@@ -47,7 +47,8 @@ export function rgbToHsv(r, g, b) {
   return [h, max ? d / max : 0, max / 255, d];
 }
 
-const isRedHue = (h) => h < 22 || h >= 325;
+// Rot eng um 0°, damit Magenta/Lila (≈300–330°, z. B. Wände) nicht als Ring zählt
+const isRedHue = (h) => h < 22 || h >= 338;
 const isGreenHue = (h) => h >= 70 && h < 180;
 
 /** Farbklasse über Farbton und Sättigung – robust gegenüber Helligkeit und Weißabgleich */
@@ -92,6 +93,11 @@ const PROBES = (() => {
       for (const r of [103, 166]) out.push({ x: r * c, y: r * s, want, kind: 'ring' });
       for (const r of [40, 75, 94, 112, 135, 157]) out.push({ x: r * c, y: r * s, want: 'neutral', kind: 'single' });
       out.push({ x: 178 * c, y: 178 * s, want: 'neutral', kind: 'outside' });
+    }
+    // nahe an den Drähten (±7° von der Segmentmitte = 2° vom Draht): legt die Drehung genau fest
+    for (const off of [-7, 7]) {
+      const a = ((segmentCenterAngle(seg) + off) * Math.PI) / 180;
+      for (const r of [103, 166]) out.push({ x: r * Math.cos(a), y: r * Math.sin(a), want, kind: 'ring-edge' });
     }
   }
   for (let k = 0; k < 8; k++) {
@@ -180,15 +186,17 @@ export function autoGuess(img) {
     nl++;
   }
   if (bestLabel < 0) return null;
-  // Cluster um eine Zelle erweitern, damit Ringränder nicht abgeschnitten werden
-  const keep = new Uint8Array(cw * ch);
+  // Alles innerhalb des Rechtecks um den größten Cluster gehört zur Scheibe (bei großen Scheiben
+  // sind Doppelring, Triple-Ring und Bull getrennte Cluster), plus eine Zelle Rand.
+  let bx0 = cw, by0 = ch, bx1 = -1, by1 = -1;
   for (let i = 0; i < cw * ch; i++) {
     if (label[i] !== bestLabel) continue;
     const cx = i % cw, cy = (i / cw) | 0;
-    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-      const x = cx + dx, y = cy + dy;
-      if (x >= 0 && y >= 0 && x < cw && y < ch) keep[y * cw + x] = 1;
-    }
+    if (cx < bx0) bx0 = cx; if (cx > bx1) bx1 = cx; if (cy < by0) by0 = cy; if (cy > by1) by1 = cy;
+  }
+  const keep = new Uint8Array(cw * ch);
+  for (let y = Math.max(0, by0 - 1); y <= Math.min(ch - 1, by1 + 1); y++) {
+    for (let x = Math.max(0, bx0 - 1); x <= Math.min(cw - 1, bx1 + 1); x++) keep[y * cw + x] = 1;
   }
   let pts = [];
   for (let by = 0; by < bh; by++) for (let bx = 0; bx < bw; bx++) {
@@ -253,13 +261,32 @@ function moments(pts) {
  * bis die projizierte Scheibe bestmöglich zu den Farben im Bild passt.
  * points: normierte Punkte; liefert { points, H, score }.
  */
-export function refine(img, points, { maxMs = 1500 } = {}) {
+export function refine(img, points, { maxMs = 1500, rotationScan = 12 } = {}) {
   const t0 = performance.now();
   const W = img.width, Hh = img.height;
   let pts = points.map((p) => ({ x: p.x * W, y: p.y * Hh }));
   const toH = (pp) => homographyFromPoints(pp.map((p) => ({ x: p.x / W, y: p.y / Hh })));
-  const score = (pp) => { const H = toH(pp); return H ? fitScore(img, H, 1) : -1; };
+  // Abtastradius: grob = große Mittelungsfläche (glatte Zielfunktion), fein = 3x3
+  let rad = 1;
+  const score = (pp) => { const H = toH(pp); return H ? fitScore(img, H, rad) : -1; };
+  // Drehung in der Scheibenebene (um das Bull) – verschiebt die Segmentgrenzen, ohne Ringe zu verändern
+  const rotPts = (pp, deg) => {
+    const H = toH(pp);
+    if (!H) return pp;
+    return pointsFromH(rotateH(H, deg)).map((p) => ({ x: p.x * W, y: p.y * Hh }));
+  };
   let best = score(pts);
+  if (rotationScan) {
+    let bestRot = pts;
+    for (let a = -rotationScan; a <= rotationScan; a += 1) {
+      if (!a) continue;
+      const cand = rotPts(pts, a);
+      const sc = score(cand);
+      if (sc > best + 0.01) { best = sc; bestRot = cand; }
+    }
+    pts = bestRot;
+    best = score(pts);
+  }
   const span = Math.hypot(pts[0].x - pts[2].x, pts[0].y - pts[2].y);
   const steps = [span * 0.04, span * 0.02, span * 0.01, span * 0.005, span * 0.0025].filter((s) => s >= 0.3);
   const cx = () => pts.reduce((a, p) => a + p.x, 0) / 4, cy = () => pts.reduce((a, p) => a + p.y, 0) / 4;
@@ -275,9 +302,18 @@ export function refine(img, points, { maxMs = 1500 } = {}) {
       const c = Math.cos(a), s = Math.sin(a);
       out.push(pts.map((p) => ({ x: mx + (p.x - mx) * c - (p.y - my) * s, y: my + (p.x - mx) * s + (p.y - my) * c })));
     }
+    // Drehung in der Scheibenebene, Schrittweite passend zur Pixel-Schrittweite
+    const deg = Math.max(0.15, (f * 180) / Math.PI);
+    out.push(rotPts(pts, deg), rotPts(pts, -deg));
+    // Streckung entlang der Bildachsen (falls die Ellipse in einer Richtung nicht passt)
+    for (const [sx, sy] of [[1 + f, 1], [1 - f, 1], [1, 1 + f], [1, 1 - f]]) {
+      out.push(pts.map((p) => ({ x: mx + (p.x - mx) * sx, y: my + (p.y - my) * sy })));
+    }
     return out;
   };
   for (const st of steps) {
+    const newRad = Math.max(1, Math.min(4, Math.round(st / 2)));
+    if (newRad !== rad) { rad = newRad; best = score(pts); }
     let improved = true, guard = 0;
     while (improved && guard++ < 40) {
       improved = false;
@@ -290,7 +326,8 @@ export function refine(img, points, { maxMs = 1500 } = {}) {
     if (performance.now() - t0 > maxMs) break;
   }
   const out = pts.map((p) => ({ x: p.x / W, y: p.y / Hh }));
-  return { points: out, H: homographyFromPoints(out), score: best };
+  const Hout = homographyFromPoints(out);
+  return { points: out, H: Hout, score: Hout ? fitScore(img, Hout, 1) : -1 };
 }
 
 /**
@@ -318,6 +355,27 @@ export function autoCalibrate(img) {
     if (dev < bestDev) { bestDev = dev; bestH = Hk; }
   }
   return { points: pointsFromH(bestH), H: bestH, score: best.score, upDeviation: bestDev };
+}
+
+/**
+ * „Feinjustieren“: verbessert die aktuellen Punkte und vergleicht mit der Auto-Erkennung.
+ * Von der Auto-Erkennung wird die 36°-Variante genommen, die den aktuellen Punkten am nächsten ist,
+ * damit eine bewusst gewählte Drehung erhalten bleibt.
+ */
+export function refineOrAuto(img, points) {
+  const local = refine(img, points);
+  if (local.score >= 0.9) return local;
+  const auto = autoCalibrate(img);
+  if (!auto) return local;
+  let bestPts = auto.points, bestD = Infinity;
+  for (let k = 0; k < 10; k++) {
+    const pk = pointsFromH(rotateH(auto.H, k * 36));
+    const d = pk.reduce((a, p, i) => a + Math.hypot((p.x - points[i].x) * img.width, (p.y - points[i].y) * img.height), 0);
+    if (d < bestD) { bestD = d; bestPts = pk; }
+  }
+  const Ha = homographyFromPoints(bestPts);
+  const autoScore = fitScore(img, Ha, 1);
+  return autoScore > local.score + 0.005 ? { points: bestPts, H: Ha, score: autoScore } : local;
 }
 
 /** Winkelabweichung (Grad) zwischen „Bull → 20“ im Bild und der Bild-Senkrechten */

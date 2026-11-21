@@ -14,7 +14,8 @@ const COLORS = {
  * Erzeugt eine Szene. pts = 4 Kalibrierpunkte (normiert) der echten Lage.
  * Liefert { img: ImageData, H } mit H = Board(mm) → Bild(normiert).
  */
-export function renderScene({ w = 960, h = 540, pts, darts = [], seed = 1, light = 1, noise = 6, warm = true }) {
+export function renderScene({ w = 960, h = 540, pts, darts = [], seed = 1, light = 1, noise = 6, warm = true, wall = null }) {
+  if (wall) COLORS.wall = wall; else COLORS.wall = [118, 108, 92];
   const H = homographyFromPoints(pts);
   const Hpx = [H[0] * w, H[1] * w, H[2] * w, H[3] * h, H[4] * h, H[5] * h, H[6], H[7], H[8]];
   const Hi = invertH(Hpx);

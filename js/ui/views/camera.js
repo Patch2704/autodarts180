@@ -3,7 +3,7 @@ import { h, icon, clear, toast, segControl } from '../dom.js';
 import { camera } from '../../vision/camera.js';
 import { calibration } from '../../state.js';
 import {
-  CAL_LABELS, homographyFromPoints, pointsFromH, rotateH, scaleH, autoCalibrate, refine,
+  CAL_LABELS, homographyFromPoints, pointsFromH, rotateH, scaleH, autoCalibrate, refineOrAuto,
   calibrationQuality, boardVisibility, frameMetrics, boardCrop, cropH, uncropPoint,
 } from '../../vision/calibration.js';
 import { videoRect, sizeCanvas, drawBoard, drawMarker } from '../../vision/overlay.js';
@@ -268,7 +268,7 @@ export async function render(root) {
     await new Promise((r) => setTimeout(r, 30));
     try {
       const img = camera.grab({ maxW: CAL_W });
-      const r = fromCurrent ? refine(img, points) : autoCalibrate(img);
+      const r = fromCurrent ? refineOrAuto(img, points) : autoCalibrate(img);
       if (!r || !r.H) { toast('Keine Scheibe gefunden – Punkte grob von Hand setzen und dann „Feinjustieren“', 'err'); return; }
       const before = fromCurrent ? calibrationQuality(img, H).score : 0;
       const after = calibrationQuality(img, r.H).score;
@@ -301,6 +301,8 @@ export async function render(root) {
           h('button', { class: 'btn', onclick: () => apply(scaleH(H, 1 / 1.01)) }, '− Kleiner'),
           h('button', { class: 'btn ghost', onclick: () => { points = defaultPoints(); H = homographyFromPoints(points); drawOverlay(); } }, 'Zurücksetzen')),
         h('div', { class: 'row' },
+          h('button', { class: 'btn ghost sm', disabled: !camera.active, onclick: exportFrame, title: 'Unbearbeitetes Kamerabild speichern, z. B. um es zur Fehleranalyse weiterzugeben' }, icon('download'), 'Kamerabild speichern')),
+        h('div', { class: 'row' },
           h('button', { class: 'btn primary', disabled: !camera.active, onclick: saveCal }, icon('check'), 'Kalibrierung speichern'),
           calibration.current ? h('span', { class: 'small muted' }, `Gespeichert: ${new Date(calibration.current.createdAt).toLocaleString('de-DE')} · Qualität ${Math.round((calibration.current.quality || 0) * 100)} %`) : h('span', { class: 'small muted' }, 'Noch keine Kalibrierung gespeichert.')));
     } else {
@@ -327,6 +329,27 @@ export async function render(root) {
       h('tbody', {}, detections.map((d, i) => h('tr', {},
         h('td', {}, i + 1), h('td', {}, h('b', {}, d.hit.label)), h('td', { class: 'r' }, d.hit.score),
         h('td', { class: 'r' }, `${Math.round(d.conf * 100)} %`), h('td', { class: 'small muted' }, d.reasons.join(', ') || '–'))))));
+  }
+
+  // Unbearbeitetes Kamerabild (ohne Linien/Punkte) – bleibt lokal, bis du es selbst weitergibst
+  async function exportFrame() {
+    const blob = await camera.rawFrameBlob();
+    if (!blob) return;
+    const name = `autodarts180-kamerabild-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.jpg`;
+    const file = new File([blob], name, { type: 'image/jpeg' });
+    try {
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'Autodarts180 Kamerabild' });
+        return;
+      }
+    } catch (e) {
+      if (e?.name === 'AbortError') return;
+    }
+    const a = h('a', { href: URL.createObjectURL(blob), download: name });
+    document.body.append(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    toast('Kamerabild gespeichert');
   }
 
   async function saveCal() {

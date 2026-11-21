@@ -327,6 +327,33 @@ test('Vision: Auto-Kalibrierung bei Perspektive, wenig Licht und kleiner Scheibe
     ok(q > 0.9, `${name}: Qualität ${q.toFixed(2)}`);
   }
 });
+test('Vision: Auto-Kalibrierung bei verdrehter Scheibe, Hochformat und lila Wand', () => {
+  // Hochformat 1080x1920 wie iPhone, Scheibe frontal-ish, um 7° verdreht, magentafarbene Wand
+  const base = [{ x: 0.52, y: 0.12 }, { x: 0.93, y: 0.36 }, { x: 0.5, y: 0.58 }, { x: 0.08, y: 0.35 }];
+  const H0 = cal.homographyFromPoints(base);
+  for (const deg of [7, -6]) {
+    const pts = cal.pointsFromH(cal.rotateH(H0, deg));
+    const { img } = scene.renderScene({ w: 540, h: 960, pts, light: 0.8, noise: 6, seed: 4, wall: [70, 12, 52] });
+    const r = cal.autoCalibrate(img);
+    ok(r, `gedreht ${deg}°: Scheibe gefunden`);
+    const err = Math.max(...r.points.map((p, i) => Math.hypot((p.x - pts[i].x) * 540, (p.y - pts[i].y) * 960)));
+    const q = cal.calibrationQuality(img, r.H);
+    calLog.push(`Hochformat, ${deg}° verdreht, lila Wand: Abweichung ${err.toFixed(1)} px, Qualität ${Math.round(q.score * 100)} % (Ringe ${Math.round(q.ringScore * 100)} %)`);
+    ok(err < 6, `gedreht ${deg}°: Abweichung ${err.toFixed(1)} px`);
+  }
+});
+test('Vision: Feinjustierung korrigiert verdrehte und gestreckte Kontur', () => {
+  const { img } = scene.renderScene({ w: 1280, h: 720, pts: SMALL, light: 0.8, noise: 6 });
+  const Ht = cal.homographyFromPoints(SMALL);
+  // 8° verdreht und horizontal 12 % zu breit (wie im Praxisfall)
+  const bad = cal.pointsFromH(cal.rotateH(Ht, 8));
+  const cx = bad.reduce((a, p) => a + p.x, 0) / 4;
+  const start = bad.map((p) => ({ x: cx + (p.x - cx) * 1.12, y: p.y }));
+  const r = cal.refine(img, start);
+  const err = Math.max(...r.points.map((p, i) => Math.hypot((p.x - SMALL[i].x) * 1280, (p.y - SMALL[i].y) * 720)));
+  calLog.push(`Feinjustierung aus 8° verdreht + 12 % zu breit: ${err.toFixed(1)} px`);
+  ok(err < 5, `Abweichung ${err.toFixed(1)} px`);
+});
 test('Vision: Feinjustierung korrigiert grob gesetzte Punkte', () => {
   const { img } = scene.renderScene({ w: 1280, h: 720, pts: SMALL, light: 0.7, noise: 8 });
   const rough = SMALL.map((p, i) => ({ x: p.x + [12, -9, 7, -11][i] / 1280, y: p.y + [-8, 10, 9, -6][i] / 720 }));

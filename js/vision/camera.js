@@ -91,13 +91,32 @@ class CameraService {
   grab({ crop = null, maxW = 640 } = {}) {
     if (!this.active) return null;
     const vw = this.video.videoWidth, vh = this.video.videoHeight;
+    // Erst das komplette Videobild zeichnen (5-Argument-Form ist auf allen Browsern
+    // korrekt ausgerichtet; Quell-Rechtecke direkt aus dem Video werden auf iOS teils verzerrt),
+    // dann aus dieser Kopie ausschneiden.
+    if (!this.full) {
+      this.full = document.createElement('canvas');
+      this.fullCtx = this.full.getContext('2d', { willReadFrequently: false });
+    }
+    if (this.full.width !== vw || this.full.height !== vh) { this.full.width = vw; this.full.height = vh; }
+    this.fullCtx.drawImage(this.video, 0, 0, vw, vh);
     const c = crop || { x: 0, y: 0, w: 1, h: 1 };
     const sx = c.x * vw, sy = c.y * vh, sw = c.w * vw, sh = c.h * vh;
     const scale = Math.min(1, maxW / sw);
     const w = Math.max(1, Math.round(sw * scale)), h = Math.max(1, Math.round(sh * scale));
     if (this.canvas.width !== w || this.canvas.height !== h) { this.canvas.width = w; this.canvas.height = h; }
-    this.ctx.drawImage(this.video, sx, sy, sw, sh, 0, 0, w, h);
+    this.ctx.drawImage(this.full, sx, sy, sw, sh, 0, 0, w, h);
     return this.ctx.getImageData(0, 0, w, h);
+  }
+
+  /** Unbearbeitetes Vollbild als JPEG-Blob (für Diagnose-Export) */
+  async rawFrameBlob(quality = 0.92) {
+    if (!this.active) return null;
+    const vw = this.video.videoWidth, vh = this.video.videoHeight;
+    const c = document.createElement('canvas');
+    c.width = vw; c.height = vh;
+    c.getContext('2d').drawImage(this.video, 0, 0, vw, vh);
+    return new Promise((res) => c.toBlob(res, 'image/jpeg', quality));
   }
 
   /** JPEG-Schnappschuss in voller Auflösung (nur lokal, z. B. für Trainingsdaten) */
