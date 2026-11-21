@@ -250,7 +250,7 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 14px; }
 .actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
 .actions .btn { white-space: normal; line-height: 1.15; padding: 0 10px; }
 
-.game-cam { position: relative; background: #000; border-radius: var(--radius); overflow: hidden; aspect-ratio: 16 / 9; }
+.game-cam { position: relative; background: #000; border-radius: var(--radius); overflow: hidden; aspect-ratio: 16 / 9; max-height: 60dvh; width: 100%; }
 .game-cam .cam-video, .cam-stage .cam-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
 .game-cam canvas, .cam-stage canvas { position: absolute; inset: 0; }
 .cam-status { position: absolute; left: 8px; bottom: 8px; background: rgba(0, 0, 0, 0.7); padding: 4px 10px; border-radius: 99px; font-size: 12px; font-weight: 700; }
@@ -263,7 +263,7 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 14px; }
 }
 
 /* ---------- Kamera / Kalibrierung ---------- */
-.cam-stage { position: relative; background: #000; border-radius: var(--radius); overflow: hidden; width: 100%; height: min(70dvh, 62vw); min-height: 260px; touch-action: none; }
+.cam-stage { position: relative; background: #000; border-radius: var(--radius); overflow: hidden; width: 100%; aspect-ratio: 16 / 9; margin: 0 auto; touch-action: none; }
 .cam-empty { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; color: var(--muted); padding: 20px; }
 .quality { display: flex; align-items: center; gap: 10px; }
 .qbar { flex: 1; height: 8px; border-radius: 99px; background: var(--surface-3); overflow: hidden; }

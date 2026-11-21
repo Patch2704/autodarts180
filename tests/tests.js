@@ -306,7 +306,68 @@ test('Vision: Kalibrierqualität auf korrekt kalibrierter Szene > 90 %', () => {
   const q = cal.calibrationQuality(drawScene(), Hnorm).score;
   ok(q > 0.9, `Qualität ${q}`);
   const wrong = cal.rotateH(Hnorm, 18);
-  ok(cal.calibrationQuality(drawScene(), wrong).score < 0.6, 'falsch gedrehte Kalibrierung wird erkannt');
+  ok(cal.calibrationQuality(drawScene(), wrong).ringScore < 0.3, 'falsch gedrehte Kalibrierung wird erkannt');
+});
+
+// Realistische Szene: echte Perspektive, gedämpfte Farben, warmes Licht, Rauschen, kleine Scheibe
+const scene = await import('./scene.js');
+const SMALL = scene.SIDE_VIEW.map((p) => ({ x: 0.5 + (p.x - 0.5) * 0.45, y: 0.5 + (p.y - 0.5) * 0.45 }));
+const TINY = scene.SIDE_VIEW.map((p) => ({ x: 0.3 + (p.x - 0.5) * 0.3, y: 0.55 + (p.y - 0.5) * 0.3 }));
+const calLog = [];
+test('Vision: Auto-Kalibrierung bei Perspektive, wenig Licht und kleiner Scheibe', () => {
+  for (const [name, light, pts, seed] of [['groß, hell', 1, scene.SIDE_VIEW, 1], ['klein, dunkel', 0.55, SMALL, 1], ['winzig, dunkel', 0.5, TINY, 1], ['klein, Seed 2', 0.7, SMALL, 2], ['klein, Seed 5', 0.8, SMALL, 5]]) {
+    const { img, H } = scene.renderScene({ w: 1280, h: 720, pts, light, noise: name.includes('Seed') ? 5 : 10, seed });
+    const r = cal.autoCalibrate(img);
+    ok(r, `${name}: Scheibe gefunden`);
+    const err = Math.max(...r.points.map((p, i) => Math.hypot((p.x - pts[i].x) * 1280, (p.y - pts[i].y) * 720)));
+    const q = cal.calibrationQuality(img, r.H).score;
+    const qt = cal.calibrationQuality(img, H).score;
+    calLog.push(`${name}: Abweichung ${err.toFixed(1)} px, Qualität ${Math.round(q * 100)} % (ideal ${Math.round(qt * 100)} %)`);
+    ok(err < 8, `${name}: Abweichung ${err.toFixed(1)} px`);
+    ok(q > 0.9, `${name}: Qualität ${q.toFixed(2)}`);
+  }
+});
+test('Vision: Feinjustierung korrigiert grob gesetzte Punkte', () => {
+  const { img } = scene.renderScene({ w: 1280, h: 720, pts: SMALL, light: 0.7, noise: 8 });
+  const rough = SMALL.map((p, i) => ({ x: p.x + [12, -9, 7, -11][i] / 1280, y: p.y + [-8, 10, 9, -6][i] / 720 }));
+  const r = cal.refine(img, rough);
+  const err = Math.max(...r.points.map((p, i) => Math.hypot((p.x - SMALL[i].x) * 1280, (p.y - SMALL[i].y) * 720)));
+  calLog.push(`Feinjustierung: von ~15 px auf ${err.toFixed(1)} px`);
+  ok(err < 5, `Abweichung nach Feinjustierung ${err.toFixed(1)} px`);
+});
+test('Vision: Qualität unterscheidet gute und verschobene Kalibrierung', () => {
+  const { img, H } = scene.renderScene({ w: 1280, h: 720, pts: SMALL, light: 0.6, noise: 10 });
+  const good = cal.calibrationQuality(img, H).score;
+  const off = cal.calibrationQuality(img, cal.homographyFromPoints(SMALL.map((p) => ({ x: p.x + 10 / 1280, y: p.y })))).score;
+  ok(good > 0.9 && off < 0.8, `gut ${good.toFixed(2)}, verschoben ${off.toFixed(2)}`);
+});
+test('Vision: Erkennung im Bildausschnitt bei kleiner Scheibe', () => {
+  const W2 = 1280, H2 = 720;
+  const base = scene.renderScene({ w: W2, h: H2, pts: SMALL, light: 0.8, noise: 4, seed: 3 });
+  const crop = cal.boardCrop(base.H);
+  const toCrop = (img) => {
+    const c = document.createElement('canvas'); c.width = W2; c.height = H2; c.getContext('2d').putImageData(img, 0, 0);
+    const sw = crop.w * W2, sh = crop.h * H2, s = Math.min(1, 640 / sw);
+    const o = document.createElement('canvas'); o.width = Math.round(sw * s); o.height = Math.round(sh * s);
+    o.getContext('2d').drawImage(c, crop.x * W2, crop.y * H2, sw, sh, 0, 0, o.width, o.height);
+    return o.getContext('2d').getImageData(0, 0, o.width, o.height);
+  };
+  const det = new DartDetector();
+  const first = toCrop(base.img);
+  det.setCalibration(cal.cropH(base.H, crop), first.width, first.height);
+  det.process(first);
+  const placed = [];
+  for (const [seg, mult] of [[20, 3], [19, 1], [8, 2]]) {
+    placed.push({ ...targetPoint(seg, mult), len: 0.05 });
+    const img = toCrop(scene.renderScene({ w: W2, h: H2, pts: SMALL, light: 0.8, noise: 4, seed: 3, darts: placed }).img);
+    let evs = [];
+    for (let k = 0; k < 8; k++) evs = evs.concat(det.process(img));
+    const d = evs.find((e) => e.type === 'dart');
+    ok(d, `${makeDart(seg, mult).label} erkannt`);
+    const t = targetPoint(seg, mult);
+    calLog.push(`Ausschnitt ${first.width}×${first.height}: ${makeDart(seg, mult).label} → ${d.hit.label} (${Math.round(d.conf * 100)} %, ${Math.hypot(d.board.x - t.x, d.board.y - t.y).toFixed(1)} mm)`);
+    eq(d.hit.label, makeDart(seg, mult).label);
+  }
 });
 test('Vision: automatische Erstschätzung liegt nahe an der echten Lage', () => {
   const g = cal.autoGuess(drawScene());
@@ -348,5 +409,6 @@ document.getElementById('summary').innerHTML = failed.length
   : `<span class="pass">Alle ${results.length} Tests bestanden</span>`;
 out.innerHTML = results.map((r) => `<div class="${r.ok ? 'pass' : 'fail'}">${r.ok ? '✔' : '✘'} ${r.name}${r.ok ? '' : `<pre>${r.err}</pre>`}</div>`).join('')
   + `<h2>Bot-Kalibrierung</h2><pre>${botResults.join('\n')}</pre>`
-  + `<h2>Erkennung (synthetisch)</h2><pre>${visionLog.join('\n')}</pre>`;
-window.__testResults = { total: results.length, failed: failed.map((f) => `${f.name}: ${f.err}`), bot: botResults, vision: visionLog };
+  + `<h2>Erkennung (synthetisch)</h2><pre>${visionLog.join('\n')}</pre>`
+  + `<h2>Kalibrierung (realistische Szene)</h2><pre>${calLog.join('\n')}</pre>`;
+window.__testResults = { total: results.length, failed: failed.map((f) => `${f.name}: ${f.err}`), bot: botResults, vision: visionLog, cal: calLog };

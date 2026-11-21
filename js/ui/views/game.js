@@ -12,9 +12,9 @@ import { settings, calibration } from '../../state.js';
 import { sfx, say } from '../../audio/sound.js';
 import { camera } from '../../vision/camera.js';
 import { DartDetector } from '../../vision/detector.js';
-import { healthCheck } from '../../vision/calibration.js';
+import { healthCheck, boardCrop, cropH, uncropPoint } from '../../vision/calibration.js';
 import { applyH } from '../../vision/homography.js';
-import { videoRect, sizeCanvas, drawBoard, drawMarker } from '../../vision/overlay.js';
+import { zoomRect, placeVideo, sizeCanvas, drawBoard, drawMarker } from '../../vision/overlay.js';
 import { uid } from '../../core/rng.js';
 
 const spoken = (label) => {
@@ -44,6 +44,7 @@ export async function render(root, params) {
   const detector = new DartDetector();
   let detStatus = '';
   let lastImg = null;
+  let crop = null, cropHm = null;
   const hasHuman = match.players.some((p) => !p.isBot);
   let inputMode = match.inputMode === 'camera' && calibration.current ? 'camera' : 'manual';
 
@@ -239,9 +240,14 @@ export async function render(root, params) {
     if (!cal) { inputMode = 'manual'; draw(); return; }
     try {
       await camera.start(cal.deviceId || undefined);
+      if (cal.zoom && camera.zoomInfo()) await camera.setZoom(cal.zoom);
       camera.attach(camStage);
-      const { w, h: hh } = camera.procSize;
-      detector.setCalibration(cal.H, w, hh);
+      camStage.style.aspectRatio = `${camera.aspect}`;
+      // nur der Bildausschnitt um die Scheibe wird ausgewertet → mehr Pixel pro Millimeter
+      crop = boardCrop(cal.H);
+      cropHm = cropH(cal.H, crop);
+      const img = camera.grab({ crop, maxW: 640 });
+      detector.setCalibration(cropHm, img.width, img.height);
       camera.startLoop(onFrame, 10);
     } catch (e) {
       toast(`Kamera nicht verfügbar: ${e.message}`, 'err');
@@ -254,16 +260,21 @@ export async function render(root, params) {
     camera.stop();
   }
 
-  function onFrame(img) {
-    if (destroyed) return;
+  function onFrame() {
+    if (destroyed || !crop) return;
+    const img = camera.grab({ crop, maxW: 640 });
     lastImg = img;
     const events = paused ? [] : detector.process(img);
-    for (const ev of events) handleDetection(ev);
+    for (const ev of events) {
+      if (ev.tip) ev.tip = uncropPoint(ev.tip, crop);
+      handleDetection(ev);
+    }
     detStatus = detector.status;
     const now = performance.now();
     if (now - lastHealth > 4000 && detStatus !== 'Bewegung') {
       lastHealth = now;
-      const hc = healthCheck(img, calibration.current);
+      const cal = calibration.current;
+      const hc = healthCheck(img, cropHm, { quality: cal.version >= 2 ? cal.quality : null, brightness: cal.version >= 2 ? cal.brightness : null });
       const before = camWarnings.map((w) => w.code).join();
       camWarnings = hc.warnings;
       if (before !== camWarnings.map((w) => w.code).join()) drawWarnings();
@@ -299,7 +310,8 @@ export async function render(root, params) {
   function drawOverlay() {
     const cal = calibration.current;
     if (!cal || inputMode !== 'camera') return;
-    const rect = videoRect(camStage, camera.aspect);
+    const rect = zoomRect(camStage, camera.aspect, boardCrop(cal.H, 240));
+    placeVideo(camera.video, rect);
     const ctx = sizeCanvas(camCanvas, camStage);
     drawBoard(ctx, cal.H, rect, { color: 'rgba(61,220,132,0.35)', numbers: false });
     const st = replay(match);
@@ -423,6 +435,7 @@ export async function render(root, params) {
   function redetect() {
     const det = detector.redetectLast(lastImg);
     if (!det) { toast('Kein zuletzt erkannter Pfeil zum erneuten Auswerten'); return; }
+    det.tip = uncropPoint(det.tip, crop);
     const st = replay(match);
     const ov = st.openVisit;
     const li = match.legs.length - 1;

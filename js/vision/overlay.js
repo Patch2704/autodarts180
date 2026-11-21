@@ -10,6 +10,20 @@ export function videoRect(container, aspect) {
   return { x: (cw - w) / 2, y: (ch - h) / 2, w, h };
 }
 
+/** Wie videoRect, aber so vergrößert, dass der normierte Ausschnitt vc den Container füllt */
+export function zoomRect(container, aspect, vc) {
+  const base = videoRect(container, aspect);
+  if (!vc) return base;
+  const sw = container.clientWidth, sh = container.clientHeight;
+  const s = Math.max(1, Math.min(sw / (vc.w * base.w), sh / (vc.h * base.h)));
+  const w = base.w * s, h = base.h * s;
+  return { x: sw / 2 - (vc.x + vc.w / 2) * w, y: sh / 2 - (vc.y + vc.h / 2) * h, w, h };
+}
+
+export function placeVideo(video, rect) {
+  Object.assign(video.style, { inset: 'auto', left: `${rect.x}px`, top: `${rect.y}px`, width: `${rect.w}px`, height: `${rect.h}px`, objectFit: 'fill' });
+}
+
 export function sizeCanvas(canvas, container) {
   const dpr = window.devicePixelRatio || 1;
   const w = container.clientWidth, h = container.clientHeight;
@@ -28,9 +42,9 @@ const toScreen = (H, rect, bx, by) => {
   return { x: rect.x + p.x * rect.w, y: rect.y + p.y * rect.h };
 };
 
-export function drawBoard(ctx, H, rect, { color = 'rgba(61,220,132,0.9)', numbers = true } = {}) {
+export function drawBoard(ctx, H, rect, { color = 'rgba(61,220,132,0.9)', numbers = true, lineWidth = 1.4 } = {}) {
   ctx.save();
-  ctx.lineWidth = 1.4;
+  ctx.lineWidth = lineWidth;
   ctx.strokeStyle = color;
   for (const r of [R.DBULL, R.SBULL, R.TRIPLE_IN, R.TRIPLE_OUT, R.DOUBLE_IN, R.DOUBLE_OUT]) {
     ctx.beginPath();
