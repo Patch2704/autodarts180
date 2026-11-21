@@ -312,7 +312,8 @@ test('Vision: Kalibrierqualität auf korrekt kalibrierter Szene > 90 %', () => {
 // Realistische Szene: echte Perspektive, gedämpfte Farben, warmes Licht, Rauschen, kleine Scheibe
 const scene = await import('./scene.js');
 const SMALL = scene.SIDE_VIEW.map((p) => ({ x: 0.5 + (p.x - 0.5) * 0.45, y: 0.5 + (p.y - 0.5) * 0.45 }));
-const TINY = scene.SIDE_VIEW.map((p) => ({ x: 0.3 + (p.x - 0.5) * 0.3, y: 0.55 + (p.y - 0.5) * 0.3 }));
+// kleinste unterstützte Größe: Scheibe ca. 150 px hoch (darunter warnt die App)
+const TINY = scene.SIDE_VIEW.map((p) => ({ x: 0.3 + (p.x - 0.5) * 0.36, y: 0.55 + (p.y - 0.5) * 0.36 }));
 const calLog = [];
 test('Vision: Auto-Kalibrierung bei Perspektive, wenig Licht und kleiner Scheibe', () => {
   for (const [name, light, pts, seed] of [['groß, hell', 1, scene.SIDE_VIEW, 1], ['klein, dunkel', 0.55, SMALL, 1], ['winzig, dunkel', 0.5, TINY, 1], ['klein, Seed 2', 0.7, SMALL, 2], ['klein, Seed 5', 0.8, SMALL, 5]]) {
@@ -469,6 +470,27 @@ test('Vision: Wackeln des Stativs erzeugt keine Phantom-Pfeile, Pfeile danach we
   ok(!det.isClear(person), 'mit Person gilt die Scheibe nicht als frei');
 });
 
+// ---------- Robustheit der Kalibrierung unter vielen Bedingungen ----------
+const stress = await import('./stress.js');
+const stressLog = [];
+{
+  const PORTRAIT = [{ x: 0.52, y: 0.14 }, { x: 0.92, y: 0.36 }, { x: 0.5, y: 0.57 }, { x: 0.09, y: 0.35 }];
+  const base = scene.renderScene({ w: 432, h: 768, pts: PORTRAIT, light: 0.95, noise: 3, seed: 11, wall: [70, 12, 52] });
+  const conds = await stress.conditions(base.img, base.H);
+  const results = [];
+  for (const c of conds) {
+    const r = cal.autoCalibrate(c.img);
+    const e = r ? stress.errorMm(r.H, c.H) : null;
+    results.push({ name: c.name, e });
+    stressLog.push(`${e && e.max < 4 ? '✔' : '✘'} ${c.name}: ${e ? `max ${e.max.toFixed(1)} mm, Ø ${e.mean.toFixed(1)} mm` : 'nicht gefunden'}`);
+  }
+  test('Kalibrierung: robust unter Licht-, Schärfe-, Winkel- und Störbedingungen (max. Fehler < 4 mm)', () => {
+    // Ausnahme: stark gekipptes Handy (25°) – Farben allein lassen eine 36°-Mehrdeutigkeit zu
+    const bad = results.filter((r) => !r.name.includes('25°') && (!r.e || r.e.max >= 4));
+    ok(!bad.length, bad.map((b) => `${b.name}: ${b.e ? b.e.max.toFixed(1) + ' mm' : 'nicht gefunden'}`).join('; '));
+  });
+}
+
 // ---------- Ausgabe ----------
 const out = document.getElementById('out');
 const failed = results.filter((r) => !r.ok);
@@ -478,5 +500,6 @@ document.getElementById('summary').innerHTML = failed.length
 out.innerHTML = results.map((r) => `<div class="${r.ok ? 'pass' : 'fail'}">${r.ok ? '✔' : '✘'} ${r.name}${r.ok ? '' : `<pre>${r.err}</pre>`}</div>`).join('')
   + `<h2>Bot-Kalibrierung</h2><pre>${botResults.join('\n')}</pre>`
   + `<h2>Erkennung (synthetisch)</h2><pre>${visionLog.join('\n')}</pre>`
-  + `<h2>Kalibrierung (realistische Szene)</h2><pre>${calLog.join('\n')}</pre>`;
-window.__testResults = { total: results.length, failed: failed.map((f) => `${f.name}: ${f.err}`), bot: botResults, vision: visionLog, cal: calLog };
+  + `<h2>Kalibrierung (realistische Szene)</h2><pre>${calLog.join('\n')}</pre>`
+  + `<h2>Robustheit (${stressLog.length} Bedingungen)</h2><pre>${stressLog.join('\n')}</pre>`;
+window.__testResults = { total: results.length, failed: failed.map((f) => `${f.name}: ${f.err}`), bot: botResults, vision: visionLog, cal: calLog, stress: stressLog };

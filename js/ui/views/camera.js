@@ -175,7 +175,8 @@ export async function render(root) {
       const { w, h: vh } = camera.resolution;
       const c = boardCrop(H, 170);
       const px = Math.round(Math.max(c.w * w, c.h * vh));
-      if (px < 220) parts.push(`⚠ Die Scheibe ist im Bild nur ca. ${px} px groß – empfohlen sind mindestens 250 px (näher stellen oder zoomen).`);
+      if (px < 150) parts.push(`⚠ Die Scheibe ist im Bild nur ca. ${px} px groß – zu klein für eine zuverlässige Kalibrierung (mindestens 150 px, besser über 300 px). Bitte näher stellen oder zoomen.`);
+      else if (px < 250) parts.push(`Hinweis: Die Scheibe ist im Bild ca. ${px} px groß. Für eine genaue Pfeilerkennung sind über 300 px besser (näher stellen oder zoomen).`);
     }
     qText.textContent = parts.join(' ');
   }
@@ -295,16 +296,16 @@ export async function render(root) {
     if (mode === 'calibrate') {
       detector = null;
       tools.append(
-        h('div', { class: 'small muted' }, 'Am einfachsten: „Automatisch erkennen“. Liegt die Kontur danach noch nicht genau, die vier roten Punkte grob auf die Stellen ziehen, an denen die Drähte zwischen 20|1, 6|10, 3|19 und 11|14 den äußeren Rand des Doppelrings treffen, und dann „Feinjustieren“ drücken. Beim Ziehen zeigt eine Lupe die Stelle vergrößert.'),
+        h('div', { class: 'small muted' }, 'Am einfachsten: „Automatisch erkennen“ – das Handy dabei aufrecht stellen (nicht seitlich gekippt), dann landet die 20 automatisch oben. Steht die 20 trotzdem an der falschen Stelle, mit „20 ◀ / 20 ▶“ korrigieren. Liegt die Kontur noch nicht genau, die vier roten Punkte grob auf die Stellen ziehen, an denen die Drähte zwischen 20|1, 6|10, 3|19 und 11|14 den äußeren Rand des Doppelrings treffen, und dann „Feinjustieren“ drücken. Beim Ziehen zeigt eine Lupe die Stelle vergrößert.'),
         h('div', { class: 'row' },
           h('button', { class: 'btn primary', disabled: !camera.active, onclick: () => runAuto(false) }, icon('wand'), 'Automatisch erkennen'),
           h('button', { class: 'btn', disabled: !camera.active, onclick: () => runAuto(true) }, icon('target'), 'Feinjustieren'),
           h('button', { class: 'btn', disabled: !camera.active, onclick: () => { viewZoom = !viewZoom; setupMode(); drawOverlay(); } }, viewZoom ? 'Ganzes Bild zeigen' : 'Auf Scheibe zoomen')),
         h('div', { class: 'row' },
-          h('button', { class: 'btn', onclick: () => apply(rotateH(H, 18)) }, icon('rotl'), '18°'),
+          h('button', { class: 'btn', title: 'Zahlen um zwei Segmente nach links drehen', onclick: () => apply(rotateH(H, 36)) }, icon('rotl'), '20 ◀'),
+          h('button', { class: 'btn', title: 'Zahlen um zwei Segmente nach rechts drehen', onclick: () => apply(rotateH(H, -36)) }, '20 ▶', icon('rotr')),
           h('button', { class: 'btn', onclick: () => apply(rotateH(H, 1)) }, icon('rotl'), '1°'),
           h('button', { class: 'btn', onclick: () => apply(rotateH(H, -1)) }, icon('rotr'), '1°'),
-          h('button', { class: 'btn', onclick: () => apply(rotateH(H, -18)) }, icon('rotr'), '18°'),
           h('button', { class: 'btn', onclick: () => apply(scaleH(H, 1.01)) }, '+ Größer'),
           h('button', { class: 'btn', onclick: () => apply(scaleH(H, 1 / 1.01)) }, '− Kleiner'),
           h('button', { class: 'btn ghost', onclick: () => { points = defaultPoints(); H = homographyFromPoints(points); drawOverlay(); } }, 'Zurücksetzen')),

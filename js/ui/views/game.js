@@ -12,7 +12,7 @@ import { settings, calibration } from '../../state.js';
 import { sfx, say } from '../../audio/sound.js';
 import { camera } from '../../vision/camera.js';
 import { DartDetector } from '../../vision/detector.js';
-import { healthCheck, boardCrop, cropH, uncropH, uncropPoint, refine, refineOrAuto, calibrationQuality, frameMetrics, pointsFromH } from '../../vision/calibration.js';
+import { healthCheck, boardCrop, cropH, uncropH, uncropPoint, refine, refineOrAuto, calibrationQuality, frameMetrics, pointsFromH, fitScore, boardShiftMm } from '../../vision/calibration.js';
 import { applyH } from '../../vision/homography.js';
 import { zoomRect, placeVideo, sizeCanvas, drawBoard, drawMarker } from '../../vision/overlay.js';
 import { uid } from '../../core/rng.js';
@@ -298,12 +298,13 @@ export async function render(root, params) {
   function checkHealth(img) {
     const cal = calibration.current;
     const refQ = cal.cropQuality ?? (cal.version >= 2 ? cal.quality : null);
+    // Dauerhaft exakt: bei jeder freien Scheibe still um Bruchteile von Millimetern nachführen
+    const tracked = autoTrack(img, refQ);
     const hc = healthCheck(img, cropHm, { quality: refQ, brightness: cal.version >= 2 ? cal.brightness : null });
-    // Leicht verrutscht (Stativ gewackelt)? → still nachführen, statt zu warnen
-    if (refQ != null && hc.quality < refQ - 0.03 && trackFails < 2) {
-      if (autoTrack(img, refQ)) { trackFails = 0; return; }
-      trackFails++;
-    } else if (refQ != null && hc.quality >= refQ - 0.03) trackFails = 0;
+    if (refQ != null && hc.quality < refQ - 0.03) {
+      trackFails = tracked ? 0 : trackFails + 1;
+      if (trackFails < 2) return; // erst nach mehreren erfolglosen Versuchen warnen
+    } else trackFails = 0;
     // Warnung erst, wenn sie dreimal hintereinander (≈ 12 s) bei freier Scheibe auftritt
     const codes = new Set(hc.warnings.map((w) => w.code));
     for (const k of Object.keys(warnStreak)) if (!codes.has(k)) delete warnStreak[k];
@@ -316,10 +317,13 @@ export async function render(root, params) {
 
   // Kleine Lageänderung automatisch ausgleichen (nur bei leerer Scheibe)
   function autoTrack(img, refQ) {
-    const r = refine(img, pointsFromH(cropHm), { maxMs: 350, rotationScan: 0 });
-    if (!r?.H) return false;
+    const before = fitScore(img, cropHm, 1);
+    const r = refine(img, pointsFromH(cropHm), { maxMs: 300, rotationScan: 0 });
+    if (!r?.H || r.score < before + 0.002) return false; // keine echte Verbesserung → nichts ändern
+    const move = boardShiftMm(cropHm, r.H);
+    if (move < 0.3 || move > 25) return false; // winzig: unnötig; sehr groß: nicht still übernehmen
     const q = calibrationQuality(img, r.H).score;
-    if (q < refQ - 0.03) return false;
+    if (refQ != null && q < refQ - 0.03) return false;
     const cal = calibration.current;
     const H = uncropH(r.H, crop);
     const updated = { ...cal, H, points: pointsFromH(H), trackedAt: Date.now() };
@@ -327,7 +331,7 @@ export async function render(root, params) {
     setupCrop(updated);
     detector.rebase(camera.grab({ crop, maxW: 640 }));
     camWarnings = []; drawWarnings();
-    trackedUntil = performance.now() + 4000;
+    if (move >= 1) trackedUntil = performance.now() + 4000; // Hinweis nur bei spürbarer Korrektur
     return true;
   }
 
