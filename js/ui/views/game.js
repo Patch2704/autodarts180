@@ -12,7 +12,7 @@ import { settings, calibration } from '../../state.js';
 import { sfx, say } from '../../audio/sound.js';
 import { camera } from '../../vision/camera.js';
 import { DartDetector } from '../../vision/detector.js';
-import { healthCheck, boardCrop, cropH, uncropPoint } from '../../vision/calibration.js';
+import { healthCheck, boardCrop, cropH, uncropPoint, refineOrAuto, calibrationQuality, frameMetrics } from '../../vision/calibration.js';
 import { applyH } from '../../vision/homography.js';
 import { zoomRect, placeVideo, sizeCanvas, drawBoard, drawMarker } from '../../vision/overlay.js';
 import { uid } from '../../core/rng.js';
@@ -44,7 +44,7 @@ export async function render(root, params) {
   const detector = new DartDetector();
   let detStatus = '';
   let lastImg = null;
-  let crop = null, cropHm = null;
+  let crop = null, cropHm = null, viewCrop = null;
   const hasHuman = match.players.some((p) => !p.isBot);
   let inputMode = match.inputMode === 'camera' && calibration.current ? 'camera' : 'manual';
 
@@ -239,15 +239,11 @@ export async function render(root, params) {
     const cal = calibration.current;
     if (!cal) { inputMode = 'manual'; draw(); return; }
     try {
-      await camera.start(cal.deviceId || undefined);
+      await camera.start(cal.deviceId || undefined, cal.label);
+      if (camera.fellBack) toast('Die gespeicherte Kamera wurde nicht gefunden – bitte unter „Kamera“ neu kalibrieren.', 'err');
       if (cal.zoom && camera.zoomInfo()) await camera.setZoom(cal.zoom);
       camera.attach(camStage);
-      camStage.style.aspectRatio = `${camera.aspect}`;
-      // nur der Bildausschnitt um die Scheibe wird ausgewertet → mehr Pixel pro Millimeter
-      crop = boardCrop(cal.H);
-      cropHm = cropH(cal.H, crop);
-      const img = camera.grab({ crop, maxW: 640 });
-      detector.setCalibration(cropHm, img.width, img.height);
+      setupCrop(cal);
       camera.startLoop(onFrame, 10);
     } catch (e) {
       toast(`Kamera nicht verfügbar: ${e.message}`, 'err');
@@ -256,12 +252,28 @@ export async function render(root, params) {
     }
   }
 
+  // Nur der Bildausschnitt um die Scheibe wird ausgewertet → mehr Pixel pro Millimeter
+  function setupCrop(cal) {
+    crop = boardCrop(cal.H);
+    cropHm = cropH(cal.H, crop);
+    const img = camera.grab({ crop, maxW: 640 });
+    detector.setCalibration(cropHm, img.width, img.height);
+    // Anzeige: quadratischer Ausschnitt um die Scheibe statt des ganzen Kamerabilds
+    viewCrop = boardCrop(cal.H, 232);
+    const { w, h: vh } = camera.resolution;
+    camStage.style.aspectRatio = `${(viewCrop.w * w) / (viewCrop.h * vh)}`;
+  }
+
   function stopCamera() {
     camera.stop();
   }
 
+  let pendingWarn = '';
   function onFrame() {
     if (destroyed || !crop) return;
+    const now = performance.now();
+    // Aufwärmphase: Belichtung und Fokus stellen sich noch ein → nichts auswerten
+    if (now - (camera.startedAt || 0) < 2500) { detStatus = 'Kamera stellt scharf …'; drawOverlay(); return; }
     const img = camera.grab({ crop, maxW: 640 });
     lastImg = img;
     const events = paused ? [] : detector.process(img);
@@ -270,16 +282,45 @@ export async function render(root, params) {
       handleDetection(ev);
     }
     detStatus = detector.status;
-    const now = performance.now();
-    if (now - lastHealth > 4000 && detStatus !== 'Bewegung') {
+    if (now - lastHealth > 3000 && detStatus !== 'Bewegung' && !detector.dartsOnBoard) {
       lastHealth = now;
       const cal = calibration.current;
-      const hc = healthCheck(img, cropHm, { quality: cal.version >= 2 ? cal.quality : null, brightness: cal.version >= 2 ? cal.brightness : null });
-      const before = camWarnings.map((w) => w.code).join();
-      camWarnings = hc.warnings;
-      if (before !== camWarnings.map((w) => w.code).join()) drawWarnings();
+      const refQ = cal.cropQuality ?? (cal.version >= 2 ? cal.quality : null);
+      const hc = healthCheck(img, cropHm, { quality: refQ, brightness: cal.version >= 2 ? cal.brightness : null });
+      const codes = hc.warnings.map((w) => w.code).join();
+      // Warnung erst anzeigen, wenn sie zweimal hintereinander auftritt (kein Fehlalarm durch einzelne Bilder)
+      const show = codes === pendingWarn ? hc.warnings : camWarnings.filter((w) => codes.includes(w.code));
+      pendingWarn = codes;
+      const before = camWarnings.map((w) => w.text).join();
+      camWarnings = show;
+      if (before !== camWarnings.map((w) => w.text).join()) drawWarnings();
     }
     drawOverlay();
+  }
+
+  // Kalibrierung im laufenden Spiel nachjustieren (z. B. Handy minimal verrutscht)
+  let adjusting = false;
+  async function readjust() {
+    if (adjusting || !camera.active) return;
+    adjusting = true;
+    toast('Justiere nach …');
+    await new Promise((r) => setTimeout(r, 30));
+    try {
+      const cal = calibration.current;
+      const full = camera.grab({ maxW: 1280 });
+      const r = refineOrAuto(full, cal.points);
+      const q = r?.H ? calibrationQuality(full, r.H).score : 0;
+      if (q < 0.85) { toast(`Nachjustieren hat nicht gereicht (${Math.round(q * 100)} %) – bitte unter „Kamera“ neu kalibrieren.`, 'err'); return; }
+      const c = boardCrop(r.H);
+      const cropImg = camera.grab({ crop: c, maxW: 640 });
+      const updated = { ...cal, H: r.H, points: r.points, quality: q, cropQuality: calibrationQuality(cropImg, cropH(r.H, c)).score, brightness: frameMetrics(cropImg).brightness, createdAt: Date.now(), version: 3 };
+      await calibration.save(updated);
+      setupCrop(updated);
+      detector.rebase(camera.grab({ crop, maxW: 640 }));
+      camWarnings = []; pendingWarn = '';
+      drawWarnings();
+      toast(`Kalibrierung nachjustiert (${Math.round(q * 100)} %)`, 'ok');
+    } finally { adjusting = false; }
   }
 
   function handleDetection(ev) {
@@ -310,7 +351,7 @@ export async function render(root, params) {
   function drawOverlay() {
     const cal = calibration.current;
     if (!cal || inputMode !== 'camera') return;
-    const rect = zoomRect(camStage, camera.aspect, boardCrop(cal.H, 240));
+    const rect = zoomRect(camStage, camera.aspect, viewCrop);
     placeVideo(camera.video, rect);
     const ctx = sizeCanvas(camCanvas, camStage);
     drawBoard(ctx, cal.H, rect, { color: 'rgba(61,220,132,0.35)', numbers: false });
@@ -494,7 +535,9 @@ export async function render(root, params) {
     if (inputMode !== 'camera' || !camWarnings.length) return;
     warnEl.append(h('div', { class: 'notice warn' },
       camWarnings.map((w) => h('div', {}, w.text)),
-      h('a', { class: 'btn sm', href: '#/camera', style: { marginTop: '8px' } }, icon('camera'), 'Neu kalibrieren')));
+      h('div', { class: 'row', style: { marginTop: '8px' } },
+        camWarnings.some((w) => w.code === 'moved') ? h('button', { class: 'btn sm primary', onclick: readjust }, icon('target'), 'Jetzt nachjustieren') : null,
+        h('a', { class: 'btn sm', href: '#/camera' }, icon('camera'), 'Neu kalibrieren'))));
   }
 
   function drawLog(st) {

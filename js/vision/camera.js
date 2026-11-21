@@ -27,20 +27,41 @@ class CameraService {
     return this.stream?.getVideoTracks()[0] || null;
   }
 
-  async start(deviceId) {
+  /**
+   * Startet die Kamera. deviceId/label: gespeicherte Kamera. Manche Browser (v. a. iOS) vergeben
+   * Geräte-IDs pro Sitzung neu – dann wird die Kamera über ihren Namen wiedergefunden.
+   * this.fellBack = true, wenn die gewünschte Kamera nicht gefunden wurde.
+   */
+  async start(deviceId, label) {
     if (!this.supported) throw new Error('Dieser Browser unterstützt keinen Kamerazugriff (HTTPS erforderlich).');
     if (this.stream && this.track?.readyState === 'live' && (!deviceId || deviceId === this.deviceId)) return;
     this.stop();
+    this.fellBack = false;
     const size = { width: { ideal: 1920 }, height: { ideal: 1080 } };
-    const video = deviceId ? { deviceId: { exact: deviceId }, ...size } : { facingMode: { ideal: 'environment' }, ...size };
-    try {
-      this.stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
-    } catch (e) {
-      if (!deviceId) throw e;
-      // gespeicherte Kamera nicht mehr vorhanden → Standardkamera
-      this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, ...size }, audio: false });
+    const open = (video) => navigator.mediaDevices.getUserMedia({ video: { ...video, ...size }, audio: false });
+    if (!deviceId) {
+      this.stream = await open({ facingMode: { ideal: 'environment' } });
+    } else {
+      try {
+        this.stream = await open({ deviceId: { exact: deviceId } });
+      } catch (e) {
+        let found = null;
+        if (label) {
+          // Berechtigung besteht bereits → Namen sind sichtbar
+          const tmp = await open({ facingMode: { ideal: 'environment' } });
+          const devs = (await this.devices()).filter((d) => d.label === label);
+          if (devs.length && devs[0].deviceId !== tmp.getVideoTracks()[0]?.getSettings?.().deviceId) {
+            tmp.getTracks().forEach((t) => t.stop());
+            try { found = await open({ deviceId: { exact: devs[0].deviceId } }); } catch { found = null; }
+          } else if (devs.length) found = tmp;
+          else tmp.getTracks().forEach((t) => t.stop());
+        }
+        if (!found) { found = await open({ facingMode: { ideal: 'environment' } }); this.fellBack = true; }
+        this.stream = found;
+      }
     }
     this.deviceId = this.track?.getSettings?.().deviceId || deviceId || null;
+    this.startedAt = performance.now();
     this.video.srcObject = this.stream;
     await this.video.play().catch(() => {});
     await new Promise((res) => {
@@ -64,6 +85,10 @@ class CameraService {
 
   get aspect() {
     return this.video.videoWidth && this.video.videoHeight ? this.video.videoWidth / this.video.videoHeight : 16 / 9;
+  }
+
+  get label() {
+    return this.track?.label || '';
   }
 
   get resolution() {

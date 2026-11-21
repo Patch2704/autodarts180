@@ -447,8 +447,8 @@ export function healthCheck(img, H, ref = {}) {
   const m = frameMetrics(img);
   const vis = boardVisibility(H);
   if (vis < 0.98) warnings.push({ code: 'visibility', text: 'Die Dartscheibe ist nicht vollständig im Bild.' });
-  if (ref.quality != null && q.score < ref.quality - 0.2) {
-    warnings.push({ code: 'moved', text: 'Die Kamera scheint verrutscht zu sein – die Scheibe passt nicht mehr zur Kalibrierung.' });
+  if (ref.quality != null && q.score < ref.quality - 0.12) {
+    warnings.push({ code: 'moved', text: `Die Scheibe passt nicht mehr genau zur Kalibrierung (Übereinstimmung jetzt ${Math.round(q.score * 100)} %, beim Kalibrieren ${Math.round(ref.quality * 100)} %).` });
   }
   if (ref.brightness && Math.abs(m.brightness - ref.brightness) / ref.brightness > 0.35) {
     warnings.push({ code: 'light', text: 'Die Beleuchtung hat sich stark verändert.' });

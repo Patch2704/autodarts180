@@ -10,6 +10,7 @@ import { videoRect, sizeCanvas, drawBoard, drawMarker } from '../../vision/overl
 import { DartDetector } from '../../vision/detector.js';
 
 const CAL_W = 1280; // Auflösung für Kalibrierung und Qualitätsmessung
+const VIEW_R = 232; // Radius (mm) des angezeigten Ausschnitts: Scheibe inkl. Zahlenring
 
 export async function render(root) {
   root.append(h('div', { class: 'page-head' }, h('h1', {}, 'Kamera'),
@@ -39,7 +40,7 @@ export async function render(root) {
     const base = videoRect(stage, camera.aspect);
     if (!viewZoom || !H) return base;
     // beim Ziehen eines Punktes bleibt der Bildausschnitt stehen
-    if (drag < 0 || !lockedView) lockedView = boardCrop(H, 240);
+    if (drag < 0 || !lockedView) lockedView = boardCrop(H, VIEW_R);
     const vc = lockedView;
     const sw = stage.clientWidth, sh = stage.clientHeight;
     const s = Math.max(1, Math.min(sw / (vc.w * base.w), sh / (vc.h * base.h)));
@@ -86,7 +87,12 @@ export async function render(root) {
   }
 
   function fitStage() {
-    const a = camera.aspect;
+    let a = camera.aspect;
+    if (viewZoom && H && camera.active) {
+      const vc = boardCrop(H, VIEW_R);
+      const { w, h: vh } = camera.resolution;
+      a = (vc.w * w) / (vc.h * vh);
+    }
     stage.style.aspectRatio = `${a}`;
     stage.style.height = 'auto';
     stage.style.maxWidth = `min(100%, calc(78dvh * ${a}))`;
@@ -94,7 +100,8 @@ export async function render(root) {
 
   async function start(deviceId) {
     try {
-      await camera.start(deviceId || calibration.current?.deviceId || undefined);
+      if (deviceId) await camera.start(deviceId);
+      else await camera.start(calibration.current?.deviceId || undefined, calibration.current?.label);
     } catch (e) {
       toast(`Kamera konnte nicht gestartet werden: ${e.message}`, 'err');
       return;
@@ -284,6 +291,7 @@ export async function render(root) {
   // ---------- Werkzeuge ----------
   function setupMode() {
     clear(tools); clear(testBox);
+    if (camera.active) fitStage();
     if (mode === 'calibrate') {
       detector = null;
       tools.append(
@@ -358,12 +366,16 @@ export async function render(root) {
     const q = calibrationQuality(full, H).score;
     const vis = boardVisibility(H);
     if (vis < 0.98) toast('Achtung: Die Scheibe ist nicht vollständig im Bild', 'err');
+    // Vergleichswerte genau so messen, wie es die Kamerakontrolle im Spiel tut (Ausschnitt, 640 px)
     const c = boardCrop(H);
-    const cm = frameMetrics(camera.grab({ crop: c, maxW: 640 }));
+    const cropImg = camera.grab({ crop: c, maxW: 640 });
+    const cm = frameMetrics(cropImg);
+    const cropQuality = calibrationQuality(cropImg, cropH(H, c)).score;
     const z = camera.zoomInfo();
     await calibration.save({
-      H, points, quality: q, brightness: cm.brightness, sharpness: cm.sharpness,
-      deviceId: camera.deviceId, aspect: camera.aspect, zoom: z ? z.value : null, createdAt: Date.now(), version: 2,
+      H, points, quality: q, cropQuality, brightness: cm.brightness, sharpness: cm.sharpness,
+      deviceId: camera.deviceId, label: camera.label, aspect: camera.aspect, resolution: camera.resolution,
+      zoom: z ? z.value : null, createdAt: Date.now(), version: 3,
     });
     toast(`Kalibrierung gespeichert (Qualität ${Math.round(q * 100)} %)`, 'ok');
     setupMode();
