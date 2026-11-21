@@ -1,5 +1,5 @@
 // Service Worker: Offline-Betrieb. Netzwerk zuerst (immer aktuell), sonst Cache.
-const CACHE = 'autodarts180-v3';
+const CACHE = 'autodarts180-v4';
 const CORE = [
   './', './index.html', './css/app.css', './manifest.webmanifest', './icon.svg',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png',
@@ -27,7 +27,8 @@ self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
   e.respondWith(
-    fetch(req)
+    // cache: 'no-cache' → beim Server nachfragen (ETag), damit Updates sofort ankommen
+    fetch(req.url, { cache: 'no-cache', credentials: 'same-origin' })
       .then((res) => {
         if (res.ok) {
           const copy = res.clone();

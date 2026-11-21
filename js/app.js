@@ -96,6 +96,10 @@ async function init() {
   window.addEventListener('hashchange', route);
   await route();
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (hadController) toast('Neue Version installiert – App neu laden, um sie zu verwenden.', 'ok');
+    });
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 }
