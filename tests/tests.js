@@ -428,6 +428,47 @@ test('Vision: Pfeile werden per Bildvergleich erkannt, gezählt und entfernt', (
   ok(!run(empty).some((e) => e.type === 'dart'), 'keine Phantom-Pfeile');
 });
 
+test('Vision: Wackeln des Stativs erzeugt keine Phantom-Pfeile, Pfeile danach werden erkannt', () => {
+  const W2 = 960, H2 = 540;
+  const BIG = scene.SIDE_VIEW.map((p) => ({ x: 0.5 + (p.x - 0.5) * 0.8, y: 0.5 + (p.y - 0.5) * 0.8 }));
+  const moved = (dx, dy) => BIG.map((p) => ({ x: p.x + dx / W2, y: p.y + dy / H2 }));
+  const base = scene.renderScene({ w: W2, h: H2, pts: BIG, light: 0.85, noise: 3, seed: 9 });
+  const crop = cal.boardCrop(base.H);
+  const toCrop = (img) => {
+    const c = document.createElement('canvas'); c.width = W2; c.height = H2; c.getContext('2d').putImageData(img, 0, 0);
+    const sw = crop.w * W2, sh = crop.h * H2, s = Math.min(1, 640 / sw);
+    const o = document.createElement('canvas'); o.width = Math.round(sw * s); o.height = Math.round(sh * s);
+    o.getContext('2d').drawImage(c, crop.x * W2, crop.y * H2, sw, sh, 0, 0, o.width, o.height);
+    return o.getContext('2d').getImageData(0, 0, o.width, o.height);
+  };
+  const det = new DartDetector();
+  const first = toCrop(base.img);
+  det.setCalibration(cal.cropH(base.H, crop), first.width, first.height);
+  det.process(first);
+  const run = (img) => { let evs = []; for (let k = 0; k < 8; k++) evs = evs.concat(det.process(img)); return evs; };
+  // 1) Stativ wackelt und bleibt 2 px versetzt stehen
+  const shifted = toCrop(scene.renderScene({ w: W2, h: H2, pts: moved(2, -1), light: 0.85, noise: 3, seed: 9 }).img);
+  let evs = run(shifted).concat(run(shifted));
+  ok(!evs.some((e) => e.type === 'dart'), 'kein Phantom-Pfeil nach Wackeln');
+  ok(det.isClear(shifted), 'Scheibe gilt nach Wackeln als frei');
+  // 2) Pfeil nach dem Wackeln
+  const withDart = toCrop(scene.renderScene({ w: W2, h: H2, pts: moved(2, -1), light: 0.85, noise: 3, seed: 9, darts: [{ ...targetPoint(19, 3), len: 0.06 }] }).img);
+  evs = run(withDart);
+  const d = evs.find((e) => e.type === 'dart');
+  ok(d, 'Pfeil nach Wackeln erkannt');
+  calLog.push(`Nach 2 px Wackeln: T19 → ${d.hit.label} (${Math.round(d.conf * 100)} %)`);
+  eq(d.hit.label, 'T19');
+  ok(!det.isClear(withDart), 'mit Pfeil gilt die Scheibe nicht als frei');
+  // 3) Person steht vor der Scheibe (große Fläche verdeckt)
+  const person = new ImageData(new Uint8ClampedArray(withDart.data), withDart.width, withDart.height);
+  for (let y = 0; y < person.height; y++) for (let x = Math.round(person.width * 0.3); x < Math.round(person.width * 0.75); x++) {
+    const i = (y * person.width + x) * 4; person.data[i] = 40; person.data[i + 1] = 60; person.data[i + 2] = 110;
+  }
+  evs = run(person);
+  ok(!evs.some((e) => e.type === 'dart'), 'Person wird nicht als Pfeil gezählt');
+  ok(!det.isClear(person), 'mit Person gilt die Scheibe nicht als frei');
+});
+
 // ---------- Ausgabe ----------
 const out = document.getElementById('out');
 const failed = results.filter((r) => !r.ok);

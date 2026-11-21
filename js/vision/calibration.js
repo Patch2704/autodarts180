@@ -405,6 +405,11 @@ export function cropH(H, c) {
   return mulH([1 / c.w, 0, -c.x / c.w, 0, 1 / c.h, -c.y / c.h, 0, 0, 1], H);
 }
 
+/** Umkehrung von cropH: H (Board → Ausschnitt normiert) → H (Board → Vollbild normiert) */
+export function uncropH(Hc, c) {
+  return mulH([c.w, 0, c.x, 0, c.h, c.y, 0, 0, 1], Hc);
+}
+
 export function uncropPoint(p, c) {
   return { x: c.x + p.x * c.w, y: c.y + p.y * c.h };
 }

@@ -95,6 +95,20 @@ class CameraService {
     return { w: this.video.videoWidth, h: this.video.videoHeight };
   }
 
+  /**
+   * Hält Schärfe und Weißabgleich auf dem aktuellen Stand fest, damit das Bild im Spiel
+   * nicht „pumpt“. Nur wenn der Browser es unterstützt (v. a. Chrome/Android); sonst false.
+   */
+  async lockSettings() {
+    const t = this.track;
+    const caps = t?.getCapabilities?.() || {};
+    const adv = {};
+    if (caps.focusMode?.includes('manual')) adv.focusMode = 'manual';
+    if (caps.whiteBalanceMode?.includes('manual')) adv.whiteBalanceMode = 'manual';
+    if (!Object.keys(adv).length) return false;
+    try { await t.applyConstraints({ advanced: [adv] }); return true; } catch { return false; }
+  }
+
   /** Kamera-Zoom (falls das Gerät ihn anbietet, v. a. Android/Chrome) */
   zoomInfo() {
     const t = this.track;

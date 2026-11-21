@@ -12,7 +12,7 @@ import { settings, calibration } from '../../state.js';
 import { sfx, say } from '../../audio/sound.js';
 import { camera } from '../../vision/camera.js';
 import { DartDetector } from '../../vision/detector.js';
-import { healthCheck, boardCrop, cropH, uncropPoint, refineOrAuto, calibrationQuality, frameMetrics } from '../../vision/calibration.js';
+import { healthCheck, boardCrop, cropH, uncropH, uncropPoint, refine, refineOrAuto, calibrationQuality, frameMetrics, pointsFromH } from '../../vision/calibration.js';
 import { applyH } from '../../vision/homography.js';
 import { zoomRect, placeVideo, sizeCanvas, drawBoard, drawMarker } from '../../vision/overlay.js';
 import { uid } from '../../core/rng.js';
@@ -269,11 +269,14 @@ export async function render(root, params) {
   }
 
   let pendingWarn = '';
+  let settingsLocked = null;
   function onFrame() {
     if (destroyed || !crop) return;
     const now = performance.now();
     // Aufwärmphase: Belichtung und Fokus stellen sich noch ein → nichts auswerten
     if (now - (camera.startedAt || 0) < 2500) { detStatus = 'Kamera stellt scharf …'; drawOverlay(); return; }
+    // nach der Aufwärmphase Schärfe und Weißabgleich festhalten (wo der Browser das erlaubt)
+    if (settingsLocked === null) { settingsLocked = false; camera.lockSettings().then((ok) => { settingsLocked = ok; }); }
     const img = camera.grab({ crop, maxW: 640 });
     lastImg = img;
     const events = paused ? [] : detector.process(img);
@@ -282,20 +285,50 @@ export async function render(root, params) {
       handleDetection(ev);
     }
     detStatus = detector.status;
-    if (now - lastHealth > 3000 && detStatus !== 'Bewegung' && !detector.dartsOnBoard) {
+    // Kontrolle nur bei leerer, freier Scheibe (keine Pfeile, niemand davor, keine Bewegung)
+    if (now - lastHealth > 4000 && detector.isClear(img)) {
       lastHealth = now;
-      const cal = calibration.current;
-      const refQ = cal.cropQuality ?? (cal.version >= 2 ? cal.quality : null);
-      const hc = healthCheck(img, cropHm, { quality: refQ, brightness: cal.version >= 2 ? cal.brightness : null });
-      const codes = hc.warnings.map((w) => w.code).join();
-      // Warnung erst anzeigen, wenn sie zweimal hintereinander auftritt (kein Fehlalarm durch einzelne Bilder)
-      const show = codes === pendingWarn ? hc.warnings : camWarnings.filter((w) => codes.includes(w.code));
-      pendingWarn = codes;
-      const before = camWarnings.map((w) => w.text).join();
-      camWarnings = show;
-      if (before !== camWarnings.map((w) => w.text).join()) drawWarnings();
+      checkHealth(img);
     }
     drawOverlay();
+  }
+
+  const warnStreak = {};
+  let trackFails = 0, trackedUntil = 0;
+  function checkHealth(img) {
+    const cal = calibration.current;
+    const refQ = cal.cropQuality ?? (cal.version >= 2 ? cal.quality : null);
+    const hc = healthCheck(img, cropHm, { quality: refQ, brightness: cal.version >= 2 ? cal.brightness : null });
+    // Leicht verrutscht (Stativ gewackelt)? → still nachführen, statt zu warnen
+    if (refQ != null && hc.quality < refQ - 0.03 && trackFails < 2) {
+      if (autoTrack(img, refQ)) { trackFails = 0; return; }
+      trackFails++;
+    } else if (refQ != null && hc.quality >= refQ - 0.03) trackFails = 0;
+    // Warnung erst, wenn sie dreimal hintereinander (≈ 12 s) bei freier Scheibe auftritt
+    const codes = new Set(hc.warnings.map((w) => w.code));
+    for (const k of Object.keys(warnStreak)) if (!codes.has(k)) delete warnStreak[k];
+    for (const c of codes) warnStreak[c] = (warnStreak[c] || 0) + 1;
+    const show = hc.warnings.filter((w) => warnStreak[w.code] >= 3);
+    const before = camWarnings.map((w) => w.text).join();
+    camWarnings = show;
+    if (before !== camWarnings.map((w) => w.text).join()) drawWarnings();
+  }
+
+  // Kleine Lageänderung automatisch ausgleichen (nur bei leerer Scheibe)
+  function autoTrack(img, refQ) {
+    const r = refine(img, pointsFromH(cropHm), { maxMs: 350, rotationScan: 0 });
+    if (!r?.H) return false;
+    const q = calibrationQuality(img, r.H).score;
+    if (q < refQ - 0.03) return false;
+    const cal = calibration.current;
+    const H = uncropH(r.H, crop);
+    const updated = { ...cal, H, points: pointsFromH(H), trackedAt: Date.now() };
+    calibration.save(updated);
+    setupCrop(updated);
+    detector.rebase(camera.grab({ crop, maxW: 640 }));
+    camWarnings = []; drawWarnings();
+    trackedUntil = performance.now() + 4000;
+    return true;
   }
 
   // Kalibrierung im laufenden Spiel nachjustieren (z. B. Handy minimal verrutscht)
@@ -317,7 +350,8 @@ export async function render(root, params) {
       await calibration.save(updated);
       setupCrop(updated);
       detector.rebase(camera.grab({ crop, maxW: 640 }));
-      camWarnings = []; pendingWarn = '';
+      camWarnings = []; pendingWarn = ''; trackFails = 0;
+      for (const k of Object.keys(warnStreak)) delete warnStreak[k];
       drawWarnings();
       toast(`Kalibrierung nachjustiert (${Math.round(q * 100)} %)`, 'ok');
     } finally { adjusting = false; }
@@ -363,7 +397,7 @@ export async function render(root, params) {
       drawMarker(ctx, rect, q.x, q.y, `${d.label} – ${d.score}`);
     }
     for (const pd of pending) drawMarker(ctx, rect, pd.ev.tip.x, pd.ev.tip.y, `${pd.dart.label}?`, '#f5b83d');
-    camStatus.textContent = `Erkennung: ${detStatus || '…'}`;
+    camStatus.textContent = `Erkennung: ${detStatus || '…'}${performance.now() < trackedUntil ? ' · Kalibrierung nachgeführt' : ''}${settingsLocked ? ' · Fokus fixiert' : ''}`;
   }
 
   // ---------- Darstellung ----------

@@ -15,6 +15,8 @@ const DEFAULTS = {
   tipExtend: 1.0, // Korrektur der Spitzenposition entlang der Pfeilachse (px, Verarbeitungsauflösung)
 };
 
+const MAX_SHIFT = 3; // maximal ausgeglichene Bildverschiebung (px) durch Wackeln des Stativs
+
 export class DartDetector {
   constructor(opts = {}) {
     this.opts = { ...DEFAULTS, ...opts };
@@ -27,9 +29,11 @@ export class DartDetector {
     this.w = w; this.h = h;
     this.Hpx = [H[0] * w, H[1] * w, H[2] * w, H[3] * h, H[4] * h, H[5] * h, H[6], H[7], H[8]];
     this.Hinv = invertH(this.Hpx);
-    // Region of Interest: Scheibe + Rand für herausragende Pfeile (bis 300 mm vom Zentrum)
+    // Region of Interest: Scheibe + Rand für herausragende Pfeile (bis 300 mm vom Zentrum).
+    // Randabstand M, damit Vergleiche mit verschobenem Referenzbild (Wackeln) im Bild bleiben.
+    const M = MAX_SHIFT + 1;
     const roi = [];
-    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    for (let y = M; y < h - M; y++) for (let x = M; x < w - M; x++) {
       const b = applyH(this.Hinv, x, y);
       if (Number.isFinite(b.x) && b.x * b.x + b.y * b.y <= 300 * 300) roi.push(y * w + x);
     }
@@ -91,11 +95,46 @@ export class DartDetector {
     return det;
   }
 
+  /**
+   * Schätzt eine kleine globale Verschiebung (Wackeln) zwischen Bild a und Referenz b.
+   * Liefert den Index-Versatz o, mit dem a[p] ≈ b[p + o] gilt (0 = keine Verschiebung).
+   */
+  estimateShift(a, b) {
+    const { roi, w } = this;
+    const step = Math.max(1, Math.floor(roi.length / 5000));
+    const lum = (d, i) => d[i] + 2 * d[i + 1] + d[i + 2];
+    let best = 0, bestSad = Infinity, sad0 = 0, bdx = 0, bdy = 0;
+    for (let dy = -MAX_SHIFT; dy <= MAX_SHIFT; dy++) {
+      for (let dx = -MAX_SHIFT; dx <= MAX_SHIFT; dx++) {
+        const o = dy * w + dx;
+        let sad = 0;
+        for (let k = 0; k < roi.length; k += step) {
+          const p = roi[k];
+          sad += Math.abs(lum(a, p * 4) - lum(b, (p + o) * 4));
+        }
+        if (!dx && !dy) sad0 = sad;
+        if (sad < bestSad) { bestSad = sad; best = o; bdx = dx; bdy = dy; }
+      }
+    }
+    // nur übernehmen, wenn die Verschiebung das Bild deutlich besser erklärt
+    if (best !== 0 && bestSad > sad0 * 0.85) return { o: 0, dx: 0, dy: 0 };
+    return { o: best, dx: bdx, dy: bdy };
+  }
+
+  /** Scheibe leer und frei (keine Pfeile, niemand davor)? Für Kamerakontrolle und Nachführung. */
+  isClear(img) {
+    if (!this.emptyRef || this.dartsOnBoard > 0 || this.awaitingTakeout || this.status !== 'bereit') return false;
+    if (!img || img.width !== this.w || img.height !== this.h) return false;
+    const s = this.estimateShift(img.data, this.emptyRef);
+    return this.changedFraction(img.data, this.emptyRef, 2, s.o) < this.opts.emptyFraction * 2;
+  }
+
   evaluate(data) {
     const roiN = this.roi.length;
     // Pfeile entfernt?
     if (this.dartsOnBoard > 0 || this.awaitingTakeout) {
-      const f = this.changedFraction(data, this.emptyRef, 1);
+      const se = this.estimateShift(data, this.emptyRef);
+      const f = this.changedFraction(data, this.emptyRef, 1, se.o);
       if (f < this.opts.emptyFraction) {
         const c = data.slice();
         this.ref = c; this.emptyRef = c;
@@ -107,12 +146,18 @@ export class DartDetector {
     }
     if (this.awaitingTakeout) { this.status = 'warte auf Entfernen'; return [{ type: 'waiting-takeout' }]; }
 
-    const count = this.buildMask(data, this.ref);
+    // Wackeln ausgleichen: Referenz um die geschätzte Verschiebung versetzt vergleichen
+    const sh = this.estimateShift(data, this.ref);
+    this.lastShift = sh;
+    const count = this.buildMask(data, this.ref, sh.o);
     const frac = count / roiN;
     if (frac < this.opts.minDartFraction) {
       this.status = 'bereit';
-      // minimale Drift (Licht) in die Referenz übernehmen
-      if (frac < this.opts.minDartFraction / 4) this.ref = data.slice();
+      // minimale Drift (Licht, leichtes Verrutschen) in die Referenz übernehmen
+      if (frac < this.opts.minDartFraction / 4 || sh.o) {
+        this.ref = data.slice();
+        if (!this.dartsOnBoard) this.emptyRef = this.ref;
+      }
       return [];
     }
     if (frac > this.opts.maxDartFraction) {
@@ -139,25 +184,25 @@ export class DartDetector {
     return [{ type: 'dart', ...det }];
   }
 
-  changedFraction(a, b, step) {
+  changedFraction(a, b, step, off = 0) {
     const thr = this.opts.diffThreshold * 3;
     const roi = this.roi;
     let changed = 0, n = 0;
     for (let k = 0; k < roi.length; k += step) {
-      const i = roi[k] * 4;
-      const d = Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+      const i = roi[k] * 4, j = (roi[k] + off) * 4;
+      const d = Math.abs(a[i] - b[j]) + Math.abs(a[i + 1] - b[j + 1]) + Math.abs(a[i + 2] - b[j + 2]);
       if (d > thr) changed++;
       n++;
     }
     return n ? changed / n : 0;
   }
 
-  buildMask(a, b) {
+  buildMask(a, b, off = 0) {
     const { diff, mask, roi, w } = this;
     diff.fill(0); mask.fill(0);
     for (let k = 0; k < roi.length; k++) {
-      const p = roi[k], i = p * 4;
-      const d = (Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2])) / 3;
+      const p = roi[k], i = p * 4, j = (p + off) * 4;
+      const d = (Math.abs(a[i] - b[j]) + Math.abs(a[i + 1] - b[j + 1]) + Math.abs(a[i + 2] - b[j + 2])) / 3;
       diff[p] = d > 255 ? 255 : d;
     }
     const thr = this.opts.diffThreshold * 9;
