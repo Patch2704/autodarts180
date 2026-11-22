@@ -512,6 +512,17 @@ const stressLog = [];
   });
 }
 
+// ---------- Freihand: Handy in der Hand (Zittern, Drehen, verwackelte Bilder) ----------
+{
+  const pts = cal.pointsFromH(stress.sideViewH(20, 432, 768));
+  const { img, H } = scene.renderScene({ w: 432, h: 768, pts, light: 0.9, noise: 4, seed: 31, wall: [70, 12, 52] });
+  const res = await stress.runHandheld(img, H, [1, 2], 18);
+  stressLog.push('— Freihand —', ...res.map((r) => `Seed ${r.seed}: scharfe Bilder Ø ${r.mean.toFixed(1)} mm, schlechtestes ${r.worst.toFixed(1)} mm`));
+  test('Kalibrierung freihändig: Kontur folgt der Bewegung (Ø < 3 mm, schlechtestes Bild < 8 mm)', () => {
+    for (const r of res) ok(r.mean < 3 && r.worst < 8, `Seed ${r.seed}: Ø ${r.mean.toFixed(1)} mm, max ${r.worst.toFixed(1)} mm`);
+  });
+}
+
 // ---------- Ausgabe ----------
 const out = document.getElementById('out');
 const failed = results.filter((r) => !r.ok);

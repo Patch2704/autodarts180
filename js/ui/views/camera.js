@@ -4,7 +4,7 @@ import { camera } from '../../vision/camera.js';
 import { calibration } from '../../state.js';
 import {
   CAL_LABELS, homographyFromPoints, pointsFromH, rotateH, scaleH, autoCalibrate, refineOrAuto,
-  calibrationQuality, boardVisibility, frameMetrics, boardCrop, cropH, uncropPoint,
+  calibrationQuality, boardVisibility, frameMetrics, boardCrop, cropH, uncropPoint, trackFrame, sharpness,
 } from '../../vision/calibration.js';
 import { videoRect, sizeCanvas, drawBoard, drawMarker } from '../../vision/overlay.js';
 import { DartDetector } from '../../vision/detector.js';
@@ -137,9 +137,25 @@ export async function render(root) {
   }
 
   let lastQ = 0;
+  // Kontur mitführen (Handy in der Hand): Bewegung von Bild zu Bild verfolgen
+  let follow = true, prevTrack = null, lastTrack = 0, sharpPeak = 0;
+  function trackStep(now) {
+    if (!follow || !H || busy || drag >= 0 || now - lastTrack < 220) return;
+    lastTrack = now;
+    const img = camera.grab({ maxW: 640 });
+    const s = sharpness(img);
+    sharpPeak = Math.max(sharpPeak * 0.97, s);
+    if (prevTrack) {
+      const nh = trackFrame(prevTrack, img, H, { fine: s >= 0.6 * sharpPeak, maxMs: 100 });
+      if (nh) { H = nh; points = pointsFromH(H); }
+    }
+    prevTrack = img;
+  }
+
   function onFrame() {
     if (destroyed) return;
     const now = performance.now();
+    if (mode === 'calibrate') trackStep(now);
     if (mode === 'calibrate' && H && now - lastQ > 500 && drag < 0 && !busy) {
       lastQ = now;
       const img = camera.grab({ maxW: CAL_W });
@@ -263,7 +279,7 @@ export async function render(root) {
     const nh = homographyFromPoints(np);
     if (nh) { points = np; H = nh; drawOverlay(); }
   });
-  const endDrag = () => { if (drag >= 0) { drag = -1; drawOverlay(); } };
+  const endDrag = () => { if (drag >= 0) { drag = -1; prevTrack = null; drawOverlay(); } };
   stage.addEventListener('pointerup', endDrag);
   stage.addEventListener('pointercancel', endDrag);
 
@@ -272,16 +288,29 @@ export async function render(root) {
   async function runAuto(fromCurrent) {
     if (busy || !camera.active) return;
     busy = true;
-    toast(fromCurrent ? 'Feinjustierung läuft …' : 'Suche Scheibe …');
-    await new Promise((r) => setTimeout(r, 30));
     try {
-      const img = camera.grab({ maxW: CAL_W });
+      // Etwa eine Sekunde lang Bilder sammeln und das schärfste nehmen (wichtig mit Handy in der Hand)
+      toast('Handy kurz ruhig halten …');
+      let img = null, best = -1;
+      for (let k = 0; k < 9 && !destroyed; k++) {
+        const f = camera.grab({ maxW: CAL_W });
+        const s = sharpness(f);
+        if (s > best) { best = s; img = new ImageData(new Uint8ClampedArray(f.data), f.width, f.height); }
+        await new Promise((r) => setTimeout(r, 110));
+      }
+      if (!img || destroyed) return;
+      toast(fromCurrent ? 'Feinjustierung läuft …' : 'Suche Scheibe …');
+      await new Promise((r) => setTimeout(r, 30));
       const r = fromCurrent ? refineOrAuto(img, points) : autoCalibrate(img);
       if (!r || !r.H) { toast('Keine Scheibe gefunden – Punkte grob von Hand setzen und dann „Feinjustieren“', 'err'); return; }
       const before = fromCurrent ? calibrationQuality(img, H).score : 0;
       const after = calibrationQuality(img, r.H).score;
       if (fromCurrent && after < before) { toast('Keine Verbesserung gefunden'); return; }
-      points = r.points; H = r.H; lastQ = 0;
+      // Während der Berechnung kann sich das Handy bewegt haben → auf das aktuelle Bild übertragen
+      const now = camera.grab({ maxW: 640 });
+      const Hnow = trackFrame(img, now, r.H, { maxMs: 250 }) || r.H;
+      H = Hnow; points = pointsFromH(H); lastQ = 0;
+      prevTrack = now;
       viewZoom = true;
       setupMode();
       drawOverlay();
@@ -300,7 +329,8 @@ export async function render(root) {
         h('div', { class: 'row' },
           h('button', { class: 'btn primary', disabled: !camera.active, onclick: () => runAuto(false) }, icon('wand'), 'Automatisch erkennen'),
           h('button', { class: 'btn', disabled: !camera.active, onclick: () => runAuto(true) }, icon('target'), 'Feinjustieren'),
-          h('button', { class: 'btn', disabled: !camera.active, onclick: () => { viewZoom = !viewZoom; setupMode(); drawOverlay(); } }, viewZoom ? 'Ganzes Bild zeigen' : 'Auf Scheibe zoomen')),
+          h('button', { class: 'btn', disabled: !camera.active, onclick: () => { viewZoom = !viewZoom; setupMode(); drawOverlay(); } }, viewZoom ? 'Ganzes Bild zeigen' : 'Auf Scheibe zoomen'),
+          h('button', { class: `btn ${follow ? 'primary' : ''}`, title: 'Kontur folgt dem Bild, wenn sich das Handy bewegt (z. B. in der Hand gehalten)', onclick: () => { follow = !follow; prevTrack = null; setupMode(); } }, follow ? 'Kontur folgt: an' : 'Kontur folgt: aus')),
         h('div', { class: 'row' },
           h('button', { class: 'btn', title: 'Zahlen um zwei Segmente nach links drehen', onclick: () => apply(rotateH(H, 36)) }, icon('rotl'), '20 ◀'),
           h('button', { class: 'btn', title: 'Zahlen um zwei Segmente nach rechts drehen', onclick: () => apply(rotateH(H, -36)) }, '20 ▶', icon('rotr')),

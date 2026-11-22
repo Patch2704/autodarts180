@@ -590,7 +590,7 @@ function moments(pts) {
  * bis die projizierte Scheibe bestmöglich zu den Farben im Bild passt.
  * points: normierte Punkte; liefert { points, H, score }.
  */
-export function refine(img, points, { maxMs = 1500, rotationScan = 12 } = {}) {
+export function refine(img, points, { maxMs = 1500, maxEvals = 0, rotationScan = 12, fineOnly = false } = {}) {
   img = normalizeColors(img);
   const t0 = performance.now();
   const W = img.width, Hh = img.height;
@@ -598,7 +598,10 @@ export function refine(img, points, { maxMs = 1500, rotationScan = 12 } = {}) {
   const toH = (pp) => homographyFromPoints(pp.map((p) => ({ x: p.x / W, y: p.y / Hh })));
   // Abtastradius: grob = große Mittelungsfläche (glatte Zielfunktion), fein = 3x3
   let rad = 1;
-  const score = (pp) => { const H = toH(pp); return H ? fitScore(img, H, rad) : -1; };
+  // Abbruch nach Rechenschritten (maxEvals, geräteunabhängig) oder nach Zeit (maxMs, für Live-Verfolgung)
+  let evals = 0;
+  const over = () => (maxEvals ? evals > maxEvals : performance.now() - t0 > maxMs);
+  const score = (pp) => { evals++; const H = toH(pp); return H ? fitScore(img, H, rad) : -1; };
   // Drehung in der Scheibenebene (um das Bull) – verschiebt die Segmentgrenzen, ohne Ringe zu verändern
   const rotPts = (pp, deg) => {
     const H = toH(pp);
@@ -618,7 +621,8 @@ export function refine(img, points, { maxMs = 1500, rotationScan = 12 } = {}) {
     best = score(pts);
   }
   const span = Math.hypot(pts[0].x - pts[2].x, pts[0].y - pts[2].y);
-  const steps = [span * 0.04, span * 0.02, span * 0.01, span * 0.005, span * 0.0025, span * 0.00125].filter((s) => s >= 0.2);
+  // fineOnly: Startlage ist schon fast richtig (Mitführen) → gleich mit feinen Schritten beginnen
+  const steps = (fineOnly ? [span * 0.008, span * 0.004, span * 0.002, span * 0.001] : [span * 0.04, span * 0.02, span * 0.01, span * 0.005, span * 0.0025, span * 0.00125]).filter((s) => s >= 0.2);
   const cx = () => pts.reduce((a, p) => a + p.x, 0) / 4, cy = () => pts.reduce((a, p) => a + p.y, 0) / 4;
   const moves = (st) => {
     const out = [];
@@ -651,13 +655,13 @@ export function refine(img, points, { maxMs = 1500, rotationScan = 12 } = {}) {
         const sc = score(cand);
         if (sc > best + 1e-6) { best = sc; pts = cand; improved = true; }
       }
-      if (performance.now() - t0 > maxMs) break;
+      if (over()) break;
     }
-    if (performance.now() - t0 > maxMs) break;
+    if (over()) break;
   }
   const out = pts.map((p) => ({ x: p.x / W, y: p.y / Hh }));
   const Hout = homographyFromPoints(out);
-  return { points: out, H: Hout, score: Hout ? fitScore(img, Hout, 1) : -1 };
+  return { points: out, H: Hout, score: Hout ? fitScore(img, Hout, 1) : -1, evals };
 }
 
 /**
@@ -681,9 +685,9 @@ export function autoCalibrate(img) {
   }).sort((a, b) => b.score - a.score);
   let best = null;
   for (const { H0 } of coarse.slice(0, 3)) {
-    let r = refine(img, pointsFromH(H0), { maxMs: 600, rotationScan: 3 });
+    let r = refine(img, pointsFromH(H0), { maxEvals: 1500, rotationScan: 3 });
     if (r.score < 0.85) {
-      const alt = refine(img, pointsFromH(rotateH(H0, 18)), { maxMs: 300, rotationScan: 3 });
+      const alt = refine(img, pointsFromH(rotateH(H0, 18)), { maxEvals: 800, rotationScan: 3 });
       if (alt.score > r.score) r = alt;
     }
     if (r?.H && (!best || r.score > best.score)) best = r;
@@ -693,7 +697,7 @@ export function autoCalibrate(img) {
   // Gegenprobe Ring-Verwechslung: Triple- und Doppelring haben dasselbe Farbmuster.
   if (calibrationQuality(img, best.H).score < 0.9) {
     for (const f of [103 / 166, 166 / 103]) {
-      const r = refine(img, pointsFromH(scaleH(best.H, f)), { maxMs: 500, rotationScan: 3 });
+      const r = refine(img, pointsFromH(scaleH(best.H, f)), { maxEvals: 800, rotationScan: 3 });
       if (r?.H && r.score > best.score) best = r;
     }
   }
@@ -715,7 +719,7 @@ export function autoCalibrate(img) {
  */
 export function refineOrAuto(img, points) {
   img = normalizeColors(img);
-  const local = refine(img, points);
+  const local = refine(img, points, { maxEvals: 2000 });
   if (local.H && calibrationQuality(img, local.H).score >= 0.95) return local;
   const auto = autoCalibrate(img);
   if (!auto) return local;
@@ -728,6 +732,85 @@ export function refineOrAuto(img, points) {
   const Ha = homographyFromPoints(bestPts);
   const autoScore = fitScore(img, Ha, 1);
   return autoScore > local.score + 0.005 ? { points: bestPts, H: Ha, score: autoScore } : local;
+}
+
+// ---------- Bewegung verfolgen (Handy in der Hand) ----------
+
+/** Helligkeits-Miniatur (Breite tw) für schnelle Verschiebungssuche */
+function lumThumb(img, tw = 160) {
+  const { width: w, height: h, data } = img;
+  const s = w / tw, th = Math.max(1, Math.round(h / s));
+  const out = new Float32Array(tw * th);
+  for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) {
+    const x0 = Math.floor(x * s), y0 = Math.floor(y * s), x1 = Math.max(x0 + 1, Math.floor((x + 1) * s)), y1 = Math.max(y0 + 1, Math.floor((y + 1) * s));
+    let sum = 0, n = 0;
+    for (let yy = y0; yy < y1 && yy < h; yy += 2) for (let xx = x0; xx < x1 && xx < w; xx += 2) {
+      const i = (yy * w + xx) * 4; sum += data[i] + 2 * data[i + 1] + data[i + 2]; n++;
+    }
+    out[y * tw + x] = n ? sum / (4 * n) : 0;
+  }
+  return { w: tw, h: th, d: out };
+}
+
+/**
+ * Verschiebung des Bildinhalts zwischen zwei Bildern im Bereich der Scheibe (normierte Koordinaten).
+ * Grob-fein-Suche bis ±25 % der Bildbreite; robust gegen unterschiedliche Auflösung beider Bilder.
+ */
+export function estimateMotion(prevImg, img, H) {
+  const a = lumThumb(prevImg), b = lumThumb(img, a.w);
+  if (a.h !== b.h) return { dx: 0, dy: 0, sad: Infinity };
+  const c = boardCrop(H, 200);
+  const pts = [];
+  const x0 = Math.floor(c.x * a.w), x1 = Math.ceil((c.x + c.w) * a.w), y0 = Math.floor(c.y * a.h), y1 = Math.ceil((c.y + c.h) * a.h);
+  for (let y = y0; y < y1; y += 2) for (let x = x0; x < x1; x += 2) pts.push(x, y);
+  // mittlere Helligkeit abziehen (Belichtungsänderung beim Bewegen)
+  const sad = (dx, dy) => {
+    let s = 0, n = 0, ma = 0, mb = 0;
+    for (let k = 0; k < pts.length; k += 2) {
+      const x = pts[k], y = pts[k + 1], xb = x + dx, yb = y + dy;
+      if (xb < 0 || yb < 0 || xb >= b.w || yb >= b.h) continue;
+      ma += a.d[y * a.w + x]; mb += b.d[yb * b.w + xb]; n++;
+    }
+    if (n < pts.length / 8) return Infinity;
+    const off = (mb - ma) / n;
+    for (let k = 0; k < pts.length; k += 2) {
+      const x = pts[k], y = pts[k + 1], xb = x + dx, yb = y + dy;
+      if (xb < 0 || yb < 0 || xb >= b.w || yb >= b.h) continue;
+      s += Math.abs(b.d[yb * b.w + xb] - a.d[y * a.w + x] - off);
+    }
+    return s / n;
+  };
+  const R = Math.round(a.w * 0.25);
+  let best = { dx: 0, dy: 0, s: sad(0, 0) };
+  for (let dy = -R; dy <= R; dy += 3) for (let dx = -R; dx <= R; dx += 3) {
+    const s = sad(dx, dy);
+    if (s < best.s) best = { dx, dy, s };
+  }
+  const coarse = best;
+  for (let dy = coarse.dy - 2; dy <= coarse.dy + 2; dy++) for (let dx = coarse.dx - 2; dx <= coarse.dx + 2; dx++) {
+    const s = sad(dx, dy);
+    if (s < best.s) best = { dx, dy, s };
+  }
+  return { dx: best.dx / a.w, dy: best.dy / a.h, sad: best.s };
+}
+
+/**
+ * Kalibrierung von einem Bild auf das nächste übertragen (Handy bewegt sich):
+ * erst Verschiebung schätzen, dann kurz feinjustieren (Drehung/Perspektive).
+ */
+export function trackFrame(prevImg, img, H, { maxMs = 200, fine = true } = {}) {
+  const m = estimateMotion(prevImg, img, H);
+  const Ht = (m.dx || m.dy) ? mulH([1, 0, m.dx, 0, 1, m.dy, 0, 0, 1], H) : H;
+  // verwackeltes Bild: nur verschieben, Feinjustierung erst beim nächsten scharfen Bild
+  if (!fine) return Ht;
+  const r = refine(img, pointsFromH(Ht), { maxMs, rotationScan: 0, fineOnly: true });
+  if (r?.H && r.score >= fitScore(img, Ht, 1) - 0.002) return r.H;
+  return Ht;
+}
+
+/** Schärfe eines Bildes (Laplace-Varianz) – für die Wahl des besten Bildes beim Freihand-Kalibrieren */
+export function sharpness(img) {
+  return frameMetrics(img).sharpness;
 }
 
 /** Größte Verschiebung (mm auf der Scheibe) zwischen zwei Kalibrierungen */

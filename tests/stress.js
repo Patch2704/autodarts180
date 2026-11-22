@@ -222,3 +222,43 @@ export async function runStress(base, H0, { verbose = false } = {}) {
   }
   return rows;
 }
+
+/**
+ * Freihand-Kalibrierung nachstellen: Bildfolge mit Zittern (±30 px), Drehen (±3°), Zoom und
+ * verwackelten Bildern. Wählt das schärfste Bild, kalibriert automatisch und führt die Kontur
+ * über alle folgenden Bilder mit. Liefert die Fehler (mm) auf den scharfen Bildern.
+ */
+export async function runHandheld(real, H0, seeds = [1, 2, 3, 4], n = 25) {
+  const { mulberry32: rngOf, gaussian: gauss } = await import('../js/core/rng.js');
+  const W = real.width, Hh = real.height;
+  const Hpx = [H0[0] * W, H0[1] * W, H0[2] * W, H0[3] * Hh, H0[4] * Hh, H0[5] * Hh, H0[6], H0[7], H0[8]];
+  const out = [];
+  for (const seed of seeds) {
+    const rng = rngOf(seed);
+    let tx = 0, ty = 0, rot = 0, sc = 1;
+    const frames = [];
+    for (let k = 0; k < n; k++) {
+      tx += gauss(rng) * 6; ty += gauss(rng) * 6; rot += gauss(rng) * 0.4; sc *= 1 + gauss(rng) * 0.006;
+      tx = Math.max(-30, Math.min(30, tx)); ty = Math.max(-30, Math.min(30, ty)); rot = Math.max(-3, Math.min(3, rot));
+      const a = (rot * Math.PI) / 180, c = Math.cos(a) * sc, s = Math.sin(a) * sc;
+      const T = [c, -s, W / 2 - (c * W) / 2 + (s * Hh) / 2 + tx, s, c, Hh / 2 - (s * W) / 2 - (c * Hh) / 2 + ty, 0, 0, 1];
+      const H2 = mulH(T, Hpx);
+      const Hk = [H2[0] / W, H2[1] / W, H2[2] / W, H2[3] / Hh, H2[4] / Hh, H2[5] / Hh, H2[6], H2[7], H2[8]];
+      let img = reproject(real, H0, Hk);
+      if (k % 3 === 1) img = filtered(img, 'blur(3px)');
+      frames.push({ img, H: Hk, sharp: cal.sharpness(img) });
+    }
+    let bi = 0;
+    for (let k = 0; k < 10; k++) if (frames[k].sharp > frames[bi].sharp) bi = k;
+    let H = cal.autoCalibrate(frames[bi].img).H;
+    let peak = frames[bi].sharp, worst = errorMm(H, frames[bi].H).max, sum = 0, cnt = 0;
+    for (let k = bi + 1; k < n; k++) {
+      peak = Math.max(peak * 0.97, frames[k].sharp);
+      const fine = frames[k].sharp >= 0.6 * peak;
+      H = cal.trackFrame(frames[k - 1].img, frames[k].img, H, { fine });
+      if (fine) { const e = errorMm(H, frames[k].H); worst = Math.max(worst, e.max); sum += e.mean; cnt++; }
+    }
+    out.push({ seed, start: bi, worst, mean: cnt ? sum / cnt : 0, end: errorMm(H, frames[n - 1].H).max });
+  }
+  return out;
+}

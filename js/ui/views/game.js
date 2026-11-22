@@ -318,7 +318,7 @@ export async function render(root, params) {
   // Kleine Lageänderung automatisch ausgleichen (nur bei leerer Scheibe)
   function autoTrack(img, refQ) {
     const before = fitScore(img, cropHm, 1);
-    const r = refine(img, pointsFromH(cropHm), { maxMs: 300, rotationScan: 0 });
+    const r = refine(img, pointsFromH(cropHm), { maxEvals: 600, rotationScan: 0 });
     if (!r?.H || r.score < before + 0.002) return false; // keine echte Verbesserung → nichts ändern
     const move = boardShiftMm(cropHm, r.H);
     if (move < 0.3 || move > 25) return false; // winzig: unnötig; sehr groß: nicht still übernehmen
