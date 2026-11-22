@@ -364,7 +364,7 @@ export function coarseSearch(img, H0, withAniso = false) {
   // zweistufig: grob (7×7×5), dann um das beste Ergebnis enger (5×5×3)
   // Größen bis 0,6× / 1,7×: Triple- und Doppelring haben dasselbe Farbmuster (Radien 103/166 mm),
   // eine Verwechslung muss deshalb immer mitgeprüft werden.
-  const passes = [[span, 3, [0.6, 0.68, 0.77, 0.87, 1, 1.15, 1.3, 1.48, 1.68]], [span / 3, 2, [0.94, 1, 1.06]]];
+  const passes = [[span, 3, [0.35, 0.42, 0.5, 0.6, 0.68, 0.77, 0.87, 1, 1.15, 1.3, 1.48, 1.68]], [span / 3, 2, [0.94, 1, 1.06]]];
   let base = { tx: 0, ty: 0, s: 1 };
   for (const [sp, n, scales] of passes) {
     let localBest = null;
@@ -451,7 +451,7 @@ export function autoGuess(img) {
   img = normalizeColors(img);
   const { width: w, height: h, data } = img;
   // 1) Blockmittelwerte (reduziert Rauschen), Farbklasse pro Block: 1 = rot, 2 = grün
-  const step = Math.max(1, Math.round(w / 320));
+  const step = Math.max(2, Math.round(w / 200)); // Blockmittel ≥ 2×2 px unterdrückt Farbrauschen
   const bw = Math.floor(w / step), bh = Math.floor(h / step);
   const colored = new Uint8Array(bw * bh);
   for (let by = 0; by < bh; by++) for (let bx = 0; bx < bw; bx++) {
@@ -503,7 +503,9 @@ export function autoGuess(img) {
     // Ringsegmente wechseln rot/grün ab → ausgewogene Mengen. Eine rote Wand (mit der Scheibe darin)
     // hätte viel mehr Rot als Grün und wird dadurch abgewertet.
     const lo = Math.min(red, green), hi = Math.max(red, green);
-    const sc = hi ? lo * (lo / hi) : 0;
+    // große Bereiche bevorzugen: die Scheibe ist viel größer als rot-grüne Aufkleber oder Logos
+    const area = (c.x1 - c.x0 + 1) * (c.y1 - c.y0 + 1);
+    const sc = hi ? lo * (lo / hi) * Math.sqrt(area) : 0;
     if (sc > bestScore) { bestScore = sc; best = c; }
   }
   if (!best) return null;
@@ -586,6 +588,37 @@ function moments(pts) {
 }
 
 /**
+ * Ist die Abbildung physikalisch möglich? Der Doppelring muss im Bild eine konvexe, nicht
+ * überkreuzte Form bilden, das Bull muss darin liegen, und die Verzerrung darf nicht stärker
+ * sein als bei einem sehr schrägen Blick (~75°). Verhindert, dass sich die Feinjustierung in
+ * unmögliche Perspektiven verrennt. W/Hh: Bildgröße in Pixel.
+ */
+export function plausibleH(H, W = 1, Hh = 1) {
+  const c = applyH(H, 0, 0);
+  const cx = c.x * W, cy = c.y * Hh;
+  const pts = [];
+  for (let k = 0; k < 16; k++) {
+    const t = (k * 22.5 * Math.PI) / 180;
+    const p = applyH(H, R.DOUBLE_OUT * Math.cos(t), R.DOUBLE_OUT * Math.sin(t));
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return false;
+    pts.push([p.x * W, p.y * Hh]);
+  }
+  // gleiche Umlaufrichtung an allen Ecken (konvex, nicht überkreuzt) und Bull auf derselben Seite aller Kanten
+  let sign = 0;
+  let rmin = Infinity, rmax = 0;
+  for (let i = 0; i < 16; i++) {
+    const [x0, y0] = pts[i], [x1, y1] = pts[(i + 1) % 16], [x2, y2] = pts[(i + 2) % 16];
+    const turn = (x1 - x0) * (y2 - y1) - (y1 - y0) * (x2 - x1);
+    const side = (x1 - x0) * (cy - y0) - (y1 - y0) * (cx - x0);
+    if (!sign) sign = Math.sign(turn);
+    if (Math.sign(turn) !== sign || Math.sign(side) !== sign) return false;
+    const r = Math.hypot(x0 - cx, y0 - cy);
+    rmin = Math.min(rmin, r); rmax = Math.max(rmax, r);
+  }
+  return rmax / rmin < 5;
+}
+
+/**
  * Feinjustierung: verschiebt die 4 Kalibrierpunkte (und global Lage/Größe/Drehung),
  * bis die projizierte Scheibe bestmöglich zu den Farben im Bild passt.
  * points: normierte Punkte; liefert { points, H, score }.
@@ -601,7 +634,7 @@ export function refine(img, points, { maxMs = 1500, maxEvals = 0, rotationScan =
   // Abbruch nach Rechenschritten (maxEvals, geräteunabhängig) oder nach Zeit (maxMs, für Live-Verfolgung)
   let evals = 0;
   const over = () => (maxEvals ? evals > maxEvals : performance.now() - t0 > maxMs);
-  const score = (pp) => { evals++; const H = toH(pp); return H ? fitScore(img, H, rad) : -1; };
+  const score = (pp) => { evals++; const H = toH(pp); return H && plausibleH(H, W, Hh) ? fitScore(img, H, rad) : -1; };
   // Drehung in der Scheibenebene (um das Bull) – verschiebt die Segmentgrenzen, ohne Ringe zu verändern
   const rotPts = (pp, deg) => {
     const H = toH(pp);
@@ -677,14 +710,19 @@ export function autoCalibrate(img) {
   if (!starts.length) return null;
   // Jeden Kandidaten grob ausrichten (schnell), nur den besten fein justieren
   const W = img.width, Hh = img.height;
-  const coarse = starts.flatMap((Hs) => coarseSearch(img, Hs, true)).map((Hc) => {
+  // Je Startpunkt die beste Variante (gemeinsame/getrennte Breite) nehmen; jeder Startpunkt bekommt
+  // so mindestens einen Versuch, auch wenn seine Grobbewertung (z. B. bei Rauschen) niedrig ausfällt
+  const coarse = starts.map((Hs) => coarseSearch(img, Hs, true).map((Hc) => {
     const H0 = rotationSearch(img, Hc);
     const c = applyH(H0, 0, 0), e = applyH(H0, R.DOUBLE_OUT, 0);
     const blur = Math.max(1, Math.min(3, Math.round(Math.hypot((e.x - c.x) * W, (e.y - c.y) * Hh) / 80)));
     return { H0, score: fitScoreCoarse(img, H0, blur) };
-  }).sort((a, b) => b.score - a.score);
+  }).sort((a, b) => b.score - a.score)[0]).sort((a, b) => b.score - a.score);
   let best = null;
-  for (const { H0 } of coarse.slice(0, 3)) {
+  // Die besten 3 sicher; wenn keiner eindeutig passt, auch die übrigen Kandidaten probieren
+  for (const [ci, { H0 }] of coarse.entries()) {
+    if (ci >= 3 && best && calibrationQuality(img, best.H).score >= 0.9) break;
+    if (ci >= 6) break;
     let r = refine(img, pointsFromH(H0), { maxEvals: 1500, rotationScan: 3 });
     if (r.score < 0.85) {
       const alt = refine(img, pointsFromH(rotateH(H0, 18)), { maxEvals: 800, rotationScan: 3 });
@@ -701,6 +739,9 @@ export function autoCalibrate(img) {
       if (r?.H && r.score > best.score) best = r;
     }
   }
+  // Präzisionsschritt: Ring- und Drahtkanten vermessen (Bruchteile eines Millimeters)
+  const er = edgeRefine(img, best.H);
+  if (er) best = { ...best, H: er.H };
   // Farben wiederholen sich alle 36° → unter den gleichwertigen Drehungen die nehmen,
   // bei der die 20 im Bild senkrecht über dem Bull liegt (Handy steht aufrecht).
   let bestH = best.H, bestDev = Infinity;
@@ -720,7 +761,10 @@ export function autoCalibrate(img) {
 export function refineOrAuto(img, points) {
   img = normalizeColors(img);
   const local = refine(img, points, { maxEvals: 2000 });
-  if (local.H && calibrationQuality(img, local.H).score >= 0.95) return local;
+  if (local.H && calibrationQuality(img, local.H).score >= 0.95) {
+    const er = edgeRefine(img, local.H);
+    return er ? { points: pointsFromH(er.H), H: er.H, score: fitScore(img, er.H, 1) } : local;
+  }
   const auto = autoCalibrate(img);
   if (!auto) return local;
   let bestPts = auto.points, bestD = Infinity;
@@ -734,15 +778,200 @@ export function refineOrAuto(img, points) {
   return autoScore > local.score + 0.005 ? { points: bestPts, H: Ha, score: autoScore } : local;
 }
 
+// ---------- Präzisionsjustierung über gemessene Kanten ----------
+
+/** Farbe an einer Zwischenpixel-Position (bilinear) */
+function bilinearRGB(img, nx, ny) {
+  const { width: w, height: h, data } = img;
+  const x = nx * w - 0.5, y = ny * h - 0.5;
+  if (x < 0 || y < 0 || x >= w - 1 || y >= h - 1) return null;
+  const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0;
+  const i00 = (y0 * w + x0) * 4, i10 = i00 + 4, i01 = i00 + w * 4, i11 = i01 + 4;
+  const out = [0, 0, 0];
+  for (let c = 0; c < 3; c++) {
+    out[c] = (data[i00 + c] * (1 - fx) + data[i10 + c] * fx) * (1 - fy) + (data[i01 + c] * (1 - fx) + data[i11 + c] * fx) * fy;
+  }
+  return out;
+}
+
+/** Homographie (Board mm → Bild normiert) aus vielen Punktpaaren per gewichteter kleinster Quadrate */
+function homographyLSQ(pairs) {
+  const S = 170; // Board-Koordinaten skalieren (bessere Kondition)
+  const N = new Float64Array(64), rhs = new Float64Array(8);
+  const addRow = (row, b, w) => {
+    for (let i = 0; i < 8; i++) {
+      rhs[i] += w * row[i] * b;
+      for (let j = 0; j < 8; j++) N[i * 8 + j] += w * row[i] * row[j];
+    }
+  };
+  for (const { X, Y, u, v, w = 1 } of pairs) {
+    const x = X / S, y = Y / S;
+    addRow([x, y, 1, 0, 0, 0, -u * x, -u * y], u, w);
+    addRow([0, 0, 0, x, y, 1, -v * x, -v * y], v, w);
+  }
+  // Gauß-Elimination mit Pivotsuche
+  const M = [];
+  for (let i = 0; i < 8; i++) M.push([...N.slice(i * 8, i * 8 + 8), rhs[i]]);
+  for (let c = 0; c < 8; c++) {
+    let p = c;
+    for (let r = c + 1; r < 8; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-14) return null;
+    [M[c], M[p]] = [M[p], M[c]];
+    for (let r = 0; r < 8; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / M[c][c];
+      for (let k = c; k <= 8; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  const h = M.map((row, i) => row[8] / row[i]);
+  return mulH([...h, 1], [1 / S, 0, 0, 0, 1 / S, 0, 0, 0, 1]);
+}
+
+/**
+ * Misst Ringkanten (radial) und Drähte zwischen roten/grünen Ringfeldern (tangential) im Bild
+ * und liefert Punktpaare „Board-Sollposition ↔ gemessene Bildposition“.
+ */
+export function measureEdges(img, H, debug = null) {
+  const pairs = [];
+  const ev = (bx, by, want) => {
+    const q = applyH(H, bx, by);
+    const rgb = bilinearRGB(img, q.x, q.y);
+    return rgb ? colorEvidence(rgb, want) : null;
+  };
+  const avgEv = (list, want) => {
+    let s = 0;
+    for (const [bx, by] of list) { const e = ev(bx, by, want); if (e == null) return null; s += e; }
+    return s / list.length;
+  };
+  // Radiale Kanten: [Radius, innen farbig?]
+  const EDGES = [[R.DOUBLE_OUT, true], [R.DOUBLE_IN, false], [R.TRIPLE_OUT, true], [R.TRIPLE_IN, false]];
+  for (let a = 0; a < 360; a += 4) {
+    // Drähte (Segmentgrenzen bei 9° + k·18°) meiden
+    const rel = (((a - 9) % 18) + 18) % 18;
+    if (rel < 2 || rel > 16) continue;
+    const t = (a * Math.PI) / 180, c = Math.cos(t), s = Math.sin(t);
+    const found = {};
+    for (const [Re, innerColored] of EDGES) {
+      const prof = [];
+      for (let d = -4.5; d <= 4.5001; d += 0.25) {
+        // quer zur Messrichtung über 3 Punkte (±0,7°) mitteln → weniger Rauschen
+        const e = avgEv([[(Re + d) * c, (Re + d) * s], [(Re + d) * Math.cos(t + 0.012), (Re + d) * Math.sin(t + 0.012)], [(Re + d) * Math.cos(t - 0.012), (Re + d) * Math.sin(t - 0.012)]], 'any');
+        if (e == null) { prof.length = 0; break; }
+        prof.push([d, e]);
+      }
+      if (prof.length < 30) continue;
+      const inner = prof.slice(0, 8).reduce((x, p) => x + p[1], 0) / 8;
+      const outer = prof.slice(-8).reduce((x, p) => x + p[1], 0) / 8;
+      const colored = innerColored ? inner : outer, neutral = innerColored ? outer : inner;
+      if (debug) debug.push(colored - neutral);
+      if (colored - neutral < 0.35) continue; // kein klarer Übergang (verdeckt, Spiegelung)
+      const thr = (colored + neutral) / 2;
+      // Übergang, der der Sollposition (d = 0) am nächsten liegt
+      let best = null;
+      for (let k = 1; k < prof.length; k++) {
+        const [d0, e0] = prof[k - 1], [d1, e1] = prof[k];
+        const cross = innerColored ? (e0 >= thr && e1 < thr) : (e0 < thr && e1 >= thr);
+        if (!cross) continue;
+        const d = d0 + ((thr - e0) / (e1 - e0)) * (d1 - d0);
+        if (best == null || Math.abs(d) < Math.abs(best)) best = d;
+      }
+      if (best == null || Math.abs(best) > 3.5) continue;
+      found[Re] = Re + best;
+    }
+    // Ringmitte aus Innen- und Außenkante: Farbausblutung, Drahtbreite und Belichtung verschieben
+    // beide Kanten gleich weit in entgegengesetzte Richtung – in der Mitte heben sie sich auf.
+    for (const [ro, ri] of [[R.DOUBLE_OUT, R.DOUBLE_IN], [R.TRIPLE_OUT, R.TRIPLE_IN]]) {
+      if (found[ro] == null || found[ri] == null) continue;
+      const width = found[ro] - found[ri];
+      if (width < 4 || width > 13) continue; // unplausible Ringbreite (Spiegelung, Pfeil)
+      const rm = (found[ro] + found[ri]) / 2, Rm = (ro + ri) / 2;
+      const q = applyH(H, rm * c, rm * s);
+      pairs.push({ X: Rm * c, Y: Rm * s, u: q.x, v: q.y, w: 2, kind: 'radial' });
+    }
+  }
+  // Tangentiale Kanten: Wechsel rot ↔ grün an den Drähten (legt die Drehung fest)
+  for (const seg of SEGMENTS) {
+    const bAng = segmentCenterAngle(seg) - 9; // Grenze im Uhrzeigersinn
+    for (const r of [103, 166]) {
+      const prof = [];
+      for (let d = -4; d <= 4.0001; d += 0.2) {
+        const t = ((bAng + d) * Math.PI) / 180;
+        // quer zur Messrichtung über 3 Radien (±1,5 mm) mitteln
+        const ptsT = [r - 1.5, r, r + 1.5].map((rr) => [rr * Math.cos(t), rr * Math.sin(t)]);
+        const er = avgEv(ptsT, 'red'), eg = avgEv(ptsT, 'green');
+        if (er == null) { prof.length = 0; break; }
+        prof.push([d, er - eg]);
+      }
+      if (prof.length < 35) continue;
+      const left = prof.slice(0, 6).reduce((x, p) => x + p[1], 0) / 6, right = prof.slice(-6).reduce((x, p) => x + p[1], 0) / 6;
+      if (Math.abs(left - right) < 0.6 || Math.sign(left) === Math.sign(right)) continue;
+      const thr = (left + right) / 2;
+      let best = null;
+      for (let k = 1; k < prof.length; k++) {
+        const [d0, e0] = prof[k - 1], [d1, e1] = prof[k];
+        if ((e0 - thr) * (e1 - thr) > 0 || e0 === e1) continue;
+        const d = d0 + ((thr - e0) / (e1 - e0)) * (d1 - d0);
+        if (best == null || Math.abs(d) < Math.abs(best)) best = d;
+      }
+      if (best == null || Math.abs(best) > 3) continue;
+      const tb = (bAng * Math.PI) / 180, tf = ((bAng + best) * Math.PI) / 180;
+      const q = applyH(H, r * Math.cos(tf), r * Math.sin(tf));
+      pairs.push({ X: r * Math.cos(tb), Y: r * Math.sin(tb), u: q.x, v: q.y, w: 3, kind: 'wire' });
+    }
+  }
+  return pairs;
+}
+
+/**
+ * Präzisionsjustierung: misst Ring- und Drahtkanten, berechnet die Lage neu (kleinste Quadrate,
+ * Ausreißer werden verworfen) und wiederholt das mehrmals. Ergebnis wird nur übernommen,
+ * wenn es die Übereinstimmung nicht verschlechtert. Liefert { H, pairs } oder null.
+ */
+export function edgeRefine(img, H, { iterations = 3 } = {}) {
+  img = normalizeColors(img);
+  let cur = H, used = 0, residual = Infinity;
+  for (let it = 0; it < iterations; it++) {
+    let pairs = measureEdges(img, cur);
+    const radial = pairs.filter((p) => p.kind === 'radial').length, wires = pairs.filter((p) => p.kind === 'wire').length;
+    if (radial < 30 || wires < 8) break;
+    let Hn = homographyLSQ(pairs);
+    if (!Hn) break;
+    // Ausreißer verwerfen (Abweichung > 2,5 × Median) und neu rechnen
+    const resid = (Hx, list) => { const Hi = invertH(Hx); return list.map((p) => { const b = applyH(Hi, p.u, p.v); return Math.hypot(b.x - p.X, b.y - p.Y); }); };
+    const res = resid(Hn, pairs);
+    const med = [...res].sort((a, b) => a - b)[Math.floor(res.length / 2)];
+    pairs = pairs.filter((p, i) => res[i] <= Math.max(0.6, 2.5 * med));
+    Hn = homographyLSQ(pairs) || Hn;
+    const r2 = resid(Hn, pairs).sort((a, b) => a - b);
+    residual = r2[Math.floor(r2.length / 2)];
+    used = pairs.length;
+    const shift = boardShiftMm(cur, Hn);
+    cur = Hn;
+    if (shift < 0.05) break;
+  }
+  if (!used) return null;
+  // Sicherheitsnetz: Kanten müssen gut zur berechneten Lage passen, die Änderung muss plausibel
+  // klein sein und die Farbprüfung darf sich nicht deutlich verschlechtern. (Die Farbbewertung
+  // allein ist bei dunklen, verrauschten Bildern leicht verzerrt – die Kanten sind genauer.)
+  if (residual > 1.0) return null;
+  if (!plausibleH(cur, img.width, img.height)) return null;
+  if (boardShiftMm(H, cur) > 10) return null;
+  if (calibrationQuality(img, cur).score < calibrationQuality(img, H).score - 0.03) return null;
+  return { H: cur, pairs: used, residual };
+}
+
 // ---------- Bewegung verfolgen (Handy in der Hand) ----------
 
 /** Helligkeits-Miniatur (Breite tw) für schnelle Verschiebungssuche */
-function lumThumb(img, tw = 160) {
+function lumThumb(img, tw = 160, th = 0) {
   const { width: w, height: h, data } = img;
-  const s = w / tw, th = Math.max(1, Math.round(h / s));
+  // feste Zielgröße (tw × th), damit zwei Bilder unterschiedlicher Auflösung exakt vergleichbar sind
+  const sx = w / tw;
+  if (!th) th = Math.max(1, Math.round(h / sx));
+  const sy = h / th;
   const out = new Float32Array(tw * th);
   for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) {
-    const x0 = Math.floor(x * s), y0 = Math.floor(y * s), x1 = Math.max(x0 + 1, Math.floor((x + 1) * s)), y1 = Math.max(y0 + 1, Math.floor((y + 1) * s));
+    const x0 = Math.floor(x * sx), y0 = Math.floor(y * sy), x1 = Math.max(x0 + 1, Math.floor((x + 1) * sx)), y1 = Math.max(y0 + 1, Math.floor((y + 1) * sy));
     let sum = 0, n = 0;
     for (let yy = y0; yy < y1 && yy < h; yy += 2) for (let xx = x0; xx < x1 && xx < w; xx += 2) {
       const i = (yy * w + xx) * 4; sum += data[i] + 2 * data[i + 1] + data[i + 2]; n++;
@@ -757,8 +986,9 @@ function lumThumb(img, tw = 160) {
  * Grob-fein-Suche bis ±25 % der Bildbreite; robust gegen unterschiedliche Auflösung beider Bilder.
  */
 export function estimateMotion(prevImg, img, H) {
-  const a = lumThumb(prevImg), b = lumThumb(img, a.w);
-  if (a.h !== b.h) return { dx: 0, dy: 0, sad: Infinity };
+  const a = lumThumb(prevImg), b = lumThumb(img, a.w, a.h);
+  // unterschiedliches Seitenverhältnis: keine sinnvolle Verschiebung bestimmbar
+  if (Math.abs(prevImg.width / prevImg.height - img.width / img.height) > 0.02) return { dx: 0, dy: 0, sad: Infinity };
   const c = boardCrop(H, 200);
   const pts = [];
   const x0 = Math.floor(c.x * a.w), x1 = Math.ceil((c.x + c.w) * a.w), y0 = Math.floor(c.y * a.h), y1 = Math.ceil((c.y + c.h) * a.h);
@@ -804,8 +1034,10 @@ export function trackFrame(prevImg, img, H, { maxMs = 200, fine = true } = {}) {
   // verwackeltes Bild: nur verschieben, Feinjustierung erst beim nächsten scharfen Bild
   if (!fine) return Ht;
   const r = refine(img, pointsFromH(Ht), { maxMs, rotationScan: 0, fineOnly: true });
-  if (r?.H && r.score >= fitScore(img, Ht, 1) - 0.002) return r.H;
-  return Ht;
+  const base = r?.H && r.score >= fitScore(img, Ht, 1) - 0.002 ? r.H : Ht;
+  // scharfes Bild: zusätzlich Kanten vermessen (Bruchteile eines Millimeters)
+  const er = edgeRefine(img, base, { iterations: 1 });
+  return er ? er.H : base;
 }
 
 /** Schärfe eines Bildes (Laplace-Varianz) – für die Wahl des besten Bildes beim Freihand-Kalibrieren */

@@ -512,6 +512,21 @@ const stressLog = [];
   });
 }
 
+// ---------- Präzision der Auto-Kalibrierung (Kantenvermessung) ----------
+{
+  const precRes = [];
+  for (const [deg, tilt, light, noise] of [[0, 0, 0.9, 4], [-45, 0, 0.9, 4], [45, 0, 0.5, 10], [30, -12, 0.85, 5]]) {
+    const Hs = stress.sideViewH(deg, 432, 768, { tilt });
+    const { img, H } = scene.renderScene({ w: 432, h: 768, pts: cal.pointsFromH(Hs), light, noise, seed: 77, wall: [70, 12, 52] });
+    const r = cal.autoCalibrate(img);
+    precRes.push({ name: `${deg}°${tilt ? ' ' + tilt : ''}${light < 0.7 ? ' dunkel' : ''}`, e: r ? stress.errorMm(r.H, H) : null });
+  }
+  stressLog.push('— Präzision —', ...precRes.map((p) => `${p.name}: ${p.e ? `Ø ${p.e.mean.toFixed(2)} mm, max ${p.e.max.toFixed(2)} mm` : 'nicht gefunden'}`));
+  test('Kalibrierung präzise: Ø < 0,6 mm, kein Punkt > 1,5 mm', () => {
+    for (const p of precRes) ok(p.e && p.e.mean < 0.6 && p.e.max < 1.5, `${p.name}: ${p.e ? `Ø ${p.e.mean.toFixed(2)}, max ${p.e.max.toFixed(2)} mm` : 'nicht gefunden'}`);
+  });
+}
+
 // ---------- Freihand: Handy in der Hand (Zittern, Drehen, verwackelte Bilder) ----------
 {
   const pts = cal.pointsFromH(stress.sideViewH(20, 432, 768));

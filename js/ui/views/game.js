@@ -12,7 +12,7 @@ import { settings, calibration } from '../../state.js';
 import { sfx, say } from '../../audio/sound.js';
 import { camera } from '../../vision/camera.js';
 import { DartDetector } from '../../vision/detector.js';
-import { healthCheck, boardCrop, cropH, uncropH, uncropPoint, refine, refineOrAuto, calibrationQuality, frameMetrics, pointsFromH, fitScore, boardShiftMm } from '../../vision/calibration.js';
+import { healthCheck, boardCrop, cropH, uncropH, uncropPoint, refine, refineOrAuto, calibrationQuality, frameMetrics, pointsFromH, fitScore, boardShiftMm, edgeRefine } from '../../vision/calibration.js';
 import { applyH } from '../../vision/homography.js';
 import { zoomRect, placeVideo, sizeCanvas, drawBoard, drawMarker } from '../../vision/overlay.js';
 import { uid } from '../../core/rng.js';
@@ -243,6 +243,11 @@ export async function render(root, params) {
       if (camera.fellBack) toast('Die gespeicherte Kamera wurde nicht gefunden – bitte unter „Kamera“ neu kalibrieren.', 'err');
       if (cal.zoom && camera.zoomInfo()) await camera.setZoom(cal.zoom);
       camera.attach(camStage);
+      // Anderes Bildformat als beim Kalibrieren (z. B. 4:3 statt 16:9) → Kalibrierung passt nicht mehr
+      if (cal.aspect && Math.abs(camera.aspect - cal.aspect) > 0.02) {
+        toast('Die Kamera liefert ein anderes Bildformat als beim Kalibrieren – es wird automatisch neu ausgerichtet.', 'err');
+        needReadjust = true;
+      }
       setupCrop(cal);
       camera.startLoop(onFrame, 10);
     } catch (e) {
@@ -270,6 +275,7 @@ export async function render(root, params) {
 
   let pendingWarn = '';
   let settingsLocked = null;
+  let needReadjust = false;
   function onFrame() {
     if (destroyed || !crop) return;
     const now = performance.now();
@@ -277,6 +283,7 @@ export async function render(root, params) {
     if (now - (camera.startedAt || 0) < 2500) { detStatus = 'Kamera stellt scharf …'; drawOverlay(); return; }
     // nach der Aufwärmphase Schärfe und Weißabgleich festhalten (wo der Browser das erlaubt)
     if (settingsLocked === null) { settingsLocked = false; camera.lockSettings().then((ok) => { settingsLocked = ok; }); }
+    if (needReadjust) { needReadjust = false; readjust(); return; }
     const img = camera.grab({ crop, maxW: 640 });
     lastImg = img;
     const events = paused ? [] : detector.process(img);
@@ -317,15 +324,18 @@ export async function render(root, params) {
 
   // Kleine Lageänderung automatisch ausgleichen (nur bei leerer Scheibe)
   function autoTrack(img, refQ) {
+    // erst grob über die Farben, dann präzise über die gemessenen Ring- und Drahtkanten
     const before = fitScore(img, cropHm, 1);
     const r = refine(img, pointsFromH(cropHm), { maxEvals: 600, rotationScan: 0 });
-    if (!r?.H || r.score < before + 0.002) return false; // keine echte Verbesserung → nichts ändern
-    const move = boardShiftMm(cropHm, r.H);
+    let Hn = r?.H && r.score >= before - 0.002 ? r.H : cropHm;
+    const er = edgeRefine(img, Hn);
+    if (er) Hn = er.H;
+    const move = boardShiftMm(cropHm, Hn);
     if (move < 0.3 || move > 25) return false; // winzig: unnötig; sehr groß: nicht still übernehmen
-    const q = calibrationQuality(img, r.H).score;
+    const q = calibrationQuality(img, Hn).score;
     if (refQ != null && q < refQ - 0.03) return false;
     const cal = calibration.current;
-    const H = uncropH(r.H, crop);
+    const H = uncropH(Hn, crop);
     const updated = { ...cal, H, points: pointsFromH(H), trackedAt: Date.now() };
     calibration.save(updated);
     setupCrop(updated);
@@ -350,7 +360,7 @@ export async function render(root, params) {
       if (q < 0.85) { toast(`Nachjustieren hat nicht gereicht (${Math.round(q * 100)} %) – bitte unter „Kamera“ neu kalibrieren.`, 'err'); return; }
       const c = boardCrop(r.H);
       const cropImg = camera.grab({ crop: c, maxW: 640 });
-      const updated = { ...cal, H: r.H, points: r.points, quality: q, cropQuality: calibrationQuality(cropImg, cropH(r.H, c)).score, brightness: frameMetrics(cropImg).brightness, createdAt: Date.now(), version: 3 };
+      const updated = { ...cal, H: r.H, points: r.points, aspect: camera.aspect, quality: q, cropQuality: calibrationQuality(cropImg, cropH(r.H, c)).score, brightness: frameMetrics(cropImg).brightness, createdAt: Date.now(), version: 3 };
       await calibration.save(updated);
       setupCrop(updated);
       detector.rebase(camera.grab({ crop, maxW: 640 }));

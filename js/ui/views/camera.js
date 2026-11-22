@@ -4,7 +4,7 @@ import { camera } from '../../vision/camera.js';
 import { calibration } from '../../state.js';
 import {
   CAL_LABELS, homographyFromPoints, pointsFromH, rotateH, scaleH, autoCalibrate, refineOrAuto,
-  calibrationQuality, boardVisibility, frameMetrics, boardCrop, cropH, uncropPoint, trackFrame, sharpness,
+  calibrationQuality, boardVisibility, frameMetrics, boardCrop, cropH, uncropPoint, trackFrame, sharpness, edgeRefine,
 } from '../../vision/calibration.js';
 import { videoRect, sizeCanvas, drawBoard, drawMarker } from '../../vision/overlay.js';
 import { DartDetector } from '../../vision/detector.js';
@@ -394,6 +394,9 @@ export async function render(root) {
   async function saveCal() {
     if (!H || !camera.active) return;
     const full = camera.grab({ maxW: CAL_W });
+    // Vor dem Speichern: Ring- und Drahtkanten auf dem vollen Bild vermessen (höchste Genauigkeit)
+    const er = edgeRefine(full, H);
+    if (er) { H = er.H; points = pointsFromH(H); }
     const q = calibrationQuality(full, H).score;
     const vis = boardVisibility(H);
     if (vis < 0.98) toast('Achtung: Die Scheibe ist nicht vollständig im Bild', 'err');
