@@ -491,6 +491,27 @@ const stressLog = [];
   });
 }
 
+// ---------- Seitliche Kameraposition (Handy neben der Scheibe auf Bull-Höhe) ----------
+{
+  const sideLog = [];
+  const sideRes = [];
+  for (const [deg, tilt, light] of [[0, 0, 0.9], [30, 0, 0.9], [-30, 0, 0.9], [45, 0, 0.9], [-45, 0, 0.9], [55, 0, 0.9], [-55, 0, 0.9], [45, 12, 0.9], [-45, -12, 0.9], [55, 0, 0.5], [-55, 12, 0.8]]) {
+    const Hs = stress.sideViewH(deg, 432, 768, { tilt });
+    const pts = cal.pointsFromH(Hs);
+    const { img, H } = scene.renderScene({ w: 432, h: 768, pts, light, noise: 5, seed: 21, wall: [70, 12, 52] });
+    const r = cal.autoCalibrate(img);
+    const e = r ? stress.errorMm(r.H, H) : null;
+    const name = `${deg === 0 ? 'frontal' : deg > 0 ? 'rechts' : 'links'} ${Math.abs(deg)}°${tilt ? (tilt > 0 ? ', höher' : ', tiefer') : ''}${light < 0.7 ? ', dunkel' : ''}`;
+    sideRes.push({ name, e });
+    sideLog.push(`${e && e.max < 4 ? '✔' : '✘'} ${name}: ${e ? `max ${e.max.toFixed(1)} mm, Ø ${e.mean.toFixed(1)} mm` : 'nicht gefunden'}`);
+  }
+  stressLog.push('— Seitenwinkel —', ...sideLog);
+  test('Kalibrierung: Kamera seitlich bis 55° (auch höher/tiefer, dunkel), max. Fehler < 4 mm', () => {
+    const bad = sideRes.filter((r) => !r.e || r.e.max >= 4);
+    ok(!bad.length, bad.map((b) => `${b.name}: ${b.e ? b.e.max.toFixed(1) + ' mm' : 'nicht gefunden'}`).join('; '));
+  });
+}
+
 // ---------- Ausgabe ----------
 const out = document.getElementById('out');
 const failed = results.filter((r) => !r.ok);

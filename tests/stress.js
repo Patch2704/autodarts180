@@ -71,6 +71,38 @@ function paint(img, fn) {
   const c = toCanvas(img); fn(c.getContext('2d'), c.width, c.height); return fromCanvas(c);
 }
 
+/**
+ * Kamera seitlich neben der Scheibe auf Bull-Höhe: Blickwinkel deg (0 = frontal, + = von rechts).
+ * Liefert H (Board mm → Bild normiert) für ein Bild w×h, Lochkamera auf das Bull gerichtet.
+ */
+export function sideViewH(deg, w, h, { dist = 650, fill = 0.8, tilt = 0 } = {}) {
+  const t = (deg * Math.PI) / 180, tl = (tilt * Math.PI) / 180;
+  const C = [Math.sin(t) * dist * Math.cos(tl), Math.sin(tl) * dist, Math.cos(t) * dist * Math.cos(tl)];
+  const n = Math.hypot(...C);
+  const fwd = C.map((v) => -v / n);
+  const up = [0, 1, 0];
+  let right = [fwd[1] * up[2] - fwd[2] * up[1], fwd[2] * up[0] - fwd[0] * up[2], fwd[0] * up[1] - fwd[1] * up[0]];
+  const rn = Math.hypot(...right); right = right.map((v) => v / rn);
+  const cup = [right[1] * fwd[2] - right[2] * fwd[1], right[2] * fwd[0] - right[0] * fwd[2], right[0] * fwd[1] - right[1] * fwd[0]];
+  // Brennweite so, dass die Scheibe (Ø 450 mm) frontal fill × min(w,h) füllt
+  const f = (fill * Math.min(w, h)) / (450 / dist);
+  const proj = (X, Y) => {
+    const p = [X - C[0], Y - C[1], -C[2]];
+    const xc = p[0] * right[0] + p[1] * right[1] + p[2] * right[2];
+    const yc = p[0] * cup[0] + p[1] * cup[1] + p[2] * cup[2];
+    const zc = p[0] * fwd[0] + p[1] * fwd[1] + p[2] * fwd[2];
+    return { x: (w / 2 + (f * xc) / zc) / w, y: (h / 2 - (f * yc) / zc) / h };
+  };
+  return cal.homographyFromPoints(cal.calBoardPoints().map((p) => proj(p.x, p.y)));
+}
+
+/** Echtes Foto in eine andere Kameraposition umrechnen (exakt für alles auf der Scheibenebene) */
+export function reproject(img, Hsrc, Hdst, outW = img.width, outH = img.height) {
+  const toPx = (H, w, h) => [H[0] * w, H[1] * w, H[2] * w, H[3] * h, H[4] * h, H[5] * h, H[6], H[7], H[8]];
+  const T = mulH(toPx(Hdst, outW, outH), invertH(toPx(Hsrc, img.width, img.height)));
+  return warpImage(img, T, outW, outH);
+}
+
 /** Fehler (mm) der geschätzten Kalibrierung Hp gegenüber Wahrheit Ht, gemessen auf der Scheibe */
 export function errorMm(Hp, Ht, w, h) {
   // beide: Board(mm) → normiert; Fehlerpunkt: Board-Punkt → Bild (geschätzt) → Board (wahr)

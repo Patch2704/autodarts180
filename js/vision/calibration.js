@@ -267,35 +267,57 @@ export function globalRingSearch(img, maxCandidates = 4) {
     return sc + 2 * Math.min(r0, g0) + 2 * Math.min(r1, g1);
   };
   const minR = 8, maxR = Math.min(sw, sh) * 0.7;
-  const shapes = [[1, 1], [0.78, 1], [1, 0.78], [0.6, 1], [1, 0.6]];
-  // nur die besten Kandidaten behalten (kein Sammeln + Sortieren aller Positionen)
+  // Ellipsenformen: frontal bis stark seitlich (Kamera neben der Scheibe bis ~70° → Breite ≈ cos 70° ≈ 0,34)
+  const shapes = [[1, 1], [0.78, 1], [1, 0.78], [0.6, 1], [1, 0.6], [0.46, 1], [0.35, 1]];
+  // Kandidaten getrennt nach Formgruppe sammeln (breit/normal und schmal/steil seitlich),
+  // damit schmale Fehltreffer die richtigen runden Kandidaten nicht verdrängen und umgekehrt
   const TOP = 40;
-  const cands = [];
-  let minTop = 4;
+  const groups = [{ cands: [], min: 4 }, { cands: [], min: 4 }];
+  // Stufe 1: grobes Raster (Schrittweite ≈ r/4)
   for (let r = minR; r <= maxR; r *= 1.1) {
-    const st = Math.max(2, Math.round(r / 8));
+    const st = Math.max(3, Math.round(r / 4));
     for (const [fx, fy] of shapes) {
+      const grp = groups[Math.min(fx, fy) < 0.55 ? 1 : 0];
       const rx = r * fx, ry = r * fy;
       for (let cy = Math.round(ry * 0.5); cy < sh - ry * 0.5; cy += st) for (let cx = Math.round(rx * 0.5); cx < sw - rx * 0.5; cx += st) {
         const sc = evalAt(cx, cy, rx, ry);
-        if (sc <= minTop) continue;
-        cands.push({ cx, cy, rx, ry, sc });
-        if (cands.length > TOP * 2) {
-          cands.sort((a, b) => b.sc - a.sc);
-          cands.length = TOP;
-          minTop = cands[TOP - 1].sc;
+        if (sc <= grp.min) continue;
+        grp.cands.push({ cx, cy, rx, ry, sc, st });
+        if (grp.cands.length > TOP * 2) {
+          grp.cands.sort((a, b) => b.sc - a.sc);
+          grp.cands.length = TOP;
+          grp.min = grp.cands[TOP - 1].sc;
         }
       }
     }
   }
-  cands.sort((a, b) => b.sc - a.sc);
-  // deutlich verschiedene Kandidaten auswählen
-  const picked = [];
-  for (const c of cands) {
-    if (picked.some((p) => Math.hypot(p.cx - c.cx, p.cy - c.cy) < Math.max(p.rx, p.ry) * 0.3 && Math.abs(Math.log(p.rx / c.rx)) < 0.25)) continue;
-    picked.push(c);
-    if (picked.length >= maxCandidates) break;
+  // Stufe 2: um die besten Treffer jeder Gruppe fein nachsuchen (Lage ±Rasterweite, Größe ±5 %)
+  for (const grp of groups) {
+    grp.cands.sort((a, b) => b.sc - a.sc);
+    grp.cands = grp.cands.slice(0, 16).map((c) => {
+      let best = c;
+      const d = Math.max(1, Math.round(c.st / 3));
+      for (let dy = -c.st; dy <= c.st; dy += d) for (let dx = -c.st; dx <= c.st; dx += d) for (const k of [0.95, 1, 1.05]) {
+        const rx = c.rx * k, ry = c.ry * k;
+        const sc = evalAt(c.cx + dx, c.cy + dy, rx, ry);
+        if (sc > best.sc) best = { cx: c.cx + dx, cy: c.cy + dy, rx, ry, sc, st: c.st };
+      }
+      return best;
+    });
   }
+  // deutlich verschiedene Kandidaten auswählen: maxCandidates aus der normalen, 2 aus der schmalen Gruppe
+  const picked = [];
+  const pick = (list, n) => {
+    list.sort((a, b) => b.sc - a.sc);
+    let k = 0;
+    for (const c of list) {
+      if (picked.some((p) => Math.hypot(p.cx - c.cx, p.cy - c.cy) < Math.max(p.rx, p.ry) * 0.3 && Math.abs(Math.log(p.rx / c.rx)) < 0.25 && Math.abs(Math.log(p.ry / c.ry)) < 0.25)) continue;
+      picked.push(c);
+      if (++k >= n) break;
+    }
+  };
+  pick(groups[0].cands, maxCandidates);
+  pick(groups[1].cands, 2);
   return picked.map((c) => {
     const pts = CAL_ANGLES.map((deg) => {
       const t = (deg * Math.PI) / 180;
@@ -325,15 +347,15 @@ export function rotationSearch(img, H0) {
  * (±20 % Lage, 75–130 % Größe) und nimmt die beste Übereinstimmung. Damit ist die
  * Feinjustierung nicht mehr auf eine sehr gute Erstschätzung angewiesen.
  */
-export function coarseSearch(img, H0) {
+export function coarseSearch(img, H0, withAniso = false) {
   img = normalizeColors(img);
   const W = img.width, Hh = img.height;
   const c = applyH(H0, 0, 0);
   const e = applyH(H0, R.DOUBLE_OUT, 0);
   const rad = Math.hypot((e.x - c.x) * W, (e.y - c.y) * Hh); // Doppelring-Radius in px
   const blur = Math.max(1, Math.min(4, Math.round(rad / 60)));
-  const transform = (tx, ty, s) => mulH([
-    s, 0, c.x * (1 - s) + tx,
+  const transform = (tx, ty, s, ax = 1) => mulH([
+    s * ax, 0, c.x * (1 - s * ax) + tx,
     0, s, c.y * (1 - s) + ty,
     0, 0, 1,
   ], H0);
@@ -355,7 +377,24 @@ export function coarseSearch(img, H0) {
     if (localBest.score > best.score) best = localBest;
     base = { tx: localBest.tx, ty: localBest.ty, s: localBest.s };
   }
-  return best.H;
+  const iso = best.H;
+  if (!withAniso) return iso;
+  // Breite getrennt anpassen (seitlicher Blick: Scheibe im Bild schmaler als hoch), dann Lage nachziehen
+  let ax = 1;
+  for (const [sp, n, axes] of [[span / 4, 1, [0.6, 0.72, 0.85, 1, 1.18, 1.4, 1.65]], [span / 8, 1, [0.93, 1, 1.07]]]) {
+    let localBest = null;
+    for (let iy = -n; iy <= n; iy++) for (let ix = -n; ix <= n; ix++) for (const af of axes) {
+      const tx = base.tx + (ix * sp) / W, ty = base.ty + (iy * sp) / Hh, a = ax * af;
+      const H = transform(tx, ty, base.s, a);
+      const sc = fitScoreCoarse(img, H, blur, true);
+      if (!localBest || sc > localBest.score) localBest = { H, score: sc, tx, ty, a };
+    }
+    if (localBest.score > best.score) best = localBest;
+    base = { tx: localBest.tx, ty: localBest.ty, s: base.s };
+    ax = localBest.a;
+  }
+  // Beide Varianten zurückgeben – welche besser ist, entscheidet die farbgenaue Bewertung danach
+  return best.H === iso ? [iso] : [iso, best.H];
 }
 
 /** Kontinuierliche Übereinstimmung (0..1) zwischen Bild und projizierter Scheibe */
@@ -634,25 +673,25 @@ export function autoCalibrate(img) {
   if (!starts.length) return null;
   // Jeden Kandidaten grob ausrichten (schnell), nur den besten fein justieren
   const W = img.width, Hh = img.height;
-  const coarse = starts.map((Hs) => {
-    const H0 = rotationSearch(img, coarseSearch(img, Hs));
+  const coarse = starts.flatMap((Hs) => coarseSearch(img, Hs, true)).map((Hc) => {
+    const H0 = rotationSearch(img, Hc);
     const c = applyH(H0, 0, 0), e = applyH(H0, R.DOUBLE_OUT, 0);
     const blur = Math.max(1, Math.min(3, Math.round(Math.hypot((e.x - c.x) * W, (e.y - c.y) * Hh) / 80)));
     return { H0, score: fitScoreCoarse(img, H0, blur) };
   }).sort((a, b) => b.score - a.score);
   let best = null;
-  for (const { H0 } of coarse.slice(0, 2)) {
+  for (const { H0 } of coarse.slice(0, 3)) {
     let r = refine(img, pointsFromH(H0), { maxMs: 600, rotationScan: 3 });
     if (r.score < 0.85) {
-      const alt = refine(img, pointsFromH(rotateH(H0, 18)), { maxMs: 400, rotationScan: 3 });
+      const alt = refine(img, pointsFromH(rotateH(H0, 18)), { maxMs: 300, rotationScan: 3 });
       if (alt.score > r.score) r = alt;
     }
     if (r?.H && (!best || r.score > best.score)) best = r;
-    if (best && calibrationQuality(img, best.H).score > 0.95) break; // eindeutig gefunden
+    if (best && calibrationQuality(img, best.H).score > 0.93) break; // eindeutig gefunden
   }
   if (!best?.H) return null;
   // Gegenprobe Ring-Verwechslung: Triple- und Doppelring haben dasselbe Farbmuster.
-  if (calibrationQuality(img, best.H).score < 0.95) {
+  if (calibrationQuality(img, best.H).score < 0.9) {
     for (const f of [103 / 166, 166 / 103]) {
       const r = refine(img, pointsFromH(scaleH(best.H, f)), { maxMs: 500, rotationScan: 3 });
       if (r?.H && r.score > best.score) best = r;
