@@ -495,7 +495,9 @@ const stressLog = [];
 {
   const sideLog = [];
   const sideRes = [];
-  for (const [deg, tilt, light] of [[0, 0, 0.9], [30, 0, 0.9], [-30, 0, 0.9], [45, 0, 0.9], [-45, 0, 0.9], [55, 0, 0.9], [-55, 0, 0.9], [45, 12, 0.9], [-45, -12, 0.9], [55, 0, 0.5], [-55, 12, 0.8]]) {
+  for (const [deg, tilt, light] of [[0, 0, 0.9], [30, 0, 0.9], [-30, 0, 0.9], [45, 0, 0.9], [-45, 0, 0.9], [55, 0, 0.9], [-55, 0, 0.9], [45, 12, 0.9], [-45, -12, 0.9], [55, 0, 0.5], [-55, 12, 0.8],
+    // steil seitlich UND Kamera deutlich höher/tiefer (schräg liegende Ellipse)
+    [-45, 20, 0.9], [45, -20, 0.9], [55, 12, 0.9], [-55, -12, 0.85], [62, 12, 0.9], [-62, 0, 0.9]]) {
     const Hs = stress.sideViewH(deg, 432, 768, { tilt });
     const pts = cal.pointsFromH(Hs);
     const { img, H } = scene.renderScene({ w: 432, h: 768, pts, light, noise: 5, seed: 21, wall: [70, 12, 52] });
@@ -506,7 +508,7 @@ const stressLog = [];
     sideLog.push(`${e && e.max < 4 ? '✔' : '✘'} ${name}: ${e ? `max ${e.max.toFixed(1)} mm, Ø ${e.mean.toFixed(1)} mm` : 'nicht gefunden'}`);
   }
   stressLog.push('— Seitenwinkel —', ...sideLog);
-  test('Kalibrierung: Kamera seitlich bis 55° (auch höher/tiefer, dunkel), max. Fehler < 4 mm', () => {
+  test('Kalibrierung: Kamera seitlich bis 62° (auch höher/tiefer bis 20°, dunkel), max. Fehler < 4 mm', () => {
     const bad = sideRes.filter((r) => !r.e || r.e.max >= 4);
     ok(!bad.length, bad.map((b) => `${b.name}: ${b.e ? b.e.max.toFixed(1) + ' mm' : 'nicht gefunden'}`).join('; '));
   });

@@ -205,12 +205,24 @@ const EDGE_PROBES = (() => {
 // Reduzierte Prüfpunkte (nur Segmentmitten) für die schnelle Grobsuche
 const COARSE_PROBES = PROBES.filter((p, i) => p.kind !== 'ring-edge' && (p.kind === 'bull' || i % 3 === 1));
 
+// Weichgezeichnete Bildkopien je Radius zwischenspeichern: ein Box-Blur pro Bild ersetzt das
+// tausendfache Mitteln von (2r+1)² Pixeln pro Prüfpunkt (gleiches Ergebnis, viel schneller)
+const blurCache = new WeakMap();
+function blurredOf(img, r) {
+  if (r <= 1) return img;
+  let m = blurCache.get(img);
+  if (!m) { m = new Map(); blurCache.set(img, m); }
+  if (!m.has(r)) m.set(r, boxBlur(img, r));
+  return m.get(r);
+}
+
 // anyColor = true: Ringe müssen nur farbig sein (rot ODER grün) – unabhängig von der Drehung
 function fitScoreCoarse(img, H, radius, anyColor = false) {
   let ring = 0, nRing = 0, neutral = 0, nNeutral = 0;
+  const src = blurredOf(img, radius), rad = radius > 1 ? 0 : radius;
   for (const p of COARSE_PROBES) {
     const q = applyH(H, p.x, p.y);
-    const rgb = sampleRGB(img, q.x, q.y, radius);
+    const rgb = sampleRGB(src, q.x, q.y, rad);
     if (p.want === 'neutral') { nNeutral++; if (rgb) neutral += 1 - colorEvidence(rgb, 'any'); }
     else { nRing++; if (rgb) ring += colorEvidence(rgb, anyColor ? 'any' : p.want); }
   }
@@ -239,27 +251,38 @@ export function globalRingSearch(img, maxCandidates = 4) {
     if (s >= 0.2 && dd >= 14 && vv >= 0.24) mask[y * sw + x] = isRedHue(hu) ? 1 : isGreenHue(hu) ? 2 : 0;
   }
   // Schablone (Einheitskreis, Radius 1 = Doppelring-Außenkante 170 mm).
-  // Art: 0 = Doppelring, 1 = Triple-Ring (müssen rot UND grün enthalten), 2 = Bull, -1 = ungefärbt
+  // Art: 0 = Doppelring, 1 = Triple-Ring (müssen rot UND grün enthalten), 3 = Bull, -1 = ungefärbt
   const tpl = [];
+  const ringAt = (k) => { const a = (k * 12 + 3) * Math.PI / 180, c = Math.cos(a), s = Math.sin(a); return [[c * 166 / 170, s * 166 / 170, 0], [c * 103 / 170, s * 103 / 170, 1]]; };
+  // zuerst 16 über den Umfang verteilte Ringpunkte: trifft davon fast keiner Farbe, liegt dort
+  // keine Scheibe und der Rest der Prüfung entfällt (spart den Großteil der Rechenzeit)
+  for (let k = 0; k < 30; k += 4) tpl.push(...ringAt(k));
+  const EARLY = tpl.length;
   for (let k = 0; k < 30; k++) {
-    const a = (k * 12 + 3) * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
-    tpl.push([c * 166 / 170, s * 166 / 170, 0], [c * 103 / 170, s * 103 / 170, 1]);
-    if (k % 2 === 0) tpl.push([c * 60 / 170, s * 60 / 170, -1], [c * 135 / 170, s * 135 / 170, -1], [c * 190 / 170, s * 190 / 170, -1]);
+    if (k % 4) tpl.push(...ringAt(k));
+    if (k % 2 === 0) {
+      const a = (k * 12 + 3) * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+      tpl.push([c * 60 / 170, s * 60 / 170, -1], [c * 135 / 170, s * 135 / 170, -1], [c * 190 / 170, s * 190 / 170, -1]);
+    }
   }
-  for (let k = 0; k < 6; k++) { const a = k * 60 * Math.PI / 180; tpl.push([Math.cos(a) * 11 / 170, Math.sin(a) * 11 / 170, 2]); }
+  // Bull darf leicht neben der Ellipsenmitte liegen (Perspektive): 3 Positionen, je ⅓ Gewicht (Art 3)
+  for (const du of [-14, 0, 14]) for (let k = 0; k < 6; k++) { const a = k * 60 * Math.PI / 180; tpl.push([(Math.cos(a) * 11 + du) / 170, Math.sin(a) * 11 / 170, 3]); }
   // flach gespeicherte Schablone (schneller als Objekte/Destrukturierung)
   const TN = tpl.length, TU = new Float32Array(TN), TV = new Float32Array(TN), TK = new Int8Array(TN);
   tpl.forEach(([u, v, k], i) => { TU[i] = u; TV[i] = v; TK[i] = k; });
-  const evalAt = (cx, cy, rx, ry) => {
+  // Ellipse mit Halbachsen rx/ry, um phi gedreht (Kamera seitlich UND höher/tiefer → schräge Ellipse)
+  const evalAt = (cx, cy, rx, ry, cp = 1, sp = 0) => {
     let r0 = 0, g0 = 0, r1 = 0, g1 = 0, sc = 0;
     for (let i = 0; i < TN; i++) {
-      const x = (cx + TU[i] * rx + 0.5) | 0, y = (cy + TV[i] * ry + 0.5) | 0;
+      if (i === EARLY && r0 + g0 + r1 + g1 < 3) return -1e9; // frühzeitig verwerfen
+      const ux = TU[i] * rx, vy = TV[i] * ry;
+      const x = (cx + ux * cp - vy * sp + 0.5) | 0, y = (cy + ux * sp + vy * cp + 0.5) | 0;
       const k = TK[i];
       if (x < 0 || y < 0 || x >= sw || y >= sh) { if (k >= 0) sc -= 0.3; continue; }
       const m = mask[y * sw + x];
       if (!m) continue;
       if (k === -1) sc -= 1;
-      else if (k === 2) sc += 1;
+      else if (k === 3) sc += 1 / 3;
       else if (k === 0) { if (m === 1) r0++; else g0++; }
       else if (m === 1) r1++; else g1++;
     }
@@ -267,22 +290,29 @@ export function globalRingSearch(img, maxCandidates = 4) {
     return sc + 2 * Math.min(r0, g0) + 2 * Math.min(r1, g1);
   };
   const minR = 8, maxR = Math.min(sw, sh) * 0.7;
-  // Ellipsenformen: frontal bis stark seitlich (Kamera neben der Scheibe bis ~70° → Breite ≈ cos 70° ≈ 0,34)
-  const shapes = [[1, 1], [0.78, 1], [1, 0.78], [0.6, 1], [1, 0.6], [0.46, 1], [0.35, 1]];
-  // Kandidaten getrennt nach Formgruppe sammeln (breit/normal und schmal/steil seitlich),
-  // damit schmale Fehltreffer die richtigen runden Kandidaten nicht verdrängen und umgekehrt
+  // Ellipsenformen [Breite, Höhe, Drehung°, Gruppe]: frontal bis stark seitlich (bis ~70°: Breite ≈ cos 70° ≈ 0,34);
+  // gedrehte Formen für Kamera seitlich und zusätzlich höher/tiefer als das Bull
+  const shapes = [[1, 1, 0, 0], [0.78, 1, 0, 0], [1, 0.78, 0, 0], [0.6, 1, 0, 0], [1, 0.6, 0, 0], [0.46, 1, 0, 1], [0.35, 1, 0, 1]];
+  for (const [fx, angs] of [[0.78, [-15, 15]], [0.6, [-14, 14, -28, 28]], [0.46, [-12, 12, -24, 24]]]) {
+    for (const a of angs) shapes.push([fx, 1, a, 2]);
+  }
+  // Kandidaten getrennt nach Formgruppe sammeln (normal, schmal, schräg), damit Fehltreffer einer
+  // Gruppe die richtigen Kandidaten einer anderen nicht verdrängen
   const TOP = 40;
-  const groups = [{ cands: [], min: 4 }, { cands: [], min: 4 }];
+  const groups = [{ cands: [], min: 4 }, { cands: [], min: 4 }, { cands: [], min: 4 }];
   // Stufe 1: grobes Raster (Schrittweite ≈ r/4)
   for (let r = minR; r <= maxR; r *= 1.1) {
     const st = Math.max(3, Math.round(r / 4));
-    for (const [fx, fy] of shapes) {
-      const grp = groups[Math.min(fx, fy) < 0.55 ? 1 : 0];
-      const rx = r * fx, ry = r * fy;
-      for (let cy = Math.round(ry * 0.5); cy < sh - ry * 0.5; cy += st) for (let cx = Math.round(rx * 0.5); cx < sw - rx * 0.5; cx += st) {
-        const sc = evalAt(cx, cy, rx, ry);
+    for (const [fx, fy, phi, gi] of shapes) {
+      // schmale/schräge Formen (Kamera seitlich) nur ab Mindestgröße: dann ist die Scheibe nie winzig
+      if ((gi === 1 && r < 14) || (gi === 2 && r < 18)) continue;
+      const grp = groups[gi];
+      const rx = r * fx, ry = r * fy, cp = Math.cos((phi * Math.PI) / 180), sp = Math.sin((phi * Math.PI) / 180);
+      const ex = Math.abs(rx * cp) + Math.abs(ry * sp), ey = Math.abs(rx * sp) + Math.abs(ry * cp);
+      for (let cy = Math.round(ey * 0.5); cy < sh - ey * 0.5; cy += st) for (let cx = Math.round(ex * 0.5); cx < sw - ex * 0.5; cx += st) {
+        const sc = evalAt(cx, cy, rx, ry, cp, sp);
         if (sc <= grp.min) continue;
-        grp.cands.push({ cx, cy, rx, ry, sc, st });
+        grp.cands.push({ cx, cy, rx, ry, cp, sp, sc, st });
         if (grp.cands.length > TOP * 2) {
           grp.cands.sort((a, b) => b.sc - a.sc);
           grp.cands.length = TOP;
@@ -299,29 +329,31 @@ export function globalRingSearch(img, maxCandidates = 4) {
       const d = Math.max(1, Math.round(c.st / 3));
       for (let dy = -c.st; dy <= c.st; dy += d) for (let dx = -c.st; dx <= c.st; dx += d) for (const k of [0.95, 1, 1.05]) {
         const rx = c.rx * k, ry = c.ry * k;
-        const sc = evalAt(c.cx + dx, c.cy + dy, rx, ry);
-        if (sc > best.sc) best = { cx: c.cx + dx, cy: c.cy + dy, rx, ry, sc, st: c.st };
+        const sc = evalAt(c.cx + dx, c.cy + dy, rx, ry, c.cp, c.sp);
+        if (sc > best.sc) best = { ...c, cx: c.cx + dx, cy: c.cy + dy, rx, ry, sc };
       }
       return best;
     });
   }
-  // deutlich verschiedene Kandidaten auswählen: maxCandidates aus der normalen, 2 aus der schmalen Gruppe
+  // deutlich verschiedene Kandidaten auswählen: maxCandidates normal, je 2 schmal und schräg
   const picked = [];
   const pick = (list, n) => {
     list.sort((a, b) => b.sc - a.sc);
     let k = 0;
     for (const c of list) {
-      if (picked.some((p) => Math.hypot(p.cx - c.cx, p.cy - c.cy) < Math.max(p.rx, p.ry) * 0.3 && Math.abs(Math.log(p.rx / c.rx)) < 0.25 && Math.abs(Math.log(p.ry / c.ry)) < 0.25)) continue;
+      if (picked.some((p) => Math.hypot(p.cx - c.cx, p.cy - c.cy) < Math.max(p.rx, p.ry) * 0.3 && Math.abs(Math.log(p.rx / c.rx)) < 0.25 && Math.abs(Math.log(p.ry / c.ry)) < 0.25 && Math.abs(p.sp - c.sp) < 0.15)) continue;
       picked.push(c);
       if (++k >= n) break;
     }
   };
   pick(groups[0].cands, maxCandidates);
   pick(groups[1].cands, 2);
+  pick(groups[2].cands, 2);
   return picked.map((c) => {
     const pts = CAL_ANGLES.map((deg) => {
       const t = (deg * Math.PI) / 180;
-      return { x: (c.cx + Math.cos(t) * c.rx) / sw, y: (c.cy - Math.sin(t) * c.ry) / sh };
+      const dx = Math.cos(t) * c.rx, dy = -Math.sin(t) * c.ry;
+      return { x: (c.cx + dx * c.cp - dy * c.sp) / sw, y: (c.cy + dx * c.sp + dy * c.cp) / sh };
     });
     return homographyFromPoints(pts);
   }).filter(Boolean);
@@ -354,17 +386,34 @@ export function coarseSearch(img, H0, withAniso = false) {
   const e = applyH(H0, R.DOUBLE_OUT, 0);
   const rad = Math.hypot((e.x - c.x) * W, (e.y - c.y) * Hh); // Doppelring-Radius in px
   const blur = Math.max(1, Math.min(4, Math.round(rad / 60)));
-  const transform = (tx, ty, s, ax = 1) => mulH([
-    s * ax, 0, c.x * (1 - s * ax) + tx,
-    0, s, c.y * (1 - s) + ty,
-    0, 0, 1,
-  ], H0);
+  // Richtung der kurzen Ellipsenachse (in Pixeln): entlang dieser wird die Breite angepasst –
+  // bei Kamera seitlich und höher/tiefer liegt die Ellipse schräg
+  let th = 0;
+  {
+    let sx = 0, sy = 0; const pp = [];
+    for (let k = 0; k < 24; k++) { const t = (k * 15 * Math.PI) / 180; const p = applyH(H0, R.DOUBLE_OUT * Math.cos(t), R.DOUBLE_OUT * Math.sin(t)); pp.push([p.x * W, p.y * Hh]); sx += p.x * W; sy += p.y * Hh; }
+    sx /= 24; sy /= 24;
+    let cxx = 0, cxy = 0, cyy = 0;
+    for (const [x, y] of pp) { cxx += (x - sx) ** 2; cxy += (x - sx) * (y - sy); cyy += (y - sy) ** 2; }
+    th = 0.5 * Math.atan2(2 * cxy, cxx - cyy) + Math.PI / 2; // Hauptachse + 90° = kurze Achse
+  }
+  const ct = Math.cos(th), st2 = Math.sin(th);
+  const transform = (tx, ty, s, ax = 1) => {
+    // Pixelraum: A = s · (I + (ax−1)·n·nᵀ), n = kurze Achse; in normierte Koordinaten umgerechnet
+    const a00 = s * (1 + (ax - 1) * ct * ct), a01 = s * (ax - 1) * ct * st2, a11 = s * (1 + (ax - 1) * st2 * st2);
+    const m00 = a00, m01 = (a01 * Hh) / W, m10 = (a01 * W) / Hh, m11 = a11;
+    return mulH([
+      m00, m01, c.x - m00 * c.x - m01 * c.y + tx,
+      m10, m11, c.y - m10 * c.x - m11 * c.y + ty,
+      0, 0, 1,
+    ], H0);
+  };
   let best = { H: H0, score: fitScoreCoarse(img, H0, blur, true) };
   const span = 0.2 * rad;
   // zweistufig: grob (7×7×5), dann um das beste Ergebnis enger (5×5×3)
   // Größen bis 0,6× / 1,7×: Triple- und Doppelring haben dasselbe Farbmuster (Radien 103/166 mm),
   // eine Verwechslung muss deshalb immer mitgeprüft werden.
-  const passes = [[span, 3, [0.35, 0.42, 0.5, 0.6, 0.68, 0.77, 0.87, 1, 1.15, 1.3, 1.48, 1.68]], [span / 3, 2, [0.94, 1, 1.06]]];
+  const passes = [[span, 2, [0.35, 0.42, 0.5, 0.6, 0.68, 0.77, 0.87, 1, 1.15, 1.3, 1.48, 1.68]], [span / 2, 2, [0.94, 1, 1.06]]];
   let base = { tx: 0, ty: 0, s: 1 };
   for (const [sp, n, scales] of passes) {
     let localBest = null;
@@ -400,6 +449,8 @@ export function coarseSearch(img, H0, withAniso = false) {
 /** Kontinuierliche Übereinstimmung (0..1) zwischen Bild und projizierter Scheibe */
 export function fitScore(img, H, radius = 0) {
   img = normalizeColors(img);
+  // große Mittelungsradien über eine einmal weichgezeichnete Kopie (gleiches Ergebnis, schneller)
+  if (radius > 1) { img = blurredOf(img, radius); radius = 0; }
   let ring = 0, nRing = 0, neutral = 0, nNeutral = 0;
   for (const p of PROBES) {
     const q = applyH(H, p.x, p.y);
