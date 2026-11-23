@@ -14,8 +14,10 @@ const COLORS = {
  * Erzeugt eine Szene. pts = 4 Kalibrierpunkte (normiert) der echten Lage.
  * Liefert { img: ImageData, H } mit H = Board(mm) → Bild(normiert).
  */
-export function renderScene({ w = 960, h = 540, pts, darts = [], seed = 1, light = 1, noise = 6, warm = true, wall = null }) {
+export function renderScene({ w = 960, h = 540, pts, darts = [], seed = 1, light = 1, noise = 6, warm = true, wall = null, colors = null, texture = 0 }) {
+  const PAL = colors ? { ...COLORS, ...colors } : COLORS;
   if (wall) COLORS.wall = wall; else COLORS.wall = [118, 108, 92];
+  if (wall) PAL.wall = wall;
   const H = homographyFromPoints(pts);
   const Hpx = [H[0] * w, H[1] * w, H[2] * w, H[3] * h, H[4] * h, H[5] * h, H[6], H[7], H[8]];
   const Hi = invertH(Hpx);
@@ -27,10 +29,10 @@ export function renderScene({ w = 960, h = 540, pts, darts = [], seed = 1, light
       const b = applyH(Hi, x + 0.5, y + 0.5);
       const r = Math.hypot(b.x, b.y);
       let c;
-      if (r > 225) c = COLORS.wall;
-      else if (r > R.DOUBLE_OUT) c = COLORS.surround;
-      else if (r <= R.DBULL) c = COLORS.red;
-      else if (r <= R.SBULL) c = COLORS.green;
+      if (r > 225) c = PAL.wall;
+      else if (r > R.DOUBLE_OUT) c = PAL.surround;
+      else if (r <= R.DBULL) c = PAL.red;
+      else if (r <= R.SBULL) c = PAL.green;
       else {
         const a = (Math.atan2(b.y, b.x) * 180) / Math.PI;
         const rot = (((90 - a + 9) % 360) + 360) % 360;
@@ -38,18 +40,19 @@ export function renderScene({ w = 960, h = 540, pts, darts = [], seed = 1, light
         const rel = rot - idx * 18;
         const even = idx % 2 === 0;
         const ring = (r >= R.TRIPLE_IN && r <= R.TRIPLE_OUT) || r >= R.DOUBLE_IN;
-        c = ring ? (even ? COLORS.red : COLORS.green) : (even ? COLORS.black : COLORS.cream);
+        c = ring ? (even ? PAL.red : PAL.green) : (even ? PAL.black : PAL.cream);
         // Drähte
         const wd = Math.min(rel, 18 - rel) * Math.PI / 180 * r;
         const ringEdge = [R.TRIPLE_IN, R.TRIPLE_OUT, R.DOUBLE_IN, R.DOUBLE_OUT].some((q) => Math.abs(r - q) < 0.6);
-        if (wd < 0.6 || ringEdge) c = COLORS.wire;
+        if (wd < 0.6 || ringEdge) c = PAL.wire;
       }
       // Licht: Verlauf von links oben, warm getönt
       const shade = light * (0.75 + 0.35 * (1 - (x / w) * 0.6 - (y / h) * 0.4));
+      const tx = texture && r < 225 ? gaussian(rng) * texture : 0; // Sisalstruktur (fest im Bild)
       const i = (y * w + x) * 4;
-      d[i] = clamp(c[0] * shade * (warm ? 1.08 : 1) + gaussian(rng) * noise);
-      d[i + 1] = clamp(c[1] * shade + gaussian(rng) * noise);
-      d[i + 2] = clamp(c[2] * shade * (warm ? 0.85 : 1) + gaussian(rng) * noise);
+      d[i] = clamp((c[0] + tx) * shade * (warm ? 1.08 : 1) + gaussian(rng) * noise);
+      d[i + 1] = clamp((c[1] + tx) * shade + gaussian(rng) * noise);
+      d[i + 2] = clamp((c[2] + tx) * shade * (warm ? 0.85 : 1) + gaussian(rng) * noise);
       d[i + 3] = 255;
     }
   }

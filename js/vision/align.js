@@ -1,0 +1,146 @@
+// Feinausrichtung zweier Bilder derselben Szene (Stativ wackelt, Scheibe verrutscht minimal):
+// Verschiebung, Drehung und Maßstab auf Bruchteile eines Pixels, dazu ein Helligkeitsabgleich.
+// Pfeile, Hände usw. zählen als Ausreißer und beeinflussen das Ergebnis kaum.
+
+const lumCache = new WeakMap();
+
+/** Helligkeitsbild (Float32) eines RGBA-Puffers, zwischengespeichert */
+export function luminance(data) {
+  let l = lumCache.get(data);
+  if (l) return l;
+  const n = data.length >> 2;
+  l = new Float32Array(n);
+  for (let p = 0, i = 0; p < n; p++, i += 4) l[p] = (data[i] + 2 * data[i + 1] + data[i + 2]) / 4;
+  lumCache.set(data, l);
+  return l;
+}
+
+export const IDENTITY = { a: 0, b: 0, tx: 0, ty: 0, cx: 0, cy: 0 };
+
+/** Bildpunkt (x, y) des aktuellen Bilds → Bildpunkt in der Referenz */
+export function applyT(T, x, y) {
+  const X = x - T.cx, Y = y - T.cy;
+  return { x: x + T.a * X - T.b * Y + T.tx, y: y + T.b * X + T.a * Y + T.ty };
+}
+
+/** Größte Verschiebung (px), die T innerhalb eines Radius r um die Mitte bewirkt */
+export function transformSize(T, r) {
+  return Math.hypot(T.tx, T.ty) + Math.hypot(T.a, T.b) * r;
+}
+
+/**
+ * Schätzt T mit cur(p) ≈ ref(T(p)). idx: Pixelindizes der Auswertungsfläche; init: Startwert.
+ * Lucas-Kanade mit Ausreißer-Dämpfung. ok = false, wenn zu wenig Struktur vorhanden ist.
+ */
+export function estimateTransform(cur, ref, w, h, idx, init = null, maxSamples = 24000) {
+  const lc = luminance(cur), lr = luminance(ref);
+  const cx = w / 2, cy = h / 2;
+  const T = { a: 0, b: 0, tx: 0, ty: 0, cx, cy, ...(init ? { a: init.a || 0, b: init.b || 0, tx: init.tx || 0, ty: init.ty || 0 } : {}) };
+  // nur Punkte mit Kanten tragen Information
+  const step = Math.max(1, Math.floor(idx.length / (maxSamples * 4)));
+  const pts = [];
+  for (let k = 0; k < idx.length; k += step) {
+    const p = idx[k], x = p % w, y = (p / w) | 0;
+    if (x < 6 || y < 6 || x >= w - 6 || y >= h - 6) continue;
+    const gx = lr[p + 1] - lr[p - 1], gy = lr[p + w] - lr[p - w];
+    if (gx * gx + gy * gy > 400) pts.push(p);
+  }
+  if (pts.length < 200) return { ...T, ok: false };
+  const keep = Math.max(1, Math.floor(pts.length / maxSamples));
+  const bil = (l, x, y) => {
+    const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0, q = y0 * w + x0;
+    return (l[q] * (1 - fx) + l[q + 1] * fx) * (1 - fy) + (l[q + w] * (1 - fx) + l[q + w + 1] * fx) * fy;
+  };
+  let gain = 1;
+  for (let it = 0; it < 8; it++) {
+    const N = new Float64Array(16), v = new Float64Array(4);
+    let used = 0, sc = 0, sr = 0;
+    const scale = it < 2 ? 40 : 18; // zuerst tolerant, dann Ausreißer stärker dämpfen
+    for (let k = 0; k < pts.length; k += keep) {
+      const p = pts[k], x = p % w, y = (p / w) | 0, X = x - cx, Y = y - cy;
+      const rx = x + T.a * X - T.b * Y + T.tx, ry = y + T.b * X + T.a * Y + T.ty;
+      if (rx < 3 || ry < 3 || rx >= w - 4 || ry >= h - 4) continue;
+      const val = bil(lr, rx, ry);
+      const e = lc[p] / gain - val;
+      const gx = (bil(lr, rx + 1, ry) - bil(lr, rx - 1, ry)) / 2, gy = (bil(lr, rx, ry + 1) - bil(lr, rx, ry - 1)) / 2;
+      const wt = 1 / (1 + (e / scale) * (e / scale));
+      const wt2 = wt * wt;
+      const J0 = gx * X + gy * Y, J1 = -gx * Y + gy * X;
+      N[0] += wt2 * J0 * J0; N[1] += wt2 * J0 * J1; N[2] += wt2 * J0 * gx; N[3] += wt2 * J0 * gy;
+      N[5] += wt2 * J1 * J1; N[6] += wt2 * J1 * gx; N[7] += wt2 * J1 * gy;
+      N[10] += wt2 * gx * gx; N[11] += wt2 * gx * gy; N[15] += wt2 * gy * gy;
+      v[0] += wt2 * J0 * e; v[1] += wt2 * J1 * e; v[2] += wt2 * gx * e; v[3] += wt2 * gy * e;
+      if (wt > 0.6) { sc += lc[p]; sr += val; }
+      used++;
+    }
+    if (used < 100) return { ...T, ok: false };
+    N[4] = N[1]; N[8] = N[2]; N[9] = N[6]; N[12] = N[3]; N[13] = N[7]; N[14] = N[11];
+    const d = solve4(N, v);
+    if (!d) return { ...T, ok: false };
+    T.a += d[0]; T.b += d[1]; T.tx += d[2]; T.ty += d[3];
+    if (sr > 0) gain = Math.min(1.5, Math.max(0.65, sc / sr));
+    if (Math.abs(d[2]) + Math.abs(d[3]) + (Math.abs(d[0]) + Math.abs(d[1])) * cx < 0.01) break;
+  }
+  return { ...T, gain, ok: Math.hypot(T.tx, T.ty) < 14 && Math.hypot(T.a, T.b) < 0.03 };
+}
+
+function solve4(N, v) {
+  const M = [0, 1, 2, 3].map((r) => [N[r * 4], N[r * 4 + 1], N[r * 4 + 2], N[r * 4 + 3], v[r]]);
+  for (let c = 0; c < 4; c++) {
+    let p = c;
+    for (let r = c + 1; r < 4; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-9) return null;
+    [M[c], M[p]] = [M[p], M[c]];
+    for (let r = 0; r < 4; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / M[c][c];
+      for (let k = c; k < 5; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  return [0, 1, 2, 3].map((r) => M[r][4] / M[r][r]);
+}
+
+/** Referenz auf das aktuelle Bild ausgerichtet (inkl. Helligkeit): Ergebnis(p) = ref(T(p)) · gain je Kanal */
+export function warpRef(cur, ref, T, w, h, idx) {
+  const gains = channelGains(cur, ref, T, w, h, idx);
+  const flat = gains.every((g) => Math.abs(g - 1) < 0.006);
+  if (flat && transformSize(T, Math.max(w, h) / 2) < 0.02) return ref;
+  const out = new Uint8ClampedArray(ref.length);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const X = x - T.cx, Y = y - T.cy;
+      let rx = x + T.a * X - T.b * Y + T.tx, ry = y + T.b * X + T.a * Y + T.ty;
+      if (rx < 0) rx = 0; else if (rx > w - 1.001) rx = w - 1.001;
+      if (ry < 0) ry = 0; else if (ry > h - 1.001) ry = h - 1.001;
+      const x0 = rx | 0, y0 = ry | 0, fx = rx - x0, fy = ry - y0;
+      const q = (y0 * w + x0) * 4, i = (y * w + x) * 4, s = w * 4;
+      const w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
+      for (let c = 0; c < 3; c++) out[i + c] = (ref[q + c] * w00 + ref[q + 4 + c] * w10 + ref[q + s + c] * w01 + ref[q + s + 4 + c] * w11) * gains[c];
+      out[i + 3] = 255;
+    }
+  }
+  return out;
+}
+
+/** Helligkeitsverhältnis je Farbkanal (Median, unempfindlich gegen Pfeile) */
+function channelGains(cur, ref, T, w, h, idx) {
+  const step = Math.max(1, Math.floor(idx.length / 4000));
+  const hist = [0, 1, 2].map(() => new Uint32Array(400));
+  const n = [0, 0, 0];
+  for (let k = 0; k < idx.length; k += step) {
+    const p = idx[k], t = applyT(T, p % w, (p / w) | 0);
+    const x = Math.round(t.x), y = Math.round(t.y);
+    if (x < 0 || y < 0 || x >= w || y >= h) continue;
+    for (let c = 0; c < 3; c++) {
+      const r = ref[(y * w + x) * 4 + c], v = cur[p * 4 + c];
+      if (r < 60 || r > 245 || v > 250) continue;
+      hist[c][Math.min(399, Math.round((v / r) * 200))]++; n[c]++;
+    }
+  }
+  return hist.map((hh, c) => {
+    if (n[c] < 200) return 1;
+    let acc = 0, i = 0;
+    for (; i < 399; i++) { acc += hh[i]; if (acc >= n[c] / 2) break; }
+    return Math.min(1.4, Math.max(0.7, i / 200));
+  });
+}

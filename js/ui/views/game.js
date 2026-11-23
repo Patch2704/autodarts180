@@ -622,6 +622,9 @@ export async function render(root, params) {
         save(); draw(); scheduleBot();
       } else commit(dart);
     };
+    // bestätigte Pfeile zeigen der Erkennung, in welche Richtung die Pfeile im Bild stecken
+    if (action === 'confirm') detector.learnDirection({ ...pd.ev, conf: 1 });
+    if (action === 'discard') detector.dartsOnBoard = Math.max(0, detector.dartsOnBoard - 1);
     if (action === 'confirm') finish({ ...pd.dart, confirmed: true });
     else if (action === 'discard') { draw(); }
     else {

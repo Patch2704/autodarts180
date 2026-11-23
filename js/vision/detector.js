@@ -3,17 +3,18 @@
 // segmentieren → Pfeilachse per Hauptkomponentenanalyse → Spitze am schmalen Ende →
 // Homographie auf Scheibenebene → Segment. Unsichere Ergebnisse werden als solche gemeldet.
 import { applyH, invertH } from './homography.js';
+import { estimateTransform, warpRef, applyT, luminance, IDENTITY } from './align.js';
 import { scoreAt } from '../core/board.js';
 
 const DEFAULTS = {
   diffThreshold: 28, // mittlere RGB-Differenz pro Pixel (nach 3x3-Glättung), Obergrenze
   minDiffThreshold: 15, // Untergrenze bei sehr rauscharmem Bild (Schwelle passt sich dem Rauschen an)
-  motionFraction: 0.001, // Anteil veränderter ROI-Pixel, ab dem "Bewegung" gilt
+  motionFraction: 0.0015, // Anteil veränderter Scheiben-Pixel (ohne Kantenwackeln), ab dem "Bewegung" gilt
   stableFrames: 5, // so viele ruhige Frames in Folge, bevor ausgewertet wird
   minDartFraction: 0.0005, // minimale Pfeilfläche relativ zur ROI (dunkler Pfeil vor dunklem Grund ist klein)
   smallDartFraction: 0.0012, // darunter muss die Form deutlich länglich sein (sonst kein Pfeil)
   maxDartFraction: 0.07, // größer = Hand/Person/Lichtwechsel
-  emptyFraction: 0.0015, // darunter gilt die Scheibe als "leer wie Referenz"
+  edgeTolerance: 0.3, // so weit (px) dürfen Kanten gegenüber der ausgerichteten Referenz verrutschen
   tipExtend: 1.0, // Korrektur der Spitzenposition, falls die Spitze nicht weiter verfolgt werden kann (px)
   tipRadiusMm: 1.0, // halbe Dicke der Stahlspitze: so weit reicht ihr sichtbares Ende über den Einstich hinaus
   tipBlurPx: 0.4, // Unschärfe/Glättung am Spitzenende (px)
@@ -198,17 +199,32 @@ function dominantLine(pixels, w, minExtent = 0) {
   return null;
 }
 
-/** Pixel nur abgedunkelt (Schatten), nicht umgefärbt? a = aktuell, b = Referenz */
-function isShadow(ar, ag, ab, br, bg, bb) {
-  const lb = br + bg + bb;
-  if (lb < 90) return false; // auf dunklem Grund nicht unterscheidbar (Differenz dort ohnehin klein)
-  const la = ar + ag + ab;
+/**
+ * Stelle nur abgedunkelt (Schatten), nicht umgefärbt? a = aktuell, b = Referenz; über ein Kreuz aus
+ * 9 Pixeln gemittelt, damit Bildrauschen die Farbanteile nicht verfälscht.
+ */
+function isShadowAt(a, b, i, s) {
+  // zuerst der Pixel selbst (schützt die dünne Spitze, deren Umgebung nur Schatten ist) …
+  const pa = a[i] + a[i + 1] + a[i + 2], pb = b[i] + b[i + 1] + b[i + 2];
+  if (pb < 180 || pa < 0.5 * pb || pa > 0.98 * pb) return false;
+  const pt = 0.018 + 1 / pb * 3;
+  if (Math.abs(a[i] / pa - b[i] / pb) > pt || Math.abs(a[i + 1] / pa - b[i + 1] / pb) > pt) return false;
+  // … dann die Umgebung, mit enger Grenze
+  let ar = 0, ag = 0, ab = 0, br = 0, bg = 0, bb = 0;
+  for (let k = 0; k < 9; k++) {
+    const j = i + SH_X[k] * 4 + SH_Y[k] * s;
+    ar += a[j]; ag += a[j + 1]; ab += a[j + 2]; br += b[j]; bg += b[j + 1]; bb += b[j + 2];
+  }
+  const la = ar + ag + ab, lb = br + bg + bb;
+  if (lb < 9 * 75 || la < 9 * 20) return false; // auf sehr dunklem Grund nicht unterscheidbar
   const k = la / lb;
-  if (k < 0.3 || k > 0.95) return false;
-  // Farbanteile (Chromatizität) bleiben im Schatten fast gleich
-  const dr = ar / la - br / lb, dg = ag / la - bg / lb;
-  return Math.abs(dr) < 0.035 && Math.abs(dg) < 0.035;
+  if (k < 0.5 || k > 0.97) return false;
+  // Farbanteile bleiben im Schatten fast gleich. Gemessen: graues Barrel vor weißem Feld weicht um
+  // 0,026–0,035 ab (echte Aufnahme)
+  const tol = 0.012 + 1.2 / (lb / 9);
+  return Math.abs(ar / la - br / lb) < tol && Math.abs(ag / la - bg / lb) < tol;
 }
+const SH_X = [0, -1, 1, 0, 0, -1, 1, -1, 1], SH_Y = [0, 0, 0, -1, 1, -1, -1, 1, 1];
 
 export class DartDetector {
   constructor(opts = {}) {
@@ -239,6 +255,10 @@ export class DartDetector {
       if ((Number.isFinite(b.x) && b.x * b.x + b.y * b.y <= 300 * 300) || inConvex(hull, x, y)) roi.push(y * w + x);
     }
     this.roi = Int32Array.from(roi);
+    // Bewegungskontrolle nur auf der Scheibe selbst (Personen, Monitore daneben stören nicht)
+    this.boardIdx = Int32Array.from(roi.filter((p, k) => { if (k % 3) return false; const b = applyH(this.Hinv, p % w, (p / w) | 0); return Number.isFinite(b.x) && b.x * b.x + b.y * b.y <= 230 * 230; }));
+    { const q0 = applyH(this.Hpx, 0, 0), qx = applyH(this.Hpx, 10, 0), qy = applyH(this.Hpx, 0, 10); this.pxPerMm = Math.max(Math.hypot(qx.x - q0.x, qx.y - q0.y), Math.hypot(qy.x - q0.x, qy.y - q0.y)) / 10; }
+    this.lastEval = null; this.calibRef = null; this.T0 = null; this.Tcur = null; this.dirPrior = null;
     this.diff = new Uint8Array(w * h);
     this.mask = new Uint8Array(w * h);
     this.reset();
@@ -254,7 +274,7 @@ export class DartDetector {
   }
 
   /** Pixel bereits steckender Pfeile (für die Erkennung verdeckter Spitzen) */
-  clearOcc() { if (this.occ) this.occ.fill(0); this.lastPixels = null; this.segs = []; }
+  clearOcc() { if (this.occ) this.occ.fill(0); this.lastPixels = null; this.segs = []; this.dartPx = []; }
 
   /** Liegt ein bereits steckender Pfeil in der Nähe (±2 px) dieses Bildpunkts? */
   isOcc(p) {
@@ -277,10 +297,28 @@ export class DartDetector {
   /** Aktuelles Bild wird neue Referenz (z. B. "Pfeile entfernt" manuell bestätigt) */
   rebase(img) {
     const c = img.data.slice();
-    this.ref = c; this.emptyRef = c; this.prev = c;
+    this.setEmpty(c);
+    this.ref = c; this.prev = c;
     this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.stable = 0; this.clearOcc();
     this.lastRefBefore = null;
     this.status = 'bereit';
+  }
+
+  /** Neues Bild der leeren Scheibe. Merkt sich, wie weit es gegenüber der Kalibrierung verrutscht ist. */
+  setEmpty(c) {
+    if (!this.calibRef) { this.calibRef = c; this.T0 = { ...IDENTITY, cx: this.w / 2, cy: this.h / 2 }; } else {
+      const T = estimateTransform(c, this.calibRef, this.w, this.h, this.roi, this.T0);
+      if (T.ok) this.T0 = T;
+    }
+    this.emptyRef = c;
+  }
+
+  /** Referenz passend zum aktuellen Bild ausrichten: { img, T } */
+  alignTo(data, ref) {
+    const s = this.estimateShift(data, ref);
+    const T = estimateTransform(data, ref, this.w, this.h, this.roi, { tx: s.dx, ty: s.dy });
+    if (!T.ok) return { img: ref, T: { ...IDENTITY, cx: this.w / 2, cy: this.h / 2 }, ok: false };
+    return { img: warpRef(data, ref, T, this.w, this.h, this.roi), T, ok: true };
   }
 
   awaitTakeout() { this.awaitingTakeout = true; this.status = 'warte auf Entfernen'; }
@@ -291,7 +329,7 @@ export class DartDetector {
     const data = img.data;
     if (!this.ref) { this.rebase(img); return [{ type: 'ready' }]; }
 
-    const motion = this.changedFraction(data, this.prev, 2);
+    const motion = this.motionFraction(data, this.prev);
     this.prev = data.slice();
     if (motion > this.opts.motionFraction) {
       this.stable = 0; this.hadMotion = true;
@@ -301,21 +339,50 @@ export class DartDetector {
     this.stable++;
     if (this.stable < this.opts.stableFrames) return [];
     // nach Bewegung sofort auswerten, sonst periodisch (falls ein Pfeil ohne messbare Bewegung landete)
-    if (!this.hadMotion && this.stable % 15 !== 0) return [];
+    if (!this.hadMotion) {
+      if (this.stable % 12 !== 0) return [];
+      if (this.lastEval && this.motionFraction(data, this.lastEval) < 0.0003) return []; // nichts Neues
+    }
     this.hadMotion = false;
+    this.lastEval = data.slice();
     return this.evaluate(data);
+  }
+
+  /**
+   * Anteil bewegter Bildpunkte auf der Scheibe. Ein leicht wackelndes Stativ verschiebt nur Kanten:
+   * Werte, die in der direkten Nachbarschaft des Vorbilds vorkommen, zählen nicht als Bewegung.
+   */
+  motionFraction(a, b) {
+    const { boardIdx, w } = this;
+    const s = w * 4;
+    let changed = 0;
+    for (let k = 0; k < boardIdx.length; k++) {
+      const i = boardIdx[k] * 4;
+      if (Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]) < 84) continue;
+      let inside = true;
+      for (let c = 0; c < 3 && inside; c++) {
+        const v = a[i + c];
+        let lo = 255, hi = 0;
+        for (let dy = -s; dy <= s; dy += s) for (let dx = -4; dx <= 4; dx += 4) { const q = b[i + c + dx + dy]; if (q < lo) lo = q; if (q > hi) hi = q; }
+        if (v < lo - 14 || v > hi + 14) inside = false;
+      }
+      if (!inside) changed++;
+    }
+    return boardIdx.length ? changed / boardIdx.length : 0;
   }
 
   /** Wertet den zuletzt erkannten Pfeil im aktuellen Bild erneut aus (Referenz = Bild davor) */
   redetectLast(img) {
-    if (!img || !this.lastRefBefore || this.awaitingTakeout && this.dartsOnBoard === 0) return null;
-    const count = this.buildMask(img.data, this.lastRefBefore);
+    if (!img || !this.lastRefBefore || (this.awaitingTakeout && this.dartsOnBoard === 0)) return null;
+    const A = this.alignTo(img.data, this.lastRefBefore);
+    this.setFrameTransform(img.data);
+    const count = this.buildMask(img.data, A.img);
     if (count < this.opts.minDartFraction * this.roi.length) return null;
     const own = this.regions.pop();
     const ownSeg = this.segs.pop();
     const ownPx = this.lastPixels;
     this.markOcc(ownPx, -1); // eigener Pfeil verdeckt sich nicht selbst
-    const det = this.analyse();
+    const det = this.analyse(1)[0] || null;
     if (ownPx) { this.markOcc(ownPx, 1); }
     if (own) this.regions.push(own);
     if (ownSeg) this.segs.push(det ? { tip: det.tipPx, far: det.far } : ownSeg);
@@ -324,69 +391,93 @@ export class DartDetector {
   }
 
   /**
-   * Schätzt eine kleine globale Verschiebung (Wackeln) zwischen Bild a und Referenz b.
-   * Liefert den Index-Versatz o, mit dem a[p] ≈ b[p + o] gilt (0 = keine Verschiebung).
+   * Schätzt eine kleine globale Verschiebung (Wackeln) zwischen Bild a und Referenz b (ganze Pixel,
+   * Startwert für die Feinausrichtung): a[p] ≈ b[p + (dx, dy)].
    */
   estimateShift(a, b) {
     const { roi, w } = this;
     const step = Math.max(1, Math.floor(roi.length / 5000));
-    const lum = (d, i) => d[i] + 2 * d[i + 1] + d[i + 2];
-    let best = 0, bestSad = Infinity, sad0 = 0, bdx = 0, bdy = 0;
+    const la = luminance(a), lb = luminance(b);
+    let bestSad = Infinity, sad0 = 0, bdx = 0, bdy = 0;
     for (let dy = -MAX_SHIFT; dy <= MAX_SHIFT; dy++) {
       for (let dx = -MAX_SHIFT; dx <= MAX_SHIFT; dx++) {
         const o = dy * w + dx;
         let sad = 0;
-        for (let k = 0; k < roi.length; k += step) {
-          const p = roi[k];
-          sad += Math.abs(lum(a, p * 4) - lum(b, (p + o) * 4));
-        }
+        for (let k = 0; k < roi.length; k += step) sad += Math.min(40, Math.abs(la[roi[k]] - lb[roi[k] + o]));
         if (!dx && !dy) sad0 = sad;
-        if (sad < bestSad) { bestSad = sad; best = o; bdx = dx; bdy = dy; }
+        if (sad < bestSad) { bestSad = sad; bdx = dx; bdy = dy; }
       }
     }
-    // nur übernehmen, wenn die Verschiebung das Bild deutlich besser erklärt
-    if (best !== 0 && bestSad > sad0 * 0.85) return { o: 0, dx: 0, dy: 0 };
-    return { o: best, dx: bdx, dy: bdy };
+    if (bestSad > sad0 * 0.95) return { dx: 0, dy: 0 };
+    return { dx: bdx, dy: bdy };
   }
 
   /** Scheibe leer und frei (keine Pfeile, niemand davor)? Für Kamerakontrolle und Nachführung. */
   isClear(img) {
     if (!this.emptyRef || this.dartsOnBoard > 0 || this.awaitingTakeout || this.status !== 'bereit') return false;
     if (!img || img.width !== this.w || img.height !== this.h) return false;
-    const s = this.estimateShift(img.data, this.emptyRef);
-    return this.changedFraction(img.data, this.emptyRef, 2, s.o) < this.opts.emptyFraction * 2;
+    if (this.motionFraction(img.data, this.emptyRef) > 0.004) return false; // schnelle Vorprüfung
+    const E = this.alignTo(img.data, this.emptyRef);
+    this.buildMask(img.data, E.img);
+    return this.looksEmpty();
+  }
+
+  /** Keine zusammenhängende Veränderung in Pfeilgröße (nach buildMask) */
+  looksEmpty() {
+    const minPx = this.opts.minDartFraction * this.roi.length;
+    const comps = this.components();
+    const big = comps.length ? comps[0].px.length : 0;
+    return big < 0.45 * minPx;
+  }
+
+  /** Lage des aktuellen Bilds gegenüber der Kalibrierung (für die Umrechnung auf die Scheibe) */
+  setFrameTransform(data, E = null) {
+    const e = E || this.alignTo(data, this.emptyRef);
+    this.Tcur = e.ok ? e.T : null;
+  }
+
+  /** Bildpunkt im aktuellen Bild → Bildpunkt zum Zeitpunkt der Kalibrierung */
+  toCalib(x, y) {
+    let p = { x, y };
+    if (this.Tcur) p = applyT(this.Tcur, p.x, p.y);
+    if (this.T0) p = applyT(this.T0, p.x, p.y);
+    return p;
   }
 
   evaluate(data) {
     const roiN = this.roi.length;
+    const events = [];
+    const E = this.alignTo(data, this.emptyRef);
     // Pfeile entfernt?
     if (this.dartsOnBoard > 0 || this.awaitingTakeout) {
-      const se = this.estimateShift(data, this.emptyRef);
-      const f = this.changedFraction(data, this.emptyRef, 1, se.o);
-      if (f < this.opts.emptyFraction) {
+      this.buildMask(data, E.img, null);
+      const empty = this.looksEmpty();
+      // … oder sind alle bekannten Pfeile weg, aber es steckt schon etwas Neues (schnell weitergespielt)
+      const gone = !empty && this.dartPx.length > 0 && this.dartPx.every((px) => this.goneFraction(px) > 0.75);
+      if (empty || gone) {
         const c = data.slice();
-        this.ref = c; this.emptyRef = c;
+        if (empty) { this.setEmpty(c); this.ref = c; } else this.ref = this.emptyRef;
         this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.clearOcc();
         this.lastRefBefore = null;
         this.status = 'bereit';
-        return [{ type: 'takeout' }];
+        events.push({ type: 'takeout' });
+        if (empty) return events;
       }
     }
     if (this.awaitingTakeout) { this.status = 'warte auf Entfernen'; return [{ type: 'waiting-takeout' }]; }
 
-    // Wackeln ausgleichen: Referenz um die geschätzte Verschiebung versetzt vergleichen
-    const sh = this.estimateShift(data, this.ref);
-    this.lastShift = sh;
-    const count = this.buildMask(data, this.ref, sh.o);
+    // Referenz auf Bruchteile eines Pixels ausrichten (Stativ wackelt, Scheibe verrutscht minimal)
+    const A = this.ref === this.emptyRef ? E : this.alignTo(data, this.ref);
+    this.setFrameTransform(data, E);
+    this.lastShift = A.T;
+    const count = this.buildMask(data, A.img, this.dartsOnBoard > 0 ? E.img : null);
     const frac = count / roiN;
-    if (frac < this.opts.minDartFraction) {
+    if (frac < this.opts.minDartFraction || this.looksEmpty()) {
       this.status = 'bereit';
       // minimale Drift (Licht, leichtes Verrutschen) in die Referenz übernehmen
-      if (frac < 0.0003 || sh.o) {
-        this.ref = data.slice();
-        if (!this.dartsOnBoard) this.emptyRef = this.ref;
-      }
-      return [];
+      this.ref = data.slice();
+      if (!this.dartsOnBoard) this.setEmpty(this.ref);
+      return events;
     }
     if (frac > this.opts.maxDartFraction) {
       this.largeChangeCount++;
@@ -396,55 +487,88 @@ export class DartDetector {
         this.largeChangeCount = 0;
         const c = data.slice();
         this.ref = c;
-        if (this.dartsOnBoard === 0) this.emptyRef = c;
-        return [{ type: 'lighting' }];
+        if (this.dartsOnBoard === 0) this.setEmpty(c);
+        return [...events, { type: 'lighting' }];
       }
-      return [{ type: 'large-change', fraction: frac }];
+      return [...events, { type: 'large-change', fraction: frac }];
     }
     this.largeChangeCount = 0;
-    const det = this.analyse();
+    const dets = this.analyse(Math.max(1, 3 - this.dartsOnBoard));
     this.lastRefBefore = this.ref;
     this.ref = data.slice();
-    if (!det) { this.status = 'bereit'; return [{ type: 'unclear' }]; }
-    this.dartsOnBoard++;
-    this.regions.push(det.bbox);
-    this.segs.push({ tip: det.tipPx, far: det.far });
-    this.markOcc(det.pixelList);
-    delete det.pixelList;
     this.status = 'bereit';
-    return [{ type: 'dart', ...det }];
-  }
-
-  changedFraction(a, b, step, off = 0) {
-    const thr = this.opts.diffThreshold * 3;
-    const roi = this.roi;
-    let changed = 0, n = 0;
-    for (let k = 0; k < roi.length; k += step) {
-      const i = roi[k] * 4, j = (roi[k] + off) * 4;
-      const d = Math.abs(a[i] - b[j]) + Math.abs(a[i + 1] - b[j + 1]) + Math.abs(a[i + 2] - b[j + 2]);
-      if (d > thr) changed++;
-      n++;
+    if (!dets.length) return [...events, { type: 'unclear' }];
+    for (const det of dets) {
+      if (this.dartsOnBoard >= 3) { det.conf = Math.min(det.conf, 0.4); det.reasons.push('mehr als drei Pfeile'); }
+      this.dartsOnBoard++;
+      this.regions.push(det.bbox);
+      this.segs.push({ tip: det.tipPx, far: det.far });
+      this.dartPx.push(det.pixelList);
+      this.markOcc(det.pixelList);
+      this.learnDirection(det);
+      delete det.pixelList;
+      events.push({ type: 'dart', ...det });
     }
-    return n ? changed / n : 0;
+    return events;
   }
 
-  buildMask(a, b, off = 0) {
-    this.cur = a; this.refImg = b; this.refOff = off;
+  /** Anteil der Pixel eines bekannten Pfeils, die wieder wie die leere Scheibe aussehen (nach buildMask gegen leer) */
+  goneFraction(px) {
+    let gone = 0;
+    for (const p of px) if (this.diff[p] < this.lowThr) gone++;
+    return px.length ? gone / px.length : 1;
+  }
+
+  /** Alle Pfeile eines Spielers zeigen im Bild meist in eine ähnliche Richtung – das lernt die Erkennung mit */
+  learnDirection(det) {
+    if (det.conf < 0.6 || det.axis.elong < 2.5) return;
+    const vx = det.far.x - det.tipPx.x, vy = det.far.y - det.tipPx.y, l = Math.hypot(vx, vy);
+    if (l < 10) return;
+    const d = this.dirPrior || (this.dirPrior = { x: 0, y: 0, n: 0 });
+    d.x = d.x * 0.8 + vx / l; d.y = d.y * 0.8 + vy / l; d.n++;
+  }
+
+  /** Gelernte Pfeilrichtung (Spitze → Flight) oder null */
+  priorDir() {
+    const d = this.dirPrior;
+    if (!d || d.n < 2) return null;
+    const l = Math.hypot(d.x, d.y), max = (1 - 0.8 ** Math.min(d.n, 30)) / 0.2;
+    if (l < 0.6 * max) return null; // Richtungen streuen zu stark
+    return { x: d.x / l, y: d.y / l };
+  }
+
+  /** a = aktuelles Bild, b = ausgerichtete Referenz; vac = ausgerichtetes Bild der leeren Scheibe */
+  buildMask(a, b, vac = null) {
+    this.cur = a; this.refImg = b;
     const { diff, mask, roi, w } = this;
+    const s = w * 4;
     diff.fill(0); mask.fill(0);
-    const vac = this.emptyRef && this.emptyRef !== b && this.dartsOnBoard > 0 ? this.emptyRef : null;
+    const tol = this.opts.edgeTolerance;
+    // Abweichung vom Wertebereich der Referenz in ±tol px Umgebung: Kanten, die um Bruchteile eines
+    // Pixels verrutscht sind, zählen nicht; ein Pfeil vor gleichmäßigem Grund zählt voll.
+    const dev = (ref, i) => {
+      const v = ref[i];
+      let lo = v, hi = v, n = v + (ref[i - 4] - v) * tol;
+      if (n < lo) lo = n; else if (n > hi) hi = n;
+      n = v + (ref[i + 4] - v) * tol; if (n < lo) lo = n; else if (n > hi) hi = n;
+      n = v + (ref[i - s] - v) * tol; if (n < lo) lo = n; else if (n > hi) hi = n;
+      n = v + (ref[i + s] - v) * tol; if (n < lo) lo = n; else if (n > hi) hi = n;
+      const x = a[i];
+      return x < lo ? lo - x : x > hi ? x - hi : 0;
+    };
     for (let k = 0; k < roi.length; k++) {
-      const p = roi[k], i = p * 4, j = (p + off) * 4;
+      const p = roi[k], i = p * 4;
       // Differenz: Mittel und stärkster Farbkanal (silber vor Creme unterscheidet sich fast nur im
       // Blauanteil, schwarz vor dunkelgrün fast nur im Grünanteil – das Mittel würde das verwässern)
-      const er = Math.abs(a[i] - b[j]), eg = Math.abs(a[i + 1] - b[j + 1]), eb = Math.abs(a[i + 2] - b[j + 2]);
+      const er = dev(b, i), eg = dev(b, i + 1), eb = dev(b, i + 2);
       const d = ((er + eg + eb) / 3 + Math.max(er, eg, eb)) / 2;
-      // Schatten: gleichmäßig abgedunkelt bei unveränderter Farbe → gehört nicht zum Pfeil
-      if (d > 6 && isShadow(a[i], a[i + 1], a[i + 2], b[j], b[j + 1], b[j + 2])) { diff[p] = 0; continue; }
+      if (d < 4) { diff[p] = d; continue; }
+      // Schatten: leicht abgedunkelt bei unveränderter Farbe → gehört nicht zum Pfeil
+      if (d > 6 && isShadowAt(a, b, i, s)) { diff[p] = 0; continue; }
       // Freigewordene Stelle (ein angestoßener Pfeil hat sich bewegt): Hier sieht das Bild wieder
       // aus wie die leere Scheibe – das gehört nicht zum neuen Pfeil
       if (vac && d > 10) {
-        const ve = ((Math.abs(a[i] - vac[j]) + Math.abs(a[i + 1] - vac[j + 1]) + Math.abs(a[i + 2] - vac[j + 2])) / 3);
+        const ve = (dev(vac, i) + dev(vac, i + 1) + dev(vac, i + 2)) / 3;
         if (ve < 0.35 * d && ve < 14) { diff[p] = 0; continue; }
       }
       diff[p] = d > 255 ? 255 : d;
@@ -464,15 +588,15 @@ export class DartDetector {
     let count = 0;
     for (let k = 0; k < roi.length; k++) {
       const p = roi[k];
-      const s = diff[p - w - 1] + diff[p - w] + diff[p - w + 1] + diff[p - 1] + diff[p] + diff[p + 1]
+      const q = diff[p - w - 1] + diff[p - w] + diff[p - w + 1] + diff[p - 1] + diff[p] + diff[p + 1]
         + diff[p + w - 1] + diff[p + w] + diff[p + w + 1];
-      if (s > thr) { mask[p] = 1; count++; }
+      if (q > thr) { mask[p] = 1; count++; }
     }
     return count;
   }
 
-  /** Zusammenhängende Regionen → Pfeil-Hypothese */
-  analyse() {
+  /** Zusammenhängende Regionen der Maske, größte zuerst */
+  components() {
     const { mask, w, h } = this;
     const seen = new Uint8Array(w * h);
     const comps = [];
@@ -495,77 +619,181 @@ export class DartDetector {
       }
       if (px.length >= 12) comps.push({ px, bbox: { minX, minY, maxX, maxY } });
     }
-    if (!comps.length) return null;
-    comps.sort((a, b) => b.px.length - a.px.length);
-    // Teile desselben Pfeils zusammenführen: nahe Teile, und Teile entlang der erwarteten
-    // Pfeilachse (ein dunkler Schaft vor dunklem Grund ist unsichtbar → Flight und Barrel getrennt)
-    const main = comps[0];
-    const centroid = (c) => {
-      if (!c.c) { let sx = 0, sy = 0; for (const p of c.px) { sx += p % w; sy += (p / w) | 0; } c.c = { x: sx / c.px.length, y: sy / c.px.length }; }
-      return c.c;
-    };
-    const mc = centroid(main);
-    const exp = this.expectedDir(mc.x, mc.y);
-    const dartLen = exp && exp.len > 12 ? exp.len * 1.45 : 0; // Pfeil ≈ 140 mm lang
-    // Achse für das Zusammenführen: Ist der Hauptteil selbst länglich (z. B. Barrel+Schaft), gibt
-    // er die tatsächliche Pfeilrichtung vor – egal wie schräg der Pfeil steckt (enger Kegel).
-    // Sonst (z. B. nur Flight sichtbar) die Richtung aus dem Kameramodell mit weitem Kegel.
-    let axis = null, cone = 0.7;
-    {
+    return comps.sort((a, b) => b.px.length - a.px.length);
+  }
+
+  /** Veränderungen → Pfeile (meist einer; mehrere, wenn zwischendurch nicht ausgewertet werden konnte) */
+  analyse(maxDarts = 1) {
+    const minPx = this.opts.minDartFraction * this.roi.length;
+    let rest = this.components();
+    const groups = [];
+    while (rest.length && groups.length < maxDarts) {
+      if (rest[0].px.length < (groups.length ? 1.2 : 0.4) * minPx) break;
+      const g = this.mergeParts(rest);
+      rest = rest.filter((c) => !g.merged.includes(c));
+      if (g.pixels.length >= minPx) groups.push(g); else if (groups.length) break;
+    }
+    const dets = [];
+    const first = groups[0];
+    for (const g of groups) {
+      // weitere Gruppen nur, wenn sie wirklich wie ein eigener Pfeil aussehen
+      if (g !== first && g.pixels.length < 0.3 * first.pixels.length) continue;
+      const atOld = this.occ && this.dartsOnBoard > 0 ? g.pixels.filter((p) => this.occ[p]).length / g.pixels.length : 0;
+      if (g !== first && atOld > 0.08) continue; // eher ein angestoßener alter Pfeil
+      const extra = rest.filter((c) => c.px.length > 0.04 * g.pixels.length).length;
+      const det = this.groupToDart(g.pixels, g.bb, extra);
+      if (!det) continue;
+      if (dets.length) {
+        if (Math.hypot(det.board.x, det.board.y) > 190 || det.axis.elong < 3 || det.conf < 0.2 || det.axis.length < 0.35 * this.maxDartLen((g.bb.minX + g.bb.maxX) / 2, (g.bb.minY + g.bb.maxY) / 2)) continue;
+        det.conf = Math.min(det.conf, 0.55); det.reasons.push('mehrere neue Pfeile auf einmal');
+      }
+      dets.push(det);
+      if (dets.length < maxDarts && atOld < 0.02) {
+        const second = this.parallelDart(g.pixels, det);
+        if (second) {
+          det.conf = Math.min(det.conf, 0.55); det.reasons.push('zwei Pfeile dicht nebeneinander');
+          second.conf = Math.min(second.conf, 0.5); second.reasons.push('zwei Pfeile dicht nebeneinander');
+          dets.push(second);
+        }
+      }
+    }
+    return dets.slice(0, maxDarts);
+  }
+
+  /**
+   * Zwei neue Pfeile auf einmal, die sich berühren: Im vorderen Teil (Barrel) liegt neben der Achse des
+   * gefundenen Pfeils ein zweiter schmaler, gleich gerichteter Streifen.
+   */
+  parallelDart(pixels, det) {
+    const { w } = this, s = this.pxPerMm;
+    const tx = det.tipPx.x, ty = det.tipPx.y, fx = det.far.x - tx, fy = det.far.y - ty, L = Math.hypot(fx, fy);
+    if (L < 60 * s * 0.6 || det.axis.elong < 2.5) return null;
+    const ux = fx / L, uy = fy / L;
+    // Querprofil im vorderen Teil: zwei klar getrennte Streifen (Tal dazwischen) = zwei Barrels
+    const R0 = Math.ceil(30 * s), prof = new Float32Array(2 * R0 + 1);
+    const front = [];
+    for (const p of pixels) {
+      const dx = (p % w) - tx, dy = ((p / w) | 0) - ty, al = dx * ux + dy * uy, pe = dx * uy - dy * ux;
+      if (al < 0.05 * L || al > 0.45 * L || Math.abs(pe) > R0) continue;
+      front.push([p, al, pe]); prof[Math.round(pe) + R0]++;
+    }
+    const sm = prof.map((v, i) => (v + (prof[i - 1] || 0) + (prof[i + 1] || 0)) / 3);
+    let m = 0; for (let i = 0; i < sm.length; i++) if (sm[i] > sm[m]) m = i;
+    let m2 = -1;
+    for (let i = 0; i < sm.length; i++) if (Math.abs(i - m) >= 6 * s && (m2 < 0 || sm[i] > sm[m2])) m2 = i;
+    let best = null;
+    if (m2 >= 0 && sm[m2] >= 0.35 * sm[m] && sm[m2] >= 14 * s) {
+      let valley = Infinity, vi = m;
+      for (let i = Math.min(m, m2); i <= Math.max(m, m2); i++) if (sm[i] < valley) { valley = sm[i]; vi = i; }
+      const lo = vi - R0;
+      if (valley <= 0.6 * sm[m2]) best = front.filter(([, , pe]) => (m2 > m ? pe > lo : pe < lo)).map(([p]) => p);
+    }
+    if (!best) {
+      // … oder der vordere Teil ist durchgehend viel breiter als ein Barrel (ca. 7 mm): zwei berühren sich
+      const widths = [];
+      const bins = new Map();
+      for (const [, al, pe] of front) { const k = Math.round(al / 2); const b = bins.get(k) || [Infinity, -Infinity]; b[0] = Math.min(b[0], pe); b[1] = Math.max(b[1], pe); bins.set(k, b); }
+      for (const b of bins.values()) widths.push(b[1] - b[0]);
+      widths.sort((x, y) => x - y);
+      if (widths.length < 10 * s || widths[Math.floor(widths.length * 0.5)] < 12.5 * s) return null;
+      const ps = front.map(([, , pe]) => pe).sort((x, y) => x - y), p5 = ps[Math.floor(ps.length * 0.05)], p95 = ps[Math.floor(ps.length * 0.95)];
+      const cut = p95 > -p5 ? p95 / 2 : p5 / 2;
+      best = front.filter(([, , pe]) => (p95 > -p5 ? pe > cut : pe < cut)).map(([p]) => p);
+    }
+    if (best.length < 60 || elongation(best, w) < 2.5) return null;
+    let x0 = w, y0 = this.h, x1 = 0, y1 = 0;
+    for (const p of best) { const x = p % w, y = (p / w) | 0; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    const d2 = this.locateTip(best, { minX: x0, minY: y0, maxX: x1, maxY: y1 }, 0, { x: ux, y: uy });
+    return d2 && Math.hypot(d2.board.x, d2.board.y) < 190 ? d2 : null;
+  }
+
+  /**
+   * Teile desselben Pfeils zusammenführen. Ein dunkler Schaft vor dunklem Grund ist unsichtbar, Flight
+   * und Barrel sind dann getrennt. Sie gehören zusammen, wenn der längliche Teil (Barrel) genau auf den
+   * anderen zeigt und der Abstand zu einem Pfeil passt – unabhängig davon, wie schräg er steckt.
+   */
+  mergeParts(comps) {
+    const { w } = this;
+    const s = this.pxPerMm;
+    const stat = (px) => {
+      let mx = 0, my = 0;
+      for (const p of px) { mx += p % w; my += (p / w) | 0; }
+      mx /= px.length; my /= px.length;
       let cxx = 0, cxy = 0, cyy = 0;
-      for (const p of main.px) { const dx = (p % w) - mc.x, dy = ((p / w) | 0) - mc.y; cxx += dx * dx; cxy += dx * dy; cyy += dy * dy; }
+      for (const p of px) { const dx = (p % w) - mx, dy = ((p / w) | 0) - my; cxx += dx * dx; cxy += dx * dy; cyy += dy * dy; }
+      const n = px.length; cxx /= n; cxy /= n; cyy /= n;
       const tr = cxx + cyy, det = cxx * cyy - cxy * cxy, disc = Math.sqrt(Math.max(0, (tr * tr) / 4 - det));
       const l1 = tr / 2 + disc, l2 = Math.max(1e-6, tr / 2 - disc);
-      if (dartLen && Math.sqrt(l1 / l2) >= 3) {
-        let ax = Math.abs(cxy) > 1e-9 ? l1 - cyy : cxx >= cyy ? 1 : 0, ay = Math.abs(cxy) > 1e-9 ? cxy : cxx >= cyy ? 0 : 1;
-        const an = Math.hypot(ax, ay); axis = { x: ax / an, y: ay / an }; cone = 0.2;
-      } else if (dartLen) axis = exp;
-    }
-    const gap = Math.max(8, Math.round(Math.min(w, h) * 0.04));
+      const ax = Math.abs(cxy) > 1e-9 ? l1 - cyy : cxx >= cyy ? 1 : 0, ay = Math.abs(cxy) > 1e-9 ? cxy : cxx >= cyy ? 0 : 1;
+      const an = Math.hypot(ax, ay) || 1;
+      return { x: mx, y: my, ax: ax / an, ay: ay / an, el: Math.sqrt(l1 / l2), n };
+    };
+    const prior = this.priorDir();
+    const main = comps[0];
     let pixels = main.px.slice();
     const bb = { ...main.bbox };
     const merged = [main];
-    for (const c of comps.slice(1)) {
-      const b = c.bbox;
-      const dx = Math.max(0, Math.max(b.minX - bb.maxX, bb.minX - b.maxX));
-      const dy = Math.max(0, Math.max(b.minY - bb.maxY, bb.minY - b.maxY));
-      let onAxis = false;
-      if (axis) {
-        const cc = centroid(c), rx = cc.x - mc.x, ry = cc.y - mc.y;
-        const along = rx * axis.x + ry * axis.y, perp = Math.abs(rx * axis.y - ry * axis.x);
-        // Kegel um die Achse
-        onAxis = Math.abs(along) <= dartLen * 1.2 && perp <= 5 + cone * Math.abs(along) && c.px.length >= Math.max(12, main.px.length * 0.02);
-      }
-      if ((dx <= gap && dy <= gap && c.px.length >= main.px.length * 0.05) || onAxis) {
+    let gs = stat(pixels);
+    const maxDist = 125 * s;
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const c of comps) {
+        if (merged.includes(c)) continue;
+        const cs = c.s || (c.s = stat(c.px));
+        const dx = cs.x - gs.x, dy = cs.y - gs.y, dist = Math.hypot(dx, dy);
+        if (dist > maxDist + 10) continue;
+        const b = c.bbox;
+        const gx = Math.max(0, Math.max(b.minX - bb.maxX, bb.minX - b.maxX)), gy = Math.max(0, Math.max(b.minY - bb.maxY, bb.minY - b.maxY));
+        const gap = Math.hypot(gx, gy);
+        const perpTo = (o, px, py) => Math.abs((px - o.x) * o.ay - (py - o.y) * o.ax);
+        let ok = false;
+        const lim = 5 + 4 * s + 0.07 * dist;
+        if (gs.el >= 2.2) ok = perpTo(gs, cs.x, cs.y) <= lim;
+        if (!ok && cs.el >= 2.2 && gs.el < 3.5) ok = perpTo(cs, gs.x, gs.y) <= lim;
+        // zwei eigenständige schmale Teile (zwei Barrels) müssen auch in dieselbe Richtung zeigen;
+        // ein teilweise sichtbarer Flight kann quer zur Achse länglich sein (bis ca. 4:1)
+        if (ok && gs.el >= 5 && cs.el >= 5) ok = Math.abs(gs.ax * cs.ax + gs.ay * cs.ay) > 0.94;
+        if (!ok && gs.el < 2.2 && cs.el < 2.2) {
+          const dir = prior || this.expectedDir(gs.x, gs.y);
+          if (dir && (prior || dir.len > 45)) ok = Math.abs(dx * dir.y - dy * dir.x) <= 5 + (prior ? 0.3 : 0.6) * dist;
+        }
+        // kleine Splitter direkt daneben
+        if (!ok && c.px.length < 0.15 * pixels.length && gap <= 4 + 2 * s) ok = true;
+        if (!ok || c.px.length < Math.max(12, 0.01 * pixels.length)) continue;
         pixels = pixels.concat(c.px);
         bb.minX = Math.min(bb.minX, b.minX); bb.minY = Math.min(bb.minY, b.minY);
         bb.maxX = Math.max(bb.maxX, b.maxX); bb.maxY = Math.max(bb.maxY, b.maxY);
-        merged.push(c);
+        merged.push(c); gs = stat(pixels); changed = true;
       }
     }
+    return { pixels, bb, merged };
+  }
+
+  /** Gruppe von Bildpunkten → Pfeil (Spitze, Feld, Konfidenz) oder null */
+  groupToDart(pixels, bb, extra) {
+    const { w } = this;
     const minPx = this.opts.minDartFraction * this.roi.length;
-    if (pixels.length < minPx) return null;
     // Enge Gruppe: Berührt die Veränderung steckende Pfeile und ist sie nicht klar länglich
     // (z. B. neuer Pfeil + angestoßener alter Pfeil = V-Form), nur die dominante Gerade auswerten
     let cluster = false;
     if (this.occ && this.dartsOnBoard > 0) {
       let touchOcc = 0;
       for (let k = 0; k < pixels.length; k += 3) if (this.occ[pixels[k]]) touchOcc++;
-      const elAll = elongation(pixels, w);
-      if (touchOcc > 3 && elAll < 2.5) {
+      if (touchOcc > 3 && elongation(pixels, w) < 2.5) {
         // mind. gut die Hälfte eines ganzen Pfeils (ca. 140 mm) muss auf der Geraden liegen
+        const exp = this.expectedDir(pixels[0] % w, (pixels[0] / w) | 0);
         const line = dominantLine(pixels, w, exp && exp.len > 12 ? 0.55 * exp.len * 1.4 : 0);
         if (line && line.inliers.length >= Math.max(minPx, 0.15 * pixels.length)) {
           pixels = line.inliers; cluster = true;
           let x0 = w, y0 = this.h, x1 = 0, y1 = 0;
           for (const p of pixels) { const x = p % w, y = (p / w) | 0; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
-          bb.minX = x0; bb.minY = y0; bb.maxX = x1; bb.maxY = y1;
+          bb = { minX: x0, minY: y0, maxX: x1, maxY: y1 };
         }
       }
     }
-    const det = this.locateTip(pixels, bb, comps.length - merged.length);
+    const det = this.locateTip(pixels, bb, extra);
     if (det && cluster) {
-      det.conf *= 0.9; det.reasons.push('aus einer Pfeilgruppe herausgelöst');
+      det.conf *= 0.6; det.reasons.push('aus einer Pfeilgruppe herausgelöst');
       // In der Gruppe ist der neue Pfeil oft nur teilweise sichtbar: kürzer als ein ganzer Pfeil
       // oder kontrastarmes Spitzenende → eher nachfragen
       if (det.axis.expLen > 12 && det.axis.length < 1.5 * det.axis.expLen) { det.conf *= 0.6; det.reasons.push('in der Gruppe nur teilweise sichtbar'); }
@@ -574,9 +802,19 @@ export class DartDetector {
     // kleine Veränderung: nur als Pfeil werten, wenn sie deutlich länglich ist
     if (pixels.length < this.opts.smallDartFraction * this.roi.length) {
       if (det.axis.elong < 3) return null;
-      det.conf *= 0.85; det.reasons.push('nur teilweise sichtbar');
+      det.conf *= 0.6; det.reasons.push('nur teilweise sichtbar');
     }
     return det;
+  }
+
+  /** Größte Bildlänge (px) eines Pfeils an dieser Stelle (beliebig schräg, bis 45°) */
+  maxDartLen(px, py) {
+    const b = applyH(this.Hinv, px + 0.5, py + 0.5);
+    if (!this.cam || !Number.isFinite(b.x)) return Infinity;
+    const p0 = this.cam.point(b.x, b.y, 0);
+    let m = 0;
+    for (const [r, z] of [[0, 150], [75, 130], [106, 106]]) for (let k = 0; k < 8; k++) { const q = this.cam.point(b.x + r * Math.cos((k * Math.PI) / 4), b.y + r * Math.sin((k * Math.PI) / 4), z); m = Math.max(m, Math.hypot(q.x - p0.x, q.y - p0.y)); }
+    return m;
   }
 
   /** Erwartete Bildrichtung Spitze → Flight am Bildpunkt (px); len = Länge (px) für 100 mm Pfeil */
@@ -624,6 +862,20 @@ export class DartDetector {
     };
     trace(0.5);
     this.bridged = 0;
+    // Kleine Lücke (bis ca. 9 mm), z. B. wo die Spitze genau auf einer Feldgrenze liegt: nur über ein
+    // deutlich sichtbares Stück dahinter
+    if (last) {
+      const strong = Math.max(24, low * 2);
+      for (let g = 0; g < 2; g++) {
+        let run = 0, found = 0;
+        for (let t = last + 1.5; t <= last + 9 * this.pxPerMm; t += 0.5) {
+          if (sample(t, 1) >= strong) { if (++run >= 4) { found = t - 1.5; break; } } else run = 0;
+        }
+        if (!found || this.isOcc({ x: p.x + dx * found, y: p.y + dy * found })) break;
+        last = found;
+        trace(found);
+      }
+    }
     // Unsichtbares Stück überbrücken (z. B. schwarzes Barrel vor schwarzem Feld, silber vor Creme):
     // weiter entlang der Achse nach einem zusammenhängenden Stück (≥ 3 px) suchen
     for (let bridges = 0; bridges < 2 && maxGap > 0; bridges++) {
@@ -650,7 +902,8 @@ export class DartDetector {
     return { x: p.x + dx * sEnd, y: p.y + dy * sEnd };
   }
 
-  locateTip(pixels, bbox, otherBlobs) {
+  /** dirHint: bekannte Richtung Spitze → Flight (z. B. vom Nachbarpfeil) */
+  locateTip(pixels, bbox, otherBlobs, dirHint = null) {
     const w = this.w;
     const n = pixels.length;
     let mx = 0, my = 0;
@@ -677,7 +930,8 @@ export class DartDetector {
     // gedrungene Form (Pfeil zeigt fast zur Kamera) → Achse aus der Geometrie übernehmen
     let axisFromModel = false;
     const spreadOk = exp && exp.variants.every((v) => v.x * exp.x + v.y * exp.y > 0.8);
-    if (exp && exp.len > 12 && elong < 2) { ux = exp.x; uy = exp.y; dot = 1; axisFromModel = true; }
+    const prior = dirHint || this.priorDir();
+    if (elong < 2 && (prior || (exp && exp.len > 12))) { const d = prior || exp; ux = d.x; uy = d.y; dot = prior && exp ? ux * exp.x + uy * exp.y : 1; axisFromModel = true; }
 
     // Projektionen entlang der Achse
     const t = new Float32Array(n);
@@ -718,9 +972,11 @@ export class DartDetector {
     const geoTipMin = tiltMin < tiltMax;
     const shapeContradicts = widthRatio < 0.5 && thinIsMin !== geoTipMin;
     const geoDecided = tBest <= 60 && tOther - tBest >= (shapeContradicts ? 40 : 15);
-    const geoStrong = geoDecided || nearlyPerp;
-    const tipAtMin = geoDecided ? tiltMin < tiltMax : nearlyPerp ? dot > 0 : thinIsMin;
-    const dirConflict = geoDecided && nearlyPerp && (tiltMin < tiltMax) !== (dot > 0);
+    const pd = prior ? ux * prior.x + uy * prior.y : 0;
+    const priorDecided = Math.abs(pd) > 0.8;
+    const geoStrong = geoDecided || nearlyPerp || priorDecided;
+    const tipAtMin = dirHint && priorDecided ? pd > 0 : geoDecided ? tiltMin < tiltMax : priorDecided ? pd > 0 : nearlyPerp ? dot > 0 : thinIsMin;
+    const dirConflict = (geoDecided && nearlyPerp && !priorDecided && (tiltMin < tiltMax) !== (dot > 0)) || (priorDecided && tipAtMin !== (pd > 0));
     const dartTilt = tipAtMin ? tiltMin : tiltMax;
 
     const endPoint = (atMin, maxGap = 0) => {
@@ -751,7 +1007,7 @@ export class DartDetector {
         if (this.bridged > 0 && r2 <= 1.1 && !this.isOcc(cand)) { tipPx = cand; bridged = this.bridged; visRatio = r2; }
       }
     }
-    const toBoard = (p) => applyH(this.Hinv, p.x + 0.5, p.y + 0.5);
+    const toBoard = (p) => { const c = this.toCalib(p.x, p.y); return applyH(this.Hinv, c.x + 0.5, c.y + 0.5); };
     let tipB = toBoard(tipPx), altB = toBoard(altPx);
     let usedAlt = false;
     const rTip = Math.hypot(tipB.x, tipB.y), rAlt = Math.hypot(altB.x, altB.y);
@@ -780,6 +1036,8 @@ export class DartDetector {
       if (dirConflict) { conf *= 0.6; reasons.push('Pfeilrichtung unklar'); }
       if (!geoDecided && !axisFromModel) conf *= 0.85; // nur über die Senkrecht-Annahme entschieden
     } else {
+      // weder Geometrie noch gelernte Richtung entscheiden, welches Ende die Spitze ist
+      conf *= 0.55; reasons.push('Pfeilrichtung nicht eindeutig');
       if (elong < 2.5) { conf *= 0.55; reasons.push('Form wenig länglich'); }
       else if (elong < 4) conf *= 0.85;
       if (widthRatio > 0.85) { conf *= 0.45; reasons.push('Spitze/Flight nicht unterscheidbar'); }
@@ -790,7 +1048,7 @@ export class DartDetector {
     else if (partial) { conf *= 0.5; reasons.push('Pfeil nur teilweise sichtbar'); }
     else if (bridged > 2) { conf *= 0.85; reasons.push('Spitze über kontrastarmes Stück verfolgt'); }
     // Veränderung deutlich länger als ein ganzer Pfeil sein kann → Teile anderer Pfeile mit erfasst
-    if (exp && exp.len > 12 && L > 2.6 * exp.len) { conf *= 0.5; reasons.push('Veränderung länger als ein Pfeil'); }
+    if (L > 1.15 * this.maxDartLen(mx, my)) { conf *= 0.5; reasons.push('Veränderung länger als ein Pfeil'); }
     // nur ein kurzes Stück sichtbar (weniger als gut die Hälfte eines Pfeils) → Richtung und Spitze unsicher
     if (exp && exp.len > 12 && L < 0.8 * exp.len) { conf *= 0.6; reasons.push('nur ein kurzes Stück des Pfeils sichtbar'); }
     if (hit.r <= 175) {
@@ -832,7 +1090,7 @@ export class DartDetector {
         }
         return k ? c.map((v) => v / k) : null;
       };
-      const end = avg(this.cur, 0, -6, -2, 0), beyond = avg(this.refImg, this.refOff || 0, 2, 8, 1);
+      const end = avg(this.cur, 0, -6, -2, 0), beyond = avg(this.refImg, 0, 2, 8, 1);
       if (end && beyond) {
         const e = end.map((v, i) => Math.abs(v - beyond[i]));
         endContrast = ((e[0] + e[1] + e[2]) / 3 + Math.max(...e)) / 2;

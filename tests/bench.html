@@ -2,15 +2,16 @@
 <html lang="de"><head><meta charset="utf-8"><title>Messreihe Pfeilerkennung</title></head>
 <body><h1>Messreihe Pfeilerkennung</h1><pre id="out">läuft …</pre>
 <script type="module">
-  import { benchmark } from './darts3d.js';
+  import { benchmark, SCENARIOS, REAL_SCENARIOS, REAL_CAMERAS, CAMERAS } from './darts3d.js';
   const out = document.getElementById('out');
   const seeds = (new URLSearchParams(location.search).get('seeds') || '101').split(',').map(Number);
   const lines = [];
   window.__rows = [];
+  const real = new URLSearchParams(location.search).get('real');
   for (const seed of seeds) await benchmark(seed, (r) => {
     window.__rows.push(r);
     lines.push(`[${seed}] ${r.label}: n ${r.n} | ohne Rückfrage richtig ${r.auto} | Rückfrage richtig/falsch ${r.askOk}/${r.askWrong} | FALSCH OHNE RÜCKFRAGE ${r.wrongConfident} | verpasst ${r.missed} | Phantom ${r.phantom} | Takeout fehlt ${r.noTakeout} | Ø ${r.mean.toFixed(2)} mm`, ...r.bad.map((b) => '      ' + b));
     out.textContent = lines.join('\n');
-  });
+  }, real ? { scenarios: REAL_SCENARIOS.filter((_, i) => real === 'all' || real.includes(String(i))), cameras: REAL_CAMERAS } : { scenarios: SCENARIOS, cameras: CAMERAS });
   window.__done = true; lines.push('FERTIG'); out.textContent = lines.join('\n');
 </script></body></html>

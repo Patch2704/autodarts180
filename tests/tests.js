@@ -555,6 +555,19 @@ const stressLog = [];
   });
 }
 
+// ---------- Bedingungen wie auf echten Aufnahmen: Wackeln, Verrutschen, neutral weiße Felder, fast frontal ----------
+{
+  const d3 = await import('./darts3d.js');
+  const runs = [[-23, -8], [25, -5]].map(([deg, tilt]) => ({ deg, tilt, r: d3.simulate({ deg, tilt, visits: 2, seed: 303, style: d3.REAL }) }));
+  stressLog.push('— Pfeile wie auf echten Aufnahmen —', ...runs.map(({ deg, tilt, r }) => `${deg}° Höhe ${tilt}°: ohne Rückfrage richtig ${r.auto}/${r.n}, Rückfrage ${r.lowConf}, verpasst ${r.missed}, Phantom ${r.phantom}, Entnahme fehlt ${r.noTakeout || 0}`));
+  test('Pfeilerkennung bei Wackeln und Verrutschen: nichts verpasst, jede Entnahme erkannt, keine groben Fehler ohne Rückfrage', () => {
+    for (const { deg, r } of runs) {
+      eq(r.missed, 0, `${deg}° verpasst`); eq(r.noTakeout || 0, 0, `${deg}° Entnahme fehlt`); ok(r.phantom <= 1, `${deg}° Phantom ${r.phantom}`);
+      ok(!r.errsConf.length || Math.max(...r.errsConf) < 8, `${deg}° größter Fehler ${Math.max(...r.errsConf).toFixed(1)} mm`);
+    }
+  });
+}
+
 // ---------- Ausgabe ----------
 const out = document.getElementById('out');
 const failed = results.filter((r) => !r.ok);

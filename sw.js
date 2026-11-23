@@ -1,11 +1,11 @@
 // Service Worker: Offline-Betrieb. Netzwerk zuerst (immer aktuell), sonst Cache.
-const CACHE = 'autodarts180-v17';
+const CACHE = 'autodarts180-v18';
 const CORE = [
   './', './index.html', './css/app.css', './manifest.webmanifest', './icon.svg',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png',
   './js/app.js', './js/state.js', './js/data/db.js', './js/data/repo.js', './js/audio/sound.js',
   './js/core/board.js', './js/core/checkout.js', './js/core/x01.js', './js/core/stats.js', './js/core/bot.js', './js/core/rng.js', './js/core/coach.js',
-  './js/vision/homography.js', './js/vision/calibration.js', './js/vision/detector.js', './js/vision/camera.js', './js/vision/overlay.js',
+  './js/vision/homography.js', './js/vision/calibration.js', './js/vision/detector.js', './js/vision/align.js', './js/vision/camera.js', './js/vision/overlay.js',
   './js/ui/dom.js', './js/ui/boardSvg.js', './js/ui/inputPad.js',
   './js/ui/views/dashboard.js', './js/ui/views/setup.js', './js/ui/views/game.js', './js/ui/views/camera.js',
   './js/ui/views/training.js', './js/ui/views/players.js', './js/ui/views/bot.js', './js/ui/views/stats.js',

@@ -41,6 +41,11 @@ const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a
 /** Zufälliger Pfeil: Einstich (x,y), Achse leicht schräg (Flight meist etwas höher) */
 export function randomDart(rng, x, y, style = {}) {
   let dir = norm([(rng() - 0.5) * 0.5, -0.1 + rng() * 0.55, 1]);
+  if (style.up) {
+    // wie auf den echten Bildern: alle Pfeile zeigen mit dem Flight deutlich nach oben
+    const el = ((style.up + gaussian(rng) * 8) * Math.PI) / 180, az = (gaussian(rng) * 8 * Math.PI) / 180;
+    dir = norm([Math.tan(az), Math.tan(el), 1]);
+  }
   if (style.maxTilt) {
     // jeder Pfeil steckt anders: Neigung bis maxTilt Grad in beliebige Richtung
     // (Flight öfter nach oben als nach unten, wie bei Würfen im Bogen)
@@ -51,6 +56,7 @@ export function randomDart(rng, x, y, style = {}) {
   const spin = rng() * Math.PI;
   const palette = [[230, 200, 40], [40, 60, 160], [200, 40, 40], [25, 25, 28], [235, 235, 235], [40, 160, 70]];
   const BLACK = [26, 26, 28], SILVER = [165, 168, 175], TIP_SILVER = [178, 180, 186];
+  if (style.preset === 'user') return { x, y, dir, spin, tip: [92, 92, 97], barrel: [138, 141, 148], shaft: [30, 30, 34], flight: [28, 28, 34] };
   if (style.preset) {
     // typische Steeldarts: Spitze und Barrel schwarz oder silber; Schaft/Flight farbig oder gleichfarbig
     const metal = style.preset === 'black' ? BLACK : style.preset === 'silver' ? SILVER : (rng() < 0.5 ? BLACK : SILVER);
@@ -185,14 +191,26 @@ export function addNoiseFast(img, sigma, seed) {
 }
 
 /** Ausschnitt wie camera.grab({crop, maxW}) */
-export function grabCrop(img, crop, maxW = 640) {
+export function grabCrop(img, crop, maxW = 640, ox = 0, oy = 0) {
   const W = img.width, H = img.height;
   const c = document.createElement('canvas'); c.width = W; c.height = H; c.getContext('2d').putImageData(img, 0, 0);
   const sw = crop.w * W, sh = crop.h * H, s = Math.min(1, maxW / sw);
   const o = document.createElement('canvas'); o.width = Math.max(1, Math.round(sw * s)); o.height = Math.max(1, Math.round(sh * s));
-  o.getContext('2d').drawImage(c, crop.x * W, crop.y * H, sw, sh, 0, 0, o.width, o.height);
+  o.getContext('2d').drawImage(c, crop.x * W + ox, crop.y * H + oy, sw, sh, 0, 0, o.width, o.height);
   return o.getContext('2d').getImageData(0, 0, o.width, o.height);
 }
+
+/** 3x3-Gauß (Optik einer Kamera) */
+function soften(img) {
+  const { width: w, height: h } = img, out = new ImageData(new Uint8ClampedArray(img.data), w, h), s = img.data, d = out.data, W4 = w * 4;
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) for (let c = 0; c < 3; c++) {
+    const i = (y * w + x) * 4 + c;
+    d[i] = (4 * s[i] + 2 * (s[i - 4] + s[i + 4] + s[i - W4] + s[i + W4]) + s[i - W4 - 4] + s[i - W4 + 4] + s[i + W4 - 4] + s[i + W4 + 4]) / 16;
+  }
+  return out;
+}
+
+const REAL_COLORS = { red: [205, 52, 48], green: [38, 205, 55], black: [44, 44, 48], cream: [212, 207, 192], surround: [40, 40, 46], wall: [62, 10, 34], wire: [190, 190, 188] };
 
 /** Zufällige Einstichstelle: gemischt aus Triple/Double/Single/Bull, gleichmäßig über die Scheibe */
 function randomTarget(rng) {
@@ -213,7 +231,8 @@ function randomTarget(rng) {
 export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, visits = 6, seed = 1, shadow = null, light = 0.9, noise = 4, style = {}, detectorOpts = {}, roll = 0, log = null }) {
   const rng = mulberry32(seed * 7919 + Math.round(deg * 13 + tilt * 3));
   const cam = sideCamera(deg, w, h, { fill, tilt, roll });
-  const base = renderScene({ w, h, pts: cal.pointsFromH(cam.H), light, noise: 0, seed }).img;
+  // echte Optik bildet Kanten weich ab (ohne Glättung wären verschobene Bilder unrealistisch verschieden)
+  const base = style.real ? soften(renderScene({ w, h, pts: cal.pointsFromH(cam.H), light, noise: 0, seed, ...(style.real ? { colors: REAL_COLORS, texture: 9, warm: false, light: 1 } : {}) }).img) : renderScene({ w, h, pts: cal.pointsFromH(cam.H), light, noise: 0, seed, ...(style.real ? { colors: REAL_COLORS, texture: 9, warm: false, light: 1 } : {}) }).img;
   const bc = cal.boardCrop(cam.H);
   const crop = detectorOpts.boardCropOnly ? bc : dartCrop(cam.H, w, h);
   const detMaxW = Math.min(960, Math.round((640 * crop.w) / bc.w)); // wie im Spiel
@@ -222,7 +241,10 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
   let frameSeed = seed * 1000;
   let cacheKey = null, cacheImg = null; // gezeichnete Pfeile wiederverwenden, nur Rauschen neu
   const drawn = (darts) => { const key = darts.map((d) => d.x.toFixed(3) + d.y.toFixed(3) + d.dir.map((v) => v.toFixed(4)).join(',')).join('|'); if (key !== cacheKey) { cacheKey = key; cacheImg = darts.length ? drawDarts(base, cam, darts, { shadow }) : base; } return cacheImg; };
-  const frame = (darts) => grabCrop(addNoiseFast(drawn(darts), noise, frameSeed++), crop, detMaxW);
+  // Wackeln pro Bild (style.jitter) und bleibendes Verrutschen nach Treffern/Ziehen (style.slip), in Vollbild-px
+  let sx0 = 0, sy0 = 0;
+  const slip = () => { if (style.slip) { sx0 = (rng() - 0.5) * 2 * style.slip; sy0 = (rng() - 0.5) * 2 * style.slip; } };
+  const frame = (darts) => grabCrop(addNoiseFast(drawn(darts), noise, frameSeed++), crop, detMaxW, sx0 + (style.jitter ? gaussian(rng) * style.jitter : 0), sy0 + (style.jitter ? gaussian(rng) * style.jitter : 0));
   const first = frame([]);
   det.setCalibration(Hc, first.width, first.height, detectorOpts.noView ? null : cropView(crop, first.width, first.height));
   det.process(first);
@@ -245,6 +267,7 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
       darts.push(randomDart(rng, t.x, t.y, style));
       // ein Spieler wirft drei gleiche Pfeile
       if (style.sameSet && darts.length > 1) { const f = darts[0], d = darts[darts.length - 1]; for (const key of ["tip", "barrel", "shaft", "flight"]) d[key] = f[key]; }
+      slip();
       // Bewegung (Hand/Pfeil im Flug) simulieren: ein gestörtes Bild, dann ruhig
       const moving = frame(darts.slice(0, -1));
       const md = moving.data;
@@ -276,6 +299,7 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
       if (log) log({ v, k, t, ev, e, darts: darts.map((d) => ({ ...d })), cam, crop, detMaxW, det, base });
     }
     // Pfeile ziehen
+    slip();
     det.awaitTakeout();
     const hand = frame([]); const hd = hand.data; for (let i = 0; i < hd.length; i += 4 * 5) hd[i] = 0;
     det.process(hand);
@@ -300,6 +324,10 @@ export const SCENARIOS = [
   ['enge Gruppe, bunt, gleiche Pfeile', { cluster: 8, bump: true, sameSet: true }],
   ['enge Gruppe, schwarz/silber, gleich, schräg', { cluster: 8, bump: true, sameSet: true, preset: 'mixed', maxTilt: 30 }],
 ];
+// Bedingungen wie auf den echten Bildern des Nutzers (fast frontal, neutral weiße Felder, Wackeln)
+export const REAL = { real: true, preset: 'user', up: 20, jitter: 0.15, slip: 1.2, sameSet: true };
+export const REAL_SCENARIOS = [['echt: verteilt', REAL], ['echt: ohne Wackeln', { ...REAL, jitter: 0, slip: 0 }], ['echt: enge Gruppe', { ...REAL, cluster: 8, bump: true }], ['echt: starkes Wackeln', { ...REAL, jitter: 0.4, slip: 2 }]];
+export const REAL_CAMERAS = [[-23, -8], [-20, 0], [25, -5], [-30, 5], [23, 8]];
 export const CAMERAS = [[30, 0], [-30, 0], [45, 0], [-45, 0], [55, 0], [-55, 0], [45, 15], [-45, -15]];
 
 export async function benchmark(seed, onRow = () => {}, { scenarios = SCENARIOS, cameras = CAMERAS, visits = 4 } = {}) {
@@ -316,4 +344,9 @@ export async function benchmark(seed, onRow = () => {}, { scenarios = SCENARIOS,
     rows.push(r); onRow(r);
   }
   return rows;
+}
+
+/** Leere Scheibe in Farben/Optik wie auf den echten Bildern */
+export function realScene(cam, w, h, seed = 1) {
+  return soften(renderScene({ w, h, pts: cal.pointsFromH(cam.H), light: 1, noise: 0, seed, colors: REAL_COLORS, texture: 9, warm: false }).img);
 }
