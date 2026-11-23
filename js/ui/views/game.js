@@ -11,7 +11,7 @@ import { Bot } from '../../core/bot.js';
 import { settings, calibration } from '../../state.js';
 import { sfx, say } from '../../audio/sound.js';
 import { camera } from '../../vision/camera.js';
-import { DartDetector } from '../../vision/detector.js';
+import { DartDetector, cropView, dartCrop } from '../../vision/detector.js';
 import { healthCheck, boardCrop, cropH, uncropH, uncropPoint, refine, refineOrAuto, calibrationQuality, frameMetrics, pointsFromH, fitScore, boardShiftMm, edgeRefine } from '../../vision/calibration.js';
 import { applyH } from '../../vision/homography.js';
 import { zoomRect, placeVideo, sizeCanvas, drawBoard, drawMarker } from '../../vision/overlay.js';
@@ -44,7 +44,8 @@ export async function render(root, params) {
   const detector = new DartDetector();
   let detStatus = '';
   let lastImg = null;
-  let crop = null, cropHm = null, viewCrop = null;
+  const detLog = [];
+  let crop = null, cropHm = null, viewCrop = null, detMaxW = 640;
   const hasHuman = match.players.some((p) => !p.isBot);
   let inputMode = match.inputMode === 'camera' && calibration.current ? 'camera' : 'manual';
 
@@ -259,10 +260,15 @@ export async function render(root, params) {
 
   // Nur der Bildausschnitt um die Scheibe wird ausgewertet → mehr Pixel pro Millimeter
   function setupCrop(cal) {
-    crop = boardCrop(cal.H);
+    // Ausschnitt inkl. des Bereichs, in den Pfeile herausragen; Auflösung so, dass die Scheibe
+    // so viele Pixel pro Millimeter behält wie im reinen Scheibenausschnitt (max. 960 px breit)
+    const res = camera.resolution;
+    const bc = boardCrop(cal.H);
+    crop = res.w && res.h ? dartCrop(cal.H, res.w, res.h) : bc;
+    detMaxW = Math.min(960, Math.round((640 * crop.w) / bc.w));
     cropHm = cropH(cal.H, crop);
-    const img = camera.grab({ crop, maxW: 640 });
-    detector.setCalibration(cropHm, img.width, img.height);
+    const img = camera.grab({ crop, maxW: detMaxW });
+    detector.setCalibration(cropHm, img.width, img.height, cropView(crop, img.width, img.height));
     // Anzeige: quadratischer Ausschnitt um die Scheibe statt des ganzen Kamerabilds
     viewCrop = boardCrop(cal.H, 232);
     const { w, h: vh } = camera.resolution;
@@ -284,10 +290,15 @@ export async function render(root, params) {
     // nach der Aufwärmphase Schärfe und Weißabgleich festhalten (wo der Browser das erlaubt)
     if (settingsLocked === null) { settingsLocked = false; camera.lockSettings().then((ok) => { settingsLocked = ok; }); }
     if (needReadjust) { needReadjust = false; readjust(); return; }
-    const img = camera.grab({ crop, maxW: 640 });
+    const img = camera.grab({ crop, maxW: detMaxW });
     lastImg = img;
     const events = paused ? [] : detector.process(img);
     for (const ev of events) {
+      // für „Erkennung speichern“: Bild vorher/nachher der letzten Pfeile (bleibt nur im Speicher)
+      if (ev.type === 'dart' && detector.lastRefBefore) {
+        detLog.push({ before: detector.lastRefBefore, after: img, H: cropHm, tip: { ...ev.tip }, label: ev.hit.label, conf: ev.conf, reasons: ev.reasons, board: ev.board, at: Date.now() });
+        if (detLog.length > 3) detLog.shift();
+      }
       if (ev.tip) ev.tip = uncropPoint(ev.tip, crop);
       handleDetection(ev);
     }
@@ -339,7 +350,7 @@ export async function render(root, params) {
     const updated = { ...cal, H, points: pointsFromH(H), trackedAt: Date.now() };
     calibration.save(updated);
     setupCrop(updated);
-    detector.rebase(camera.grab({ crop, maxW: 640 }));
+    detector.rebase(camera.grab({ crop, maxW: detMaxW }));
     camWarnings = []; drawWarnings();
     if (move >= 1) trackedUntil = performance.now() + 4000; // Hinweis nur bei spürbarer Korrektur
     return true;
@@ -363,7 +374,7 @@ export async function render(root, params) {
       const updated = { ...cal, H: r.H, points: r.points, aspect: camera.aspect, quality: q, cropQuality: calibrationQuality(cropImg, cropH(r.H, c)).score, brightness: frameMetrics(cropImg).brightness, createdAt: Date.now(), version: 3 };
       await calibration.save(updated);
       setupCrop(updated);
-      detector.rebase(camera.grab({ crop, maxW: 640 }));
+      detector.rebase(camera.grab({ crop, maxW: detMaxW }));
       camWarnings = []; pendingWarn = ''; trackFails = 0;
       for (const k of Object.keys(warnStreak)) delete warnStreak[k];
       drawWarnings();
@@ -511,6 +522,7 @@ export async function render(root, params) {
       calibration.current ? h('button', { class: 'btn', onclick: () => { inputMode = inputMode === 'camera' ? 'manual' : 'camera'; match.inputMode = inputMode; save(); if (inputMode === 'camera') startCamera(); else stopCamera(); draw(); } }, icon(inputMode === 'camera' ? 'hand' : 'camera'), inputMode === 'camera' ? 'Nur Tastenfeld' : 'Kamera an') : null,
       inputMode === 'camera' ? h('button', { class: `btn ${waitingTakeout ? 'primary' : ''}`, onclick: () => { if (lastImg) detector.rebase(lastImg); pending = []; toast('Referenzbild neu gesetzt'); draw(); } }, icon('hand'), waitingTakeout ? 'Pfeile entfernt' : 'Referenz neu') : null,
       inputMode === 'camera' ? h('button', { class: 'btn', disabled: !lastImg || botTurn, onclick: redetect }, icon('refresh'), 'Erneut erkennen') : null,
+      inputMode === 'camera' ? h('button', { class: 'btn', disabled: !detLog.length, onclick: exportDetections, title: 'Bilder der letzten erkannten Pfeile (vorher/nachher mit erkannter Spitze) speichern, z. B. zur Fehleranalyse' }, icon('download'), 'Erkennung speichern') : null,
     ].filter(Boolean));
     if (waitingTakeout && !botTurn && match.status === 'running') {
       actionsEl.append(h('div', { class: 'notice', style: { gridColumn: '1 / -1' } }, 'Bitte Pfeile aus der Scheibe ziehen – die Kamera erkennt das automatisch.'));
@@ -519,6 +531,53 @@ export async function render(root, params) {
 
     drawLog(st);
     drawOverlay();
+  }
+
+  // Diagnosebild der letzten (bis zu 3) erkannten Pfeile: links Bild davor, rechts danach mit
+  // erkannter Spitze und Ringen der Kalibrierung. Bleibt lokal, bis du es selbst weitergibst.
+  async function exportDetections() {
+    if (!detLog.length) return;
+    const w = detLog[0].after.width, hh = detLog[0].after.height;
+    const rows = detLog.filter((e) => e.after.width === w && e.after.height === hh);
+    const c = document.createElement('canvas');
+    c.width = w * 2; c.height = hh * rows.length;
+    const g = c.getContext('2d');
+    rows.forEach((e, i) => {
+      const y0 = i * hh;
+      g.putImageData(new ImageData(new Uint8ClampedArray(e.before), w, hh), 0, y0);
+      g.putImageData(e.after, w, y0);
+      // Ringe der Kalibrierung (dünn) auf beiden Hälften
+      g.strokeStyle = 'rgba(61,220,132,0.6)'; g.lineWidth = 1;
+      for (const off of [0, w]) for (const r of [6.35, 15.9, 99, 107, 162, 170]) {
+        g.beginPath();
+        for (let k = 0; k <= 72; k++) {
+          const t = (k * 5 * Math.PI) / 180, p = applyH(e.H, r * Math.cos(t), r * Math.sin(t));
+          const px = off + p.x * w, py = y0 + p.y * hh;
+          if (k) g.lineTo(px, py); else g.moveTo(px, py);
+        }
+        g.stroke();
+      }
+      const tx = w + e.tip.x * w, ty = y0 + e.tip.y * hh;
+      g.strokeStyle = '#ff3b3b'; g.lineWidth = 2;
+      g.beginPath(); g.arc(tx, ty, 7, 0, 2 * Math.PI); g.moveTo(tx - 12, ty); g.lineTo(tx + 12, ty); g.moveTo(tx, ty - 12); g.lineTo(tx, ty + 12); g.stroke();
+      g.font = 'bold 16px system-ui, sans-serif'; g.fillStyle = 'rgba(0,0,0,0.6)'; g.fillRect(w, y0, w, 44);
+      g.fillStyle = '#fff';
+      g.fillText(`${i + 1}. erkannt: ${e.label} (${Math.round(e.conf * 100)} %)  x ${e.board.x.toFixed(1)} / y ${e.board.y.toFixed(1)} mm`, w + 8, y0 + 18);
+      g.font = '13px system-ui, sans-serif';
+      g.fillText(e.reasons.join(', ') || 'keine Auffälligkeiten', w + 8, y0 + 36);
+      g.fillStyle = 'rgba(0,0,0,0.6)'; g.fillRect(0, y0, 70, 24); g.fillStyle = '#fff'; g.fillText('vorher', 8, y0 + 17);
+    });
+    const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
+    if (!blob) return;
+    const name = `autodarts180-erkennung-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.jpg`;
+    const file = new File([blob], name, { type: 'image/jpeg' });
+    try {
+      if (navigator.canShare?.({ files: [file] })) { await navigator.share({ files: [file], title: 'Autodarts180 Erkennung' }); return; }
+    } catch (e) { if (e?.name === 'AbortError') return; }
+    const a = h('a', { href: URL.createObjectURL(blob), download: name });
+    document.body.append(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    toast('Erkennungsbilder gespeichert');
   }
 
   function redetect() {

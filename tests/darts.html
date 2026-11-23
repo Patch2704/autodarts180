@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pfeilerkennung 3D</title>
+<style>
+  body { font: 13px/1.5 system-ui, sans-serif; background: #15171a; color: #e8eaed; margin: 0; padding: 16px; }
+  pre { white-space: pre-wrap; background: #0d0e10; padding: 8px; border-radius: 6px; }
+  canvas { max-width: 48%; border: 1px solid #333; margin: 4px; }
+</style>
+</head>
+<body>
+<h1>Pfeilerkennung – realistische 3D-Pfeile</h1>
+<div id="views"></div>
+<pre id="out">läuft …</pre>
+<script type="module">
+  import * as D from './darts3d.js';
+  import * as cal from '../js/vision/calibration.js';
+  import { renderScene } from './scene.js';
+  const out = document.getElementById('out');
+  const q = new URLSearchParams(location.search);
+  const lines = [];
+  const show = (img) => { const c = document.createElement('canvas'); c.width = img.width; c.height = img.height; c.getContext('2d').putImageData(img, 0, 0); document.getElementById('views').append(c); };
+  // Beispielbild
+  {
+    const cam = D.sideCamera(Number(q.get('deg') ?? 45), 720, 1280, { fill: 0.7, tilt: Number(q.get('tilt') ?? 0) });
+    const base = renderScene({ w: 720, h: 1280, pts: cal.pointsFromH(cam.H), light: 0.9, noise: 0 }).img;
+    const darts = [D.randomDart(Math.random, 0, 103), D.randomDart(Math.random, 100, -30), D.randomDart(Math.random, -150, 60)];
+    const img = D.drawDarts(base, cam, darts, { shadow: [0.2, 0.7, 1] });
+    show(D.grabCrop(img, cal.boardCrop(cam.H)));
+  }
+  const conds = q.get('quick') ? [[0, 0], [45, 0], [-55, 10]] : [[0, 0], [30, 0], [-30, 0], [45, 0], [-45, 0], [55, 0], [-55, 0], [45, 15], [-45, -15], [30, 20]];
+  const shadows = q.get('noshadow') ? [null] : [null, [0.2, 0.7, 1]];
+  let tot = 0, totC = 0, totM = 0, totW = 0;
+  const t0 = performance.now();
+  for (const [deg, tilt] of conds) for (const sh of shadows) {
+    // kurz abgeben (MessageChannel wird auch in Hintergrund-Tabs nicht gedrosselt)
+    await new Promise((res) => { const c = new MessageChannel(); c.port1.onmessage = res; c.port2.postMessage(0); });
+    const r = D.simulate({ deg, tilt, shadow: sh, visits: Number(q.get('visits') ?? 4), seed: Number(q.get('seed') ?? 1) });
+    tot += r.n; totC += r.correct; totM += r.missed; totW += r.wrongConfident;
+    lines.push(`${deg}° Höhe ${tilt}°${sh ? ' Schatten' : ''}: ${r.correct}/${r.n} richtig, verpasst ${r.missed}, mit Rückfrage ${r.lowConf}, falsch ohne Rückfrage ${r.wrongConfident}, Fehler Ø ${r.mean.toFixed(1)} mm, 90% ${r.p90.toFixed(1)}, max ${r.max.toFixed(1)}, Versatz Spitze entlang ${r.biasAlong.toFixed(1)} px / quer ${r.biasPerp.toFixed(1)} px`);
+    for (const w of r.wrong) lines.push('    ' + w);
+    out.textContent = lines.join('\n');
+  }
+  lines.unshift(`GESAMT: ${totC}/${tot} richtig (${(100 * totC / tot).toFixed(1)} %), verpasst ${totM}, falsch ohne Rückfrage ${totW}, ${Math.round(performance.now() - t0)} ms`);
+  out.textContent = lines.join('\n');
+  window.__done = lines;
+</script>
+</body>
+</html>
