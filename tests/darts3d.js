@@ -221,7 +221,7 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
   const det = new DartDetector(detectorOpts);
   let frameSeed = seed * 1000;
   let cacheKey = null, cacheImg = null; // gezeichnete Pfeile wiederverwenden, nur Rauschen neu
-  const drawn = (darts) => { const key = darts.map((d) => d.x.toFixed(3) + d.y.toFixed(3)).join('|'); if (key !== cacheKey) { cacheKey = key; cacheImg = darts.length ? drawDarts(base, cam, darts, { shadow }) : base; } return cacheImg; };
+  const drawn = (darts) => { const key = darts.map((d) => d.x.toFixed(3) + d.y.toFixed(3) + d.dir.map((v) => v.toFixed(4)).join(',')).join('|'); if (key !== cacheKey) { cacheKey = key; cacheImg = darts.length ? drawDarts(base, cam, darts, { shadow }) : base; } return cacheImg; };
   const frame = (darts) => grabCrop(addNoiseFast(drawn(darts), noise, frameSeed++), crop, detMaxW);
   const first = frame([]);
   det.setCalibration(Hc, first.width, first.height, detectorOpts.noView ? null : cropView(crop, first.width, first.height));
@@ -230,9 +230,21 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
   const res = { n: 0, correct: 0, missed: 0, lowConf: 0, errs: [], errsConf: [], wrongConfident: 0, wrong: [], along: [], perp: [] };
   for (let v = 0; v < visits; v++) {
     const darts = [];
+    // eng gruppiert: alle drei Pfeile um einen gemeinsamen Zielpunkt (Streuung style.cluster mm)
+    const center = style.cluster ? randomTarget(rng) : null;
     for (let k = 0; k < 3; k++) {
-      const t = randomTarget(rng);
+      let t = randomTarget(rng);
+      if (center) { t = { x: center.x + gaussian(rng) * style.cluster, y: center.y + gaussian(rng) * style.cluster }; if (Math.hypot(t.x, t.y) > 168) t = center; }
+      // Anstoßen: ein naher neuer Pfeil verschiebt die Neigung eines steckenden Pfeils leicht
+      if (style.bump) for (const o of darts) {
+        if (Math.hypot(o.x - t.x, o.y - t.y) < 20) {
+          const a = ((3 + rng() * 6) * Math.PI) / 180, ph = rng() * 2 * Math.PI;
+          o.dir = norm([o.dir[0] + Math.sin(a) * Math.cos(ph), o.dir[1] + Math.sin(a) * Math.sin(ph), o.dir[2]]);
+        }
+      }
       darts.push(randomDart(rng, t.x, t.y, style));
+      // ein Spieler wirft drei gleiche Pfeile
+      if (style.sameSet && darts.length > 1) { const f = darts[0], d = darts[darts.length - 1]; for (const key of ["tip", "barrel", "shaft", "flight"]) d[key] = f[key]; }
       // Bewegung (Hand/Pfeil im Flug) simulieren: ein gestörtes Bild, dann ruhig
       const moving = frame(darts.slice(0, -1));
       const md = moving.data;
@@ -259,7 +271,7 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
       if (ev.conf >= 0.6 && ev.hit.label !== truth.label) res.wrongConfident++;
       if (ev.hit.label === truth.label) res.correct++;
       else res.wrong.push(`${truth.label} → ${ev.hit.label} (${e.toFixed(1)} mm, ${Math.round(ev.conf * 100)} %${ev.reasons.length ? ', ' + ev.reasons.join(', ') : ''})`);
-      if (log) log({ v, k, t, ev, e, darts: darts.slice(), cam, crop, detMaxW });
+      if (log) log({ v, k, t, ev, e, darts: darts.map((d) => ({ ...d })), cam, crop, detMaxW, det, base });
     }
     // Pfeile ziehen
     det.awaitTakeout();

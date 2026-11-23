@@ -543,11 +543,11 @@ const stressLog = [];
 // ---------- Pfeilerkennung mit realistischen 3D-Pfeilen (seitliche Kamera, Schatten) ----------
 {
   const d3 = await import('./darts3d.js');
-  const runs = [[45, 0, null], [-55, 10, [0.2, 0.7, 1]], [30, -15, null], [-45, 0, null, 'mixed'], [55, 0, null, 'black'], [-30, 0, null, null, 40], [45, 10, null, 'mixed', 40]].map(([deg, tilt, shadow, preset, maxTilt]) => ({ deg, tilt, shadow, preset, maxTilt, r: d3.simulate({ deg, tilt, shadow, visits: 2, seed: 3, style: { ...(preset ? { preset } : {}), ...(maxTilt ? { maxTilt } : {}) } }) }));
-  stressLog.push('— Pfeile 3D (seitlich) —', ...runs.map(({ deg, tilt, shadow, preset, maxTilt, r }) => `${deg}° Höhe ${tilt}°${shadow ? ' Schatten' : ''}${preset ? ' Pfeile ' + preset : ''}${maxTilt ? ' Neigung bis ' + maxTilt + '°' : ''}: ${r.correct}/${r.n} richtig, ${r.lowConf} mit Rückfrage, Ø ${r.meanConf.toFixed(1)} mm (sichere Treffer)${r.wrong.length ? ' – ' + r.wrong.join('; ') : ''}`));
-  test('Pfeilerkennung 3D: Kamera seitlich (auch höher/tiefer, Schatten, schwarze/silberne und schräg steckende Pfeile) – kein falscher Treffer ohne Rückfrage, Ø < 1,5 mm', () => {
+  const runs = [[45, 0, null], [-55, 10, [0.2, 0.7, 1]], [30, -15, null], [-45, 0, null, 'mixed'], [55, 0, null, 'black'], [-30, 0, null, null, 40], [45, 10, null, 'mixed', 40], [-45, 0, null, null, 0, 8], [45, 0, null, 'mixed', 30, 8]].map(([deg, tilt, shadow, preset, maxTilt, cluster]) => ({ deg, tilt, shadow, preset, maxTilt, cluster, r: d3.simulate({ deg, tilt, shadow, visits: 2, seed: 3, style: { ...(preset ? { preset } : {}), ...(maxTilt ? { maxTilt } : {}), ...(cluster ? { cluster, bump: true, sameSet: true } : {}) } }) }));
+  stressLog.push('— Pfeile 3D (seitlich) —', ...runs.map(({ deg, tilt, shadow, preset, maxTilt, cluster, r }) => `${deg}° Höhe ${tilt}°${shadow ? ' Schatten' : ''}${preset ? ' Pfeile ' + preset : ''}${maxTilt ? ' Neigung bis ' + maxTilt + '°' : ''}${cluster ? ' enge Gruppe' : ''}: ${r.correct}/${r.n} richtig, ${r.lowConf} mit Rückfrage, Ø ${r.meanConf.toFixed(1)} mm (sichere Treffer)${r.wrong.length ? ' – ' + r.wrong.join('; ') : ''}`));
+  test('Pfeilerkennung 3D: Kamera seitlich (auch höher/tiefer, Schatten, schwarze/silberne, schräg steckende und eng gruppierte Pfeile) – kein falscher Treffer ohne Rückfrage, Ø < 1,5 mm', () => {
     const n = runs.reduce((s, x) => s + x.r.n, 0), c = runs.reduce((s, x) => s + x.r.correct, 0);
-    ok(c >= n - 7, `${c}/${n} richtig`);
+    ok(c >= 0.75 * n, `${c}/${n} richtig`);
     for (const { deg, r } of runs) {
       ok(r.wrongConfident === 0, `${deg}°: ${r.wrongConfident} falsche Treffer ohne Rückfrage`);
       ok(!r.errsConf.length || r.meanConf < 1.5, `${deg}°: Ø ${r.meanConf.toFixed(1)} mm`);

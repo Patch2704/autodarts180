@@ -152,6 +152,52 @@ export function dartCrop(H, fullW, fullH) {
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
+/** Längliche Form? Wurzel des Verhältnisses der Hauptachsen (Pixelindizes, Bildbreite w) */
+function elongation(pixels, w) {
+  let mx = 0, my = 0;
+  for (const p of pixels) { mx += p % w; my += (p / w) | 0; }
+  mx /= pixels.length; my /= pixels.length;
+  let cxx = 0, cxy = 0, cyy = 0;
+  for (const p of pixels) { const dx = (p % w) - mx, dy = ((p / w) | 0) - my; cxx += dx * dx; cxy += dx * dy; cyy += dy * dy; }
+  const tr = cxx + cyy, det = cxx * cyy - cxy * cxy, disc = Math.sqrt(Math.max(0, (tr * tr) / 4 - det));
+  return Math.sqrt((tr / 2 + disc) / Math.max(1e-6, tr / 2 - disc));
+}
+
+/**
+ * Dominante Gerade (Hough): Richtung in 2°-Schritten, Abstand in 2-px-Klassen; die Gerade mit
+ * den meisten Pixeln im ±4-px-Band. Liefert die Pixel in diesem Band.
+ */
+function dominantLine(pixels, w, minExtent = 0) {
+  const step = Math.max(1, Math.floor(pixels.length / 3000));
+  const cands = [];
+  for (let a = 0; a < 180; a += 2) {
+    const t = (a * Math.PI) / 180, nx = -Math.sin(t), ny = Math.cos(t);
+    const bins = new Map();
+    for (let k = 0; k < pixels.length; k += step) {
+      const p = pixels[k], d = Math.round(((p % w) * nx + ((p / w) | 0) * ny) / 2);
+      bins.set(d, (bins.get(d) || 0) + 1);
+    }
+    for (const [d, c] of bins) {
+      const s = c + (bins.get(d - 1) || 0) + (bins.get(d + 1) || 0) + 0.5 * ((bins.get(d - 2) || 0) + (bins.get(d + 2) || 0));
+      cands.push({ s, nx, ny, off: d * 2 });
+    }
+  }
+  cands.sort((a, b) => b.s - a.s);
+  // Die Pfeilachse ist lang; kurze Geraden (z. B. die Kante eines Flight-Flügels) verwerfen
+  for (const c of cands.slice(0, 200)) {
+    const inliers = [], along = [];
+    for (const p of pixels) {
+      const x = p % w, y = (p / w) | 0;
+      if (Math.abs(x * c.nx + y * c.ny - c.off) <= 4) { inliers.push(p); along.push(x * c.ny - y * c.nx); }
+    }
+    if (inliers.length < 10) continue;
+    along.sort((a, b) => a - b);
+    const extent = along[Math.floor(along.length * 0.97)] - along[Math.floor(along.length * 0.03)];
+    if (extent >= minExtent) return { inliers, nx: c.nx, ny: c.ny, extent };
+  }
+  return null;
+}
+
 /** Pixel nur abgedunkelt (Schatten), nicht umgefärbt? a = aktuell, b = Referenz */
 function isShadow(ar, ag, ab, br, bg, bb) {
   const lb = br + bg + bb;
@@ -383,6 +429,7 @@ export class DartDetector {
     this.cur = a; this.refImg = b; this.refOff = off;
     const { diff, mask, roi, w } = this;
     diff.fill(0); mask.fill(0);
+    const vac = this.emptyRef && this.emptyRef !== b && this.dartsOnBoard > 0 ? this.emptyRef : null;
     for (let k = 0; k < roi.length; k++) {
       const p = roi[k], i = p * 4, j = (p + off) * 4;
       // Differenz: Mittel und stärkster Farbkanal (silber vor Creme unterscheidet sich fast nur im
@@ -391,6 +438,12 @@ export class DartDetector {
       const d = ((er + eg + eb) / 3 + Math.max(er, eg, eb)) / 2;
       // Schatten: gleichmäßig abgedunkelt bei unveränderter Farbe → gehört nicht zum Pfeil
       if (d > 6 && isShadow(a[i], a[i + 1], a[i + 2], b[j], b[j + 1], b[j + 2])) { diff[p] = 0; continue; }
+      // Freigewordene Stelle (ein angestoßener Pfeil hat sich bewegt): Hier sieht das Bild wieder
+      // aus wie die leere Scheibe – das gehört nicht zum neuen Pfeil
+      if (vac && d > 10) {
+        const ve = ((Math.abs(a[i] - vac[j]) + Math.abs(a[i + 1] - vac[j + 1]) + Math.abs(a[i + 2] - vac[j + 2])) / 3);
+        if (ve < 0.35 * d && ve < 14) { diff[p] = 0; continue; }
+      }
       diff[p] = d > 255 ? 255 : d;
     }
     // Rauschpegel (Median der Differenz – fast alle Pixel sind unverändert): Schwelle daran
@@ -489,7 +542,32 @@ export class DartDetector {
     }
     const minPx = this.opts.minDartFraction * this.roi.length;
     if (pixels.length < minPx) return null;
+    // Enge Gruppe: Berührt die Veränderung steckende Pfeile und ist sie nicht klar länglich
+    // (z. B. neuer Pfeil + angestoßener alter Pfeil = V-Form), nur die dominante Gerade auswerten
+    let cluster = false;
+    if (this.occ && this.dartsOnBoard > 0) {
+      let touchOcc = 0;
+      for (let k = 0; k < pixels.length; k += 3) if (this.occ[pixels[k]]) touchOcc++;
+      const elAll = elongation(pixels, w);
+      if (touchOcc > 3 && elAll < 2.5) {
+        // mind. gut die Hälfte eines ganzen Pfeils (ca. 140 mm) muss auf der Geraden liegen
+        const line = dominantLine(pixels, w, exp && exp.len > 12 ? 0.55 * exp.len * 1.4 : 0);
+        if (line && line.inliers.length >= Math.max(minPx, 0.15 * pixels.length)) {
+          pixels = line.inliers; cluster = true;
+          let x0 = w, y0 = this.h, x1 = 0, y1 = 0;
+          for (const p of pixels) { const x = p % w, y = (p / w) | 0; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+          bb.minX = x0; bb.minY = y0; bb.maxX = x1; bb.maxY = y1;
+        }
+      }
+    }
     const det = this.locateTip(pixels, bb, comps.length - merged.length);
+    if (det && cluster) {
+      det.conf *= 0.9; det.reasons.push('aus einer Pfeilgruppe herausgelöst');
+      // In der Gruppe ist der neue Pfeil oft nur teilweise sichtbar: kürzer als ein ganzer Pfeil
+      // oder kontrastarmes Spitzenende → eher nachfragen
+      if (det.axis.expLen > 12 && det.axis.length < 1.5 * det.axis.expLen) { det.conf *= 0.75; det.reasons.push('in der Gruppe nur teilweise sichtbar'); }
+      if (det.axis.endContrast < 45) det.conf *= 0.75;
+    }
     // kleine Veränderung: nur als Pfeil werten, wenn sie deutlich länglich ist
     if (pixels.length < this.opts.smallDartFraction * this.roi.length) {
       if (det.axis.elong < 3) return null;
@@ -695,7 +773,7 @@ export class DartDetector {
       if (elong < 2.5 && !axisFromModel) conf *= 0.85;
       if (axisFromModel) { conf *= spreadOk ? 0.7 : 0.5; reasons.push('Pfeil zeigt fast zur Kamera'); }
       if (!geoDecided && Math.abs(dot) < 0.7) { conf *= 0.85; reasons.push('Pfeil stark schräg'); }
-      if (thinIsMin !== tipAtMin && widthRatio < 0.6) { conf *= 0.8; reasons.push('Form widerspricht Pfeilrichtung'); }
+      if (thinIsMin !== tipAtMin && widthRatio < 0.6) { conf *= 0.65; reasons.push('Form widerspricht Pfeilrichtung'); }
       if (dirConflict) { conf *= 0.6; reasons.push('Pfeilrichtung unklar'); }
       if (!geoDecided && !axisFromModel) conf *= 0.85; // nur über die Senkrecht-Annahme entschieden
     } else {
@@ -708,6 +786,10 @@ export class DartDetector {
     if (estimated) { conf *= 0.3; reasons.push('Spitze kaum sichtbar – Lage über Pfeillänge geschätzt'); }
     else if (partial) { conf *= 0.5; reasons.push('Pfeil nur teilweise sichtbar'); }
     else if (bridged > 2) { conf *= 0.85; reasons.push('Spitze über kontrastarmes Stück verfolgt'); }
+    // Veränderung deutlich länger als ein ganzer Pfeil sein kann → Teile anderer Pfeile mit erfasst
+    if (exp && exp.len > 12 && L > 2.6 * exp.len) { conf *= 0.5; reasons.push('Veränderung länger als ein Pfeil'); }
+    // nur ein kurzes Stück sichtbar (weniger als gut die Hälfte eines Pfeils) → Richtung und Spitze unsicher
+    if (exp && exp.len > 12 && L < 0.8 * exp.len) { conf *= 0.6; reasons.push('nur ein kurzes Stück des Pfeils sichtbar'); }
     if (hit.r <= 175) {
       // Toleranz je nach Messsicherheit: mit eindeutiger Pfeilrichtung ist die Spitze auf
       // Bruchteile von Millimetern genau, sonst deutlich ungenauer
@@ -715,8 +797,9 @@ export class DartDetector {
       if (hit.wireDist < sigma * 0.75) { conf *= 0.5; reasons.push('direkt am Draht'); }
       else if (hit.wireDist < sigma * 1.6) { conf *= 0.8; reasons.push('nahe am Draht'); }
     } else if (hit.r < 190) { conf *= 0.6; reasons.push('knapp außerhalb des Doppels'); }
-    const overlap = this.regions.some((r) => !(bbox.maxX < r.minX || bbox.minX > r.maxX || bbox.maxY < r.minY || bbox.minY > r.maxY));
-    if (overlap) { conf *= 0.75; reasons.push('überlagert einen vorhandenen Pfeil'); }
+    // Liegt die Spitze direkt auf/an einem schon steckenden Pfeil? (Nur Überschneidung der
+    // Umrisse reicht nicht – in einer engen Gruppe überschneiden sich die Umrisse fast immer.)
+    if (this.isOcc(tip)) { conf *= 0.75; reasons.push('Spitze liegt an einem anderen Pfeil'); }
     if (otherBlobs > 2) { conf *= 0.8; reasons.push('weitere Bildveränderungen'); }
     // Kontrast am Spitzenende: Ist das Pfeilende (z. B. schwarze Spitze/Barrel) farblich kaum vom
     // Untergrund direkt dahinter zu unterscheiden (schwarz vor schwarzem Feld, silber vor Creme),
