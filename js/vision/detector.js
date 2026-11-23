@@ -254,7 +254,7 @@ export class DartDetector {
   }
 
   /** Pixel bereits steckender Pfeile (für die Erkennung verdeckter Spitzen) */
-  clearOcc() { if (this.occ) this.occ.fill(0); this.lastPixels = null; }
+  clearOcc() { if (this.occ) this.occ.fill(0); this.lastPixels = null; this.segs = []; }
 
   /** Liegt ein bereits steckender Pfeil in der Nähe (±2 px) dieses Bildpunkts? */
   isOcc(p) {
@@ -312,11 +312,13 @@ export class DartDetector {
     const count = this.buildMask(img.data, this.lastRefBefore);
     if (count < this.opts.minDartFraction * this.roi.length) return null;
     const own = this.regions.pop();
+    const ownSeg = this.segs.pop();
     const ownPx = this.lastPixels;
     this.markOcc(ownPx, -1); // eigener Pfeil verdeckt sich nicht selbst
     const det = this.analyse();
     if (ownPx) { this.markOcc(ownPx, 1); }
     if (own) this.regions.push(own);
+    if (ownSeg) this.segs.push(det ? { tip: det.tipPx, far: det.far } : ownSeg);
     if (det) delete det.pixelList;
     return det;
   }
@@ -406,6 +408,7 @@ export class DartDetector {
     if (!det) { this.status = 'bereit'; return [{ type: 'unclear' }]; }
     this.dartsOnBoard++;
     this.regions.push(det.bbox);
+    this.segs.push({ tip: det.tipPx, far: det.far });
     this.markOcc(det.pixelList);
     delete det.pixelList;
     this.status = 'bereit';
@@ -565,7 +568,7 @@ export class DartDetector {
       det.conf *= 0.9; det.reasons.push('aus einer Pfeilgruppe herausgelöst');
       // In der Gruppe ist der neue Pfeil oft nur teilweise sichtbar: kürzer als ein ganzer Pfeil
       // oder kontrastarmes Spitzenende → eher nachfragen
-      if (det.axis.expLen > 12 && det.axis.length < 1.5 * det.axis.expLen) { det.conf *= 0.75; det.reasons.push('in der Gruppe nur teilweise sichtbar'); }
+      if (det.axis.expLen > 12 && det.axis.length < 1.5 * det.axis.expLen) { det.conf *= 0.6; det.reasons.push('in der Gruppe nur teilweise sichtbar'); }
       if (det.axis.endContrast < 45) det.conf *= 0.75;
     }
     // kleine Veränderung: nur als Pfeil werten, wenn sie deutlich länglich ist
@@ -793,14 +796,25 @@ export class DartDetector {
     if (hit.r <= 175) {
       // Toleranz je nach Messsicherheit: mit eindeutiger Pfeilrichtung ist die Spitze auf
       // Bruchteile von Millimetern genau, sonst deutlich ungenauer
-      const sigma = geoStrong && !axisFromModel ? 0.6 : 2;
-      if (hit.wireDist < sigma * 0.75) { conf *= 0.5; reasons.push('direkt am Draht'); }
-      else if (hit.wireDist < sigma * 1.6) { conf *= 0.8; reasons.push('nahe am Draht'); }
+      // (gemessen: Fehler wächst mit den mm pro Bildpunkt entlang der Pfeilachse)
+      const bq = toBoard({ x: tip.x + ux, y: tip.y + uy });
+      const mmPx = Number.isFinite(bq.x) ? Math.hypot(bq.x - b.x, bq.y - b.y) : 1.5;
+      const sigma = geoStrong && !axisFromModel ? Math.min(1.5, 0.35 + 0.4 * mmPx) : 2;
+      if (hit.wireDist < sigma) { conf *= 0.5; reasons.push('direkt am Draht'); }
+      else if (hit.wireDist < sigma * 1.5) { conf *= 0.8; reasons.push('nahe am Draht'); }
     } else if (hit.r < 190) { conf *= 0.6; reasons.push('knapp außerhalb des Doppels'); }
     // Liegt die Spitze direkt auf/an einem schon steckenden Pfeil? (Nur Überschneidung der
     // Umrisse reicht nicht – in einer engen Gruppe überschneiden sich die Umrisse fast immer.)
     if (this.isOcc(tip)) { conf *= 0.75; reasons.push('Spitze liegt an einem anderen Pfeil'); }
-    if (otherBlobs > 2) { conf *= 0.8; reasons.push('weitere Bildveränderungen'); }
+    // Liegt die Spitze mitten am Körper eines steckenden Pfeils, kann es auch dieser Pfeil selbst sein,
+    // der angestoßen wurde (nahe seiner Spitze bewegt er sich nicht, weiter hinten schon)
+    for (const s of this.segs || []) {
+      const sx = s.far.x - s.tip.x, sy = s.far.y - s.tip.y, sl = Math.hypot(sx, sy) || 1;
+      const al = ((tip.x - s.tip.x) * sx + (tip.y - s.tip.y) * sy) / sl, pe = Math.abs((tip.x - s.tip.x) * sy - (tip.y - s.tip.y) * sx) / sl;
+      if (al > 14 && al < sl && pe < 4 + 0.16 * al) { conf *= 0.55; reasons.push('evtl. nur ein angestoßener Pfeil'); break; }
+    }
+    // stecken schon Pfeile, deuten weitere Veränderungen auf angestoßene Pfeile hin → nachfragen
+    if (otherBlobs > 2) { conf *= this.dartsOnBoard > 0 ? 0.55 : 0.8; reasons.push('weitere Bildveränderungen'); }
     // Kontrast am Spitzenende: Ist das Pfeilende (z. B. schwarze Spitze/Barrel) farblich kaum vom
     // Untergrund direkt dahinter zu unterscheiden (schwarz vor schwarzem Feld, silber vor Creme),
     // kann die Spitze unsichtbar weitergehen → Rückfrage statt Raten.
@@ -824,7 +838,7 @@ export class DartDetector {
         endContrast = ((e[0] + e[1] + e[2]) / 3 + Math.max(...e)) / 2;
       }
     }
-    if (geoStrong && endContrast < 28) { conf *= 0.5; reasons.push('Spitze kaum vom Untergrund zu unterscheiden'); }
+    if (geoStrong && endContrast < 50) { conf *= 0.5; reasons.push('Spitze kaum vom Untergrund zu unterscheiden'); }
     // Spitze hinter einem bereits steckenden Pfeil? Dann ist der sichtbare Teil deutlich kürzer
     // als ein ganzer Pfeil und endet direkt an dessen Pixeln → Spitze liegt weiter vorne, unsicher.
     let occTouch = false;
@@ -846,7 +860,8 @@ export class DartDetector {
     }
 
     return {
-      tip: { x: tip.x / this.w, y: tip.y / this.h },
+      tip: { x: (tip.x + 0.5) / this.w, y: (tip.y + 0.5) / this.h },
+      far: { x: altPx.x, y: altPx.y }, tipPx: { x: tip.x, y: tip.y },
       board: { x: b.x, y: b.y },
       hit: { seg: hit.seg, mult: hit.mult, score: hit.score, label: hit.label, wireDist: hit.wireDist, r: hit.r },
       conf: Math.max(0, Math.min(1, conf)),

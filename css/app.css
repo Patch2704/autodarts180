@@ -183,7 +183,7 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 14px; }
 .tbl-wrap { overflow-x: auto; }
 
 /* ---------- Dashboard ---------- */
-.hero { display: flex; align-items: center; justify-content: space-between; gap: 16px; background: linear-gradient(135deg, var(--surface) 0%, var(--surface-2) 100%); }
+.hero { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; background: linear-gradient(135deg, var(--surface) 0%, var(--surface-2) 100%); }
 .hero .big-logo { font-size: 30px; font-weight: 900; letter-spacing: -0.03em; }
 .hero .big-logo b { color: var(--accent); }
 .quick { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }

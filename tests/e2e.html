@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><title>E2E Spiel mit simulierter Kamera</title>
+<style>body{font:13px system-ui;background:#15171a;color:#e8eaed;margin:8px} iframe{width:390px;height:700px;border:1px solid #333} canvas{height:300px} pre{white-space:pre-wrap}</style></head>
+<body><h1>Spiel mit simulierter Kamera</h1><pre id="out">startet …</pre><iframe id="app" src="../index.html#/dashboard"></iframe>
+<script type="module">
+  // Spielt die echte App (iframe) mit einem künstlichen Kamerastream durch: Pfeile landen, Hand zieht sie heraus.
+  import * as D from './darts3d.js';
+  import * as cal from '../js/vision/calibration.js';
+  import { renderScene } from './scene.js';
+  import { scoreAt } from '../js/core/board.js';
+  import { mulberry32 } from '../js/core/rng.js';
+  const q = new URLSearchParams(location.search);
+  const deg = Number(q.get('deg') ?? -40), tilt = Number(q.get('tilt') ?? 0), visits = Number(q.get('visits') ?? 3), W = Number(q.get('w') ?? 1080), H = Math.round(W * 16 / 9);
+  const out = document.getElementById('out'), lines = [];
+  const log = (s) => { lines.push(s); out.textContent = lines.join('\n'); };
+  window.__e2e = { lines, done: false };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const cam = D.sideCamera(deg, W, H, { fill: 0.8, tilt });
+  const base = renderScene({ w: W, h: H, pts: cal.pointsFromH(cam.H), light: 0.9, noise: 0, wall: [70, 12, 52] }).img;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H; document.body.append(cv);
+  const g = cv.getContext('2d');
+  let frames = [], hand = false, fi = 0;
+  const setScene = (darts) => { const img = darts.length ? D.drawDarts(base, cam, darts, { shadow: [0.2, 0.7, 1] }) : base; frames = [1, 2, 3].map((s) => D.addNoiseFast(img, 4, s + fi)); };
+  setScene([]);
+  const paint = () => { g.putImageData(frames[fi++ % frames.length], 0, 0); if (hand) { g.fillStyle = '#c89678'; g.beginPath(); g.ellipse(W * 0.5 + Math.sin(fi) * 60, H * 0.55, W * 0.22, H * 0.2, 0.4, 0, 7); g.fill(); } };
+  paint(); setInterval(paint, 66);
+  const stream = cv.captureStream(15);
+  const fr = document.getElementById('app');
+  await new Promise((r) => { if (fr.contentDocument?.readyState === 'complete' && fr.contentWindow.location.href !== 'about:blank') r(); else fr.onload = r; });
+  await sleep(800);
+  const w = fr.contentWindow;
+  const imp = (p) => w.eval(`import('${new URL('../' + p, location.href).href}')`);
+  w.addEventListener('error', (e) => log('JS-FEHLER: ' + e.message));
+  const ce = w.console.error; w.console.error = (...a) => { log('console.error: ' + a.map((x) => x?.message || x).join(' ')); ce(...a); };
+  w.navigator.mediaDevices.getUserMedia = async () => stream.clone();
+  Object.defineProperty(w.navigator, 'canShare', { value: () => false, configurable: true });
+  const st = await imp('js/state.js'), repo = await imp('js/data/repo.js'), x01 = await imp('js/core/x01.js'), det = await imp('js/vision/detector.js');
+  const times = [], evTimes = [];
+  const op = det.DartDetector.prototype.process; const evLog = [];
+  det.DartDetector.prototype.process = function (img) { const t = performance.now(); const r = op.call(this, img); times.push(performance.now() - t); window.__size = `${img.width}×${img.height}`; for (const e of r) evLog.push(e.type); return r; };
+  const oe = det.DartDetector.prototype.evaluate;
+  det.DartDetector.prototype.evaluate = function (d) { const t = performance.now(); const r = oe.call(this, d); evTimes.push(performance.now() - t); return r; };
+  const oldCal = st.calibration.current;
+  // Kalibrierung wie von der App: automatisch aus dem Bild (nicht aus der Wahrheit)
+  g.putImageData(frames[0], 0, 0);
+  const half = document.createElement('canvas'); half.width = 720; half.height = Math.round(720 * H / W); half.getContext('2d').drawImage(cv, 0, 0, half.width, half.height);
+  const full = half.getContext('2d').getImageData(0, 0, half.width, half.height);
+  const auto = cal.autoCalibrate(full);
+  if (!auto?.H) { log('Auto-Kalibrierung fehlgeschlagen'); window.__e2e.done = true; throw new Error('kal'); }
+  const bc = cal.boardCrop(auto.H), cimg = D.grabCrop(frames[0], bc, 640);
+  await st.calibration.save({ H: auto.H, points: auto.points, quality: auto.quality ?? 1, cropQuality: cal.calibrationQuality(cimg, cal.cropH(auto.H, bc)).score, brightness: cal.frameMetrics(cimg).brightness, aspect: W / H, createdAt: Date.now(), version: 3 });
+  const m = x01.createMatch({ settings: { startScore: 1001, legsToWin: 1 }, players: [{ id: 'e2e', name: 'Test' }] });
+  m.inputMode = 'camera';
+  await repo.matches.save(m);
+  w.location.hash = `#/game/${m.id}`;
+  await sleep(6000);
+  const doc = fr.contentDocument;
+  log(`Kamera ${W}×${H}, Blick ${deg}°/${tilt}°, Status: ${doc.querySelector('.cam-status')?.textContent}`);
+  const rng = mulberry32(Number(q.get('seed') ?? 7));
+  const truth = [], asked = [];
+  const btn = (t) => [...doc.querySelectorAll('button')].find((b) => b.textContent.trim().startsWith(t));
+  let exported = null;
+  const oc = w.HTMLAnchorElement.prototype.click;
+  w.HTMLAnchorElement.prototype.click = function () { if (this.download) { const ex = { name: this.download }; ex.blob = w.fetch(this.href).then((r) => r.blob()); exported = ex; return; } return oc.call(this); };
+  for (let v = 0; v < visits; v++) {
+    const darts = [];
+    for (let k = 0; k < 3; k++) {
+      const a = rng() * 2 * Math.PI, r = 12 + rng() * 150, x = r * Math.cos(a), y = r * Math.sin(a);
+      darts.push(D.randomDart(rng, x, y, { preset: q.get('preset') || undefined, maxTilt: 25 }));
+      truth.push(scoreAt(x, y).label);
+      setScene(darts);
+      await sleep(2500);
+      const c = btn('Bestätigen');
+      if (c) { asked.push(truth.length); c.click(); await sleep(300); }
+    }
+    if (v === 0) {
+      const b = btn('Erkennung speichern');
+      if (b && !b.disabled) { b.click(); await sleep(1500); if (exported) { const im = new Image(); await new Promise((r) => { im.onload = r; im.onerror = r; exported.blob.then((bl) => { im.src = URL.createObjectURL(bl); }); }); log(`Erkennung speichern: ${exported.name} ${im.naturalWidth}×${im.naturalHeight}`); im.style.width = '500px'; document.body.append(im); } else log('Erkennung speichern: KEIN BILD'); } else log('Erkennung speichern: Knopf fehlt/gesperrt');
+    }
+    hand = true; await sleep(1500); setScene([]); await sleep(300); hand = false; await sleep(2500);
+  }
+  const mm = await repo.matches.get(m.id);
+  const got = mm.legs.flatMap((l) => l.visits.flatMap((x) => x.darts.map((d) => d.label)));
+  log(`Wahrheit: ${truth.join(' ')}`); log(`Erkannt:  ${got.join(' ')}`); log(`Rückfragen bei Pfeil: ${asked.join(', ') || 'keine'}`);
+  log(`Aufnahmen: ${mm.legs.flatMap((l) => l.visits).map((x) => x.darts.length).join(', ')} | Ereignisse: ${evLog.join(',')}`);
+  const s = (a) => a.length ? `Ø ${(a.reduce((x, y) => x + y, 0) / a.length).toFixed(1)} ms, max ${Math.max(...a).toFixed(0)} ms` : '-';
+  log(`Bildgröße Auswertung ${window.__size}; pro Bild ${s(times)}; Auswertung ${s(evTimes)}; Bilder ${times.length}`);
+  log('Hinweise: ' + [...doc.querySelectorAll('.notice')].map((n) => n.textContent).join(' | '));
+  w.location.hash = '#/dashboard'; await sleep(300);
+  await repo.matches.remove(m.id); if (oldCal) await st.calibration.save(oldCal); else await st.calibration.clear();
+  window.__e2e.done = true; log('FERTIG');
+</script></body></html>

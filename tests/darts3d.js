@@ -227,7 +227,7 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
   det.setCalibration(Hc, first.width, first.height, detectorOpts.noView ? null : cropView(crop, first.width, first.height));
   det.process(first);
   for (let k = 0; k < 6; k++) det.process(frame([]));
-  const res = { n: 0, correct: 0, missed: 0, lowConf: 0, errs: [], errsConf: [], wrongConfident: 0, wrong: [], along: [], perp: [] };
+  const res = { n: 0, correct: 0, auto: 0, askOk: 0, askWrong: 0, phantom: 0, missed: 0, lowConf: 0, errs: [], errsConf: [], wrongConfident: 0, wrong: [], along: [], perp: [] };
   for (let v = 0; v < visits; v++) {
     const darts = [];
     // eng gruppiert: alle drei Pfeile um einen gemeinsamen Zielpunkt (Streuung style.cluster mm)
@@ -254,6 +254,7 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
       const still = frame(darts);
       for (let f = 0; f < 7; f++) evs = evs.concat(det.process(f % 2 ? still : frame(darts)));
       const ev = evs.find((e) => e.type === 'dart');
+      res.phantom += Math.max(0, evs.filter((e) => e.type === 'dart').length - 1);
       const truth = scoreAt(t.x, t.y);
       res.n++;
       if (!ev) { res.missed++; res.wrong.push(`${truth.label}: nicht erkannt (${evs.map((e) => e.type).join(',') || 'kein Ereignis'})`); continue; }
@@ -269,6 +270,7 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
       }
       if (ev.conf < 0.6) res.lowConf++; else res.errsConf.push(e);
       if (ev.conf >= 0.6 && ev.hit.label !== truth.label) res.wrongConfident++;
+      { const good = ev.hit.label === truth.label; if (ev.conf >= 0.6) { if (good) res.auto++; } else if (good) res.askOk++; else res.askWrong++; }
       if (ev.hit.label === truth.label) res.correct++;
       else res.wrong.push(`${truth.label} → ${ev.hit.label} (${e.toFixed(1)} mm, ${Math.round(ev.conf * 100)} %${ev.reasons.length ? ', ' + ev.reasons.join(', ') : ''})`);
       if (log) log({ v, k, t, ev, e, darts: darts.map((d) => ({ ...d })), cam, crop, detMaxW, det, base });
@@ -277,7 +279,10 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
     det.awaitTakeout();
     const hand = frame([]); const hd = hand.data; for (let i = 0; i < hd.length; i += 4 * 5) hd[i] = 0;
     det.process(hand);
-    for (let f = 0; f < 8; f++) det.process(frame([]));
+    let tk = [];
+    for (let f = 0; f < 8; f++) tk = tk.concat(det.process(frame([])));
+    res.phantom += tk.filter((e) => e.type === 'dart').length;
+    if (!tk.some((e) => e.type === 'takeout')) res.noTakeout = (res.noTakeout || 0) + 1;
   }
   const s = res.errs.slice().sort((a, b) => a - b);
   res.mean = s.length ? s.reduce((a, b) => a + b, 0) / s.length : NaN;
@@ -286,4 +291,29 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
   const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : NaN);
   res.biasAlong = avg(res.along); res.biasPerp = avg(res.perp); res.meanConf = avg(res.errsConf);
   return res;
+}
+
+/** Feste Messreihe über alle Pfeilarten; seed frei wählbar (zum Gegenprüfen frische Werte nehmen) */
+export const SCENARIOS = [
+  ['bunt, normal', {}], ['schwarz/silber gemischt', { preset: 'mixed' }], ['komplett schwarz', { preset: 'black' }], ['komplett silber', { preset: 'silver' }],
+  ['bunt, bis 40° schräg', { maxTilt: 40 }], ['schwarz/silber, bis 40° schräg', { maxTilt: 40, preset: 'mixed' }],
+  ['enge Gruppe, bunt, gleiche Pfeile', { cluster: 8, bump: true, sameSet: true }],
+  ['enge Gruppe, schwarz/silber, gleich, schräg', { cluster: 8, bump: true, sameSet: true, preset: 'mixed', maxTilt: 30 }],
+];
+export const CAMERAS = [[30, 0], [-30, 0], [45, 0], [-45, 0], [55, 0], [-55, 0], [45, 15], [-45, -15]];
+
+export async function benchmark(seed, onRow = () => {}, { scenarios = SCENARIOS, cameras = CAMERAS, visits = 4 } = {}) {
+  const rows = [];
+  for (const [label, style] of scenarios) {
+    const r = { label, seed, n: 0, auto: 0, askOk: 0, askWrong: 0, wrongConfident: 0, missed: 0, phantom: 0, noTakeout: 0, errs: [], bad: [] };
+    for (const [deg, tilt] of cameras) {
+      await new Promise((res) => { const c = new MessageChannel(); c.port1.onmessage = res; c.port2.postMessage(0); });
+      const s = simulate({ deg, tilt, visits, seed, style, log: ({ t, ev, e, k }) => { if (ev.conf >= 0.6 && ev.hit.label !== scoreAt(t.x, t.y).label) r.bad.push(`${deg}/${tilt} P${k + 1} ${scoreAt(t.x, t.y).label}→${ev.hit.label} e=${e.toFixed(1)} c${Math.round(ev.conf * 100)} [${ev.reasons}]`); } });
+      for (const key of ['n', 'auto', 'askOk', 'askWrong', 'wrongConfident', 'missed', 'phantom']) r[key] += s[key];
+      r.noTakeout += s.noTakeout || 0; r.errs.push(...s.errsConf);
+    }
+    r.mean = r.errs.reduce((a, b) => a + b, 0) / r.errs.length; delete r.errs;
+    rows.push(r); onRow(r);
+  }
+  return rows;
 }
