@@ -37,7 +37,7 @@
   for (const [deg, tilt] of conds) for (const sh of shadows) {
     // kurz abgeben (MessageChannel wird auch in Hintergrund-Tabs nicht gedrosselt)
     await new Promise((res) => { const c = new MessageChannel(); c.port1.onmessage = res; c.port2.postMessage(0); });
-    const r = D.simulate({ deg, tilt, shadow: sh, visits: Number(q.get('visits') ?? 4), seed: Number(q.get('seed') ?? 1), style: q.get('preset') ? { preset: q.get('preset') } : {} });
+    const r = D.simulate({ deg, tilt, shadow: sh, visits: Number(q.get('visits') ?? 4), seed: Number(q.get('seed') ?? 1), style: { ...(q.get('preset') ? { preset: q.get('preset') } : {}), ...(q.get('tilt') ? { maxTilt: Number(q.get('tilt')) } : {}) } });
     tot += r.n; totC += r.correct; totM += r.missed; totW += r.wrongConfident;
     lines.push(`${deg}° Höhe ${tilt}°${sh ? ' Schatten' : ''}: ${r.correct}/${r.n} richtig, verpasst ${r.missed}, mit Rückfrage ${r.lowConf}, falsch ohne Rückfrage ${r.wrongConfident}, Fehler Ø ${r.mean.toFixed(1)} mm, 90% ${r.p90.toFixed(1)}, max ${r.max.toFixed(1)}, Versatz Spitze entlang ${r.biasAlong.toFixed(1)} px / quer ${r.biasPerp.toFixed(1)} px`);
     for (const w of r.wrong) lines.push('    ' + w);

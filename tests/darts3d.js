@@ -40,7 +40,14 @@ const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a
 
 /** Zufälliger Pfeil: Einstich (x,y), Achse leicht schräg (Flight meist etwas höher) */
 export function randomDart(rng, x, y, style = {}) {
-  const dir = norm([(rng() - 0.5) * 0.5, -0.1 + rng() * 0.55, 1]);
+  let dir = norm([(rng() - 0.5) * 0.5, -0.1 + rng() * 0.55, 1]);
+  if (style.maxTilt) {
+    // jeder Pfeil steckt anders: Neigung bis maxTilt Grad in beliebige Richtung
+    // (Flight öfter nach oben als nach unten, wie bei Würfen im Bogen)
+    const th = (Math.sqrt(rng()) * style.maxTilt * Math.PI) / 180;
+    const phi = rng() < 0.6 ? Math.PI / 2 + (rng() - 0.5) * Math.PI : rng() * 2 * Math.PI;
+    dir = [Math.sin(th) * Math.cos(phi), Math.sin(th) * Math.sin(phi), Math.cos(th)];
+  }
   const spin = rng() * Math.PI;
   const palette = [[230, 200, 40], [40, 60, 160], [200, 40, 40], [25, 25, 28], [235, 235, 235], [40, 160, 70]];
   const BLACK = [26, 26, 28], SILVER = [165, 168, 175], TIP_SILVER = [178, 180, 186];

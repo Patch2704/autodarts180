@@ -51,12 +51,42 @@ export function estimateCamera(Hpx, cx, cy, size) {
   const n3 = Math.hypot(...r3); r3 = r3.map((v) => v / n3);
   // Normale zur Kamera hin ausrichten (Kamera im Ursprung)
   if (r3[0] * t[0] + r3[1] * t[1] + r3[2] * t[2] > 0) r3 = r3.map((v) => -v);
+  const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const ray = (px, py) => [(px - cx) / focal, (py - cy) / focal, 1];
   return {
     focal, persp,
     /** Bildpunkt (px) eines Punkts L mm vor der Scheibe über dem Board-Punkt (bx, by) */
     point(bx, by, L = 0) {
       const X = [0, 1, 2].map((k) => r1[k] * bx + r2[k] * by + t[k] + r3[k] * L);
       return { x: (focal * X[0]) / X[2] + cx, y: (focal * X[1]) / X[2] + cy };
+    },
+    /**
+     * Wie schräg müsste ein Pfeil stecken, dessen Spitze im Bild bei tipPx (auf der Scheibe) und
+     * dessen hinteres Ende bei farPx liegt? Länge 100–175 mm, hinteres Ende vor der Scheibe.
+     * Liefert die kleinste nötige Neigung gegen die Senkrechte (Grad) oder Infinity (unmöglich).
+     */
+    impliedTilt(tipPx, farPx) {
+      const qt = ray(tipPx.x, tipPx.y), qf = ray(farPx.x, farPx.y);
+      const den = dot3(r3, qt);
+      if (Math.abs(den) < 1e-9) return Infinity;
+      const s = dot3(r3, t) / den;
+      if (!(s > 0)) return Infinity;
+      const T = qt.map((v) => v * s);
+      const qq = dot3(qf, qf), qT = dot3(qf, T), TT = dot3(T, T);
+      let best = Infinity;
+      for (let L = 100; L <= 175; L += 5) {
+        const disc = qT * qT - qq * (TT - L * L);
+        if (disc < 0) continue;
+        for (const sg of [-1, 1]) {
+          const u = (qT + sg * Math.sqrt(disc)) / qq;
+          if (!(u > 0)) continue;
+          const h = dot3(r3, [u * qf[0] - T[0], u * qf[1] - T[1], u * qf[2] - T[2]]);
+          if (h <= 0) continue;
+          const tilt = (Math.acos(Math.min(1, h / L)) * 180) / Math.PI;
+          if (tilt < best) best = tilt;
+        }
+      }
+      return best;
     },
   };
 }
@@ -68,7 +98,10 @@ export function estimateCamera(Hpx, cx, cy, size) {
  */
 function dartVolumePoints(cam) {
   const pts = [];
-  for (const [ox, oy, oz] of [[0, 0, 0], [0, 0, 150], [0, 65, 150], [0, -25, 150], [45, 15, 150], [-45, 15, 150]]) {
+  // Pfeile bis ca. 40° in jede Richtung geneigt (150 mm lang → 96 mm seitlich, 115 mm vor der Scheibe)
+  const tilts = [[0, 0, 0], [0, 0, 150]];
+  for (let k = 0; k < 8; k++) tilts.push([96 * Math.cos((k * Math.PI) / 4), 96 * Math.sin((k * Math.PI) / 4), 115]);
+  for (const [ox, oy, oz] of tilts) {
     for (let k = 0; k < 24; k++) {
       const t = (k * 15 * Math.PI) / 180;
       const p = cam.point(180 * Math.cos(t) + ox, 180 * Math.sin(t) + oy, oz);
@@ -417,8 +450,21 @@ export class DartDetector {
     };
     const mc = centroid(main);
     const exp = this.expectedDir(mc.x, mc.y);
-    const axis = exp && exp.len > 12 ? exp : null;
-    const dartLen = axis ? axis.len * 1.45 : 0; // Pfeil ≈ 140 mm lang
+    const dartLen = exp && exp.len > 12 ? exp.len * 1.45 : 0; // Pfeil ≈ 140 mm lang
+    // Achse für das Zusammenführen: Ist der Hauptteil selbst länglich (z. B. Barrel+Schaft), gibt
+    // er die tatsächliche Pfeilrichtung vor – egal wie schräg der Pfeil steckt (enger Kegel).
+    // Sonst (z. B. nur Flight sichtbar) die Richtung aus dem Kameramodell mit weitem Kegel.
+    let axis = null, cone = 0.7;
+    {
+      let cxx = 0, cxy = 0, cyy = 0;
+      for (const p of main.px) { const dx = (p % w) - mc.x, dy = ((p / w) | 0) - mc.y; cxx += dx * dx; cxy += dx * dy; cyy += dy * dy; }
+      const tr = cxx + cyy, det = cxx * cyy - cxy * cxy, disc = Math.sqrt(Math.max(0, (tr * tr) / 4 - det));
+      const l1 = tr / 2 + disc, l2 = Math.max(1e-6, tr / 2 - disc);
+      if (dartLen && Math.sqrt(l1 / l2) >= 3) {
+        let ax = Math.abs(cxy) > 1e-9 ? l1 - cyy : cxx >= cyy ? 1 : 0, ay = Math.abs(cxy) > 1e-9 ? cxy : cxx >= cyy ? 0 : 1;
+        const an = Math.hypot(ax, ay); axis = { x: ax / an, y: ay / an }; cone = 0.2;
+      } else if (dartLen) axis = exp;
+    }
     const gap = Math.max(8, Math.round(Math.min(w, h) * 0.04));
     let pixels = main.px.slice();
     const bb = { ...main.bbox };
@@ -431,8 +477,8 @@ export class DartDetector {
       if (axis) {
         const cc = centroid(c), rx = cc.x - mc.x, ry = cc.y - mc.y;
         const along = rx * axis.x + ry * axis.y, perp = Math.abs(rx * axis.y - ry * axis.x);
-        // Kegel um die Achse: Pfeile stecken nicht exakt senkrecht (bis ca. 25° geneigt)
-        onAxis = Math.abs(along) <= dartLen * 1.2 && perp <= 5 + 0.45 * Math.abs(along) && c.px.length >= Math.max(12, main.px.length * 0.02);
+        // Kegel um die Achse
+        onAxis = Math.abs(along) <= dartLen * 1.2 && perp <= 5 + cone * Math.abs(along) && c.px.length >= Math.max(12, main.px.length * 0.02);
       }
       if ((dx <= gap && dy <= gap && c.px.length >= main.px.length * 0.05) || onAxis) {
         pixels = pixels.concat(c.px);
@@ -569,8 +615,32 @@ export class DartDetector {
     // Geometrie eindeutig genug? (Pfeil ragt im Bild sichtbar heraus und Achse passt zur Erwartung)
     // … und die Richtung bleibt auch bei typisch schräg steckenden Pfeilen eindeutig
     const signOk = exp && exp.variants.every((v) => (ux * v.x + uy * v.y) * Math.sign(dot) > 0.2);
-    const geoStrong = exp && exp.len > 12 && Math.abs(dot) > 0.45 && (signOk || axisFromModel) && (elong >= 2 || axisFromModel);
-    const tipAtMin = geoStrong ? dot > 0 : thinIsMin;
+    const nearlyPerp = exp && exp.len > 12 && Math.abs(dot) > 0.45 && (signOk || axisFromModel) && (elong >= 2 || axisFromModel);
+    // Jeder Pfeil steckt anders schräg. Deshalb für beide Zuordnungen (Spitze am einen oder am
+    // anderen Ende) prüfen, wie schräg ein echter Steeldart (100–175 mm) dafür stecken müsste.
+    // Nur die richtige Zuordnung ergibt eine plausible Neigung – unabhängig von der Neigung selbst.
+    const rawEnd = (atMin) => {
+      const lim = atMin ? tmin + 0.04 * L : tmax - 0.04 * L;
+      let sx = 0, sy = 0, c = 0;
+      for (let k = 0; k < n; k++) if (atMin ? t[k] <= lim : t[k] >= lim) { sx += pixels[k] % w; sy += (pixels[k] / w) | 0; c++; }
+      return { x: sx / c + 0.5, y: sy / c + 0.5 };
+    };
+    let tiltMin = Infinity, tiltMax = Infinity;
+    if (this.cam && (elong >= 2 || axisFromModel)) {
+      const eMin = rawEnd(true), eMax = rawEnd(false);
+      tiltMin = this.cam.impliedTilt(eMin, eMax); // Spitze am min-Ende
+      tiltMax = this.cam.impliedTilt(eMax, eMin); // Spitze am max-Ende
+    }
+    const tBest = Math.min(tiltMin, tiltMax), tOther = Math.max(tiltMin, tiltMax);
+    // Widerspricht die Form deutlich (schmales Ende = Spitze, breites = Flight), muss die Geometrie
+    // eindeutiger sein – das Kameramodell kann z. B. bei fast frontaler Kamera ungenau sein.
+    const geoTipMin = tiltMin < tiltMax;
+    const shapeContradicts = widthRatio < 0.5 && thinIsMin !== geoTipMin;
+    const geoDecided = tBest <= 60 && tOther - tBest >= (shapeContradicts ? 40 : 15);
+    const geoStrong = geoDecided || nearlyPerp;
+    const tipAtMin = geoDecided ? tiltMin < tiltMax : nearlyPerp ? dot > 0 : thinIsMin;
+    const dirConflict = geoDecided && nearlyPerp && (tiltMin < tiltMax) !== (dot > 0);
+    const dartTilt = tipAtMin ? tiltMin : tiltMax;
 
     const endPoint = (atMin, maxGap = 0) => {
       const lim = atMin ? tmin + 0.04 * L : tmax - 0.04 * L;
@@ -624,8 +694,10 @@ export class DartDetector {
       // Richtung aus Geometrie; Form nur als Zusatzkontrolle
       if (elong < 2.5 && !axisFromModel) conf *= 0.85;
       if (axisFromModel) { conf *= spreadOk ? 0.7 : 0.5; reasons.push('Pfeil zeigt fast zur Kamera'); }
-      if (Math.abs(dot) < 0.7) { conf *= 0.85; reasons.push('Pfeil stark schräg'); }
+      if (!geoDecided && Math.abs(dot) < 0.7) { conf *= 0.85; reasons.push('Pfeil stark schräg'); }
       if (thinIsMin !== tipAtMin && widthRatio < 0.6) { conf *= 0.8; reasons.push('Form widerspricht Pfeilrichtung'); }
+      if (dirConflict) { conf *= 0.6; reasons.push('Pfeilrichtung unklar'); }
+      if (!geoDecided && !axisFromModel) conf *= 0.85; // nur über die Senkrecht-Annahme entschieden
     } else {
       if (elong < 2.5) { conf *= 0.55; reasons.push('Form wenig länglich'); }
       else if (elong < 4) conf *= 0.85;
@@ -697,7 +769,7 @@ export class DartDetector {
       conf: Math.max(0, Math.min(1, conf)),
       reasons,
       bbox,
-      axis: { elong, widthRatio, length: L, expLen: exp ? exp.len : 0, occTouch, visRatio, bridged, estimated, endContrast },
+      axis: { elong, widthRatio, length: L, expLen: exp ? exp.len : 0, occTouch, visRatio, bridged, estimated, endContrast, tilt: dartTilt, tiltOther: tOther },
       pixels: pixels.length,
       pixelList: pixels,
     };
