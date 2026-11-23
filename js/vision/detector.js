@@ -6,7 +6,8 @@ import { applyH, invertH } from './homography.js';
 import { scoreAt } from '../core/board.js';
 
 const DEFAULTS = {
-  diffThreshold: 28, // mittlere RGB-Differenz pro Pixel (nach 3x3-Glättung)
+  diffThreshold: 28, // mittlere RGB-Differenz pro Pixel (nach 3x3-Glättung), Obergrenze
+  minDiffThreshold: 15, // Untergrenze bei sehr rauscharmem Bild (Schwelle passt sich dem Rauschen an)
   motionFraction: 0.001, // Anteil veränderter ROI-Pixel, ab dem "Bewegung" gilt
   stableFrames: 5, // so viele ruhige Frames in Folge, bevor ausgewertet wird
   minDartFraction: 0.0005, // minimale Pfeilfläche relativ zur ROI (dunkler Pfeil vor dunklem Grund ist klein)
@@ -176,6 +177,16 @@ export class DartDetector {
   /** Pixel bereits steckender Pfeile (für die Erkennung verdeckter Spitzen) */
   clearOcc() { if (this.occ) this.occ.fill(0); this.lastPixels = null; }
 
+  /** Liegt ein bereits steckender Pfeil in der Nähe (±2 px) dieses Bildpunkts? */
+  isOcc(p) {
+    if (!this.occ) return false;
+    const x0 = Math.round(p.x), y0 = Math.round(p.y);
+    for (let y = y0 - 2; y <= y0 + 2; y++) for (let x = x0 - 2; x <= x0 + 2; x++) {
+      if (x >= 0 && y >= 0 && x < this.w && y < this.h && this.occ[y * this.w + x]) return true;
+    }
+    return false;
+  }
+
   markOcc(list, delta = 1) {
     if (!list || !this.w) return;
     if (!this.occ || this.occ.length !== this.w * this.h) this.occ = new Uint8Array(this.w * this.h);
@@ -336,16 +347,31 @@ export class DartDetector {
   }
 
   buildMask(a, b, off = 0) {
+    this.cur = a; this.refImg = b; this.refOff = off;
     const { diff, mask, roi, w } = this;
     diff.fill(0); mask.fill(0);
     for (let k = 0; k < roi.length; k++) {
       const p = roi[k], i = p * 4, j = (p + off) * 4;
-      const d = (Math.abs(a[i] - b[j]) + Math.abs(a[i + 1] - b[j + 1]) + Math.abs(a[i + 2] - b[j + 2])) / 3;
+      // Differenz: Mittel und stärkster Farbkanal (silber vor Creme unterscheidet sich fast nur im
+      // Blauanteil, schwarz vor dunkelgrün fast nur im Grünanteil – das Mittel würde das verwässern)
+      const er = Math.abs(a[i] - b[j]), eg = Math.abs(a[i + 1] - b[j + 1]), eb = Math.abs(a[i + 2] - b[j + 2]);
+      const d = ((er + eg + eb) / 3 + Math.max(er, eg, eb)) / 2;
       // Schatten: gleichmäßig abgedunkelt bei unveränderter Farbe → gehört nicht zum Pfeil
       if (d > 6 && isShadow(a[i], a[i + 1], a[i + 2], b[j], b[j + 1], b[j + 2])) { diff[p] = 0; continue; }
       diff[p] = d > 255 ? 255 : d;
     }
-    const thr = this.opts.diffThreshold * 9;
+    // Rauschpegel (Median der Differenz – fast alle Pixel sind unverändert): Schwelle daran
+    // anpassen, damit kontrastarme Teile (silber vor Creme, schwarz vor dunklem Grün) sichtbar
+    // bleiben, ohne dass Rauschen als Pfeil zählt
+    const hist = new Uint32Array(256);
+    let hn = 0;
+    for (let k = 0; k < roi.length; k += 7) { hist[diff[roi[k]]]++; hn++; }
+    let med = 0;
+    for (let acc = 0; med < 255; med++) { acc += hist[med]; if (acc >= hn / 2) break; }
+    this.noise = med;
+    const thrMean = Math.min(this.opts.diffThreshold, Math.max(this.opts.minDiffThreshold, 4 * med + 2));
+    this.lowThr = Math.min(18, Math.max(10, 3.5 * med + 2));
+    const thr = thrMean * 9;
     let count = 0;
     for (let k = 0; k < roi.length; k++) {
       const p = roi[k];
@@ -447,20 +473,41 @@ export class DartDetector {
    * Verfolgt die dünne Spitze vom Ende der Pfeilregion weiter nach außen: Die Spitze ist nur
    * 1–3 px breit und fällt nach der Glättung oft unter die Schwelle. (dx, dy) zeigt zur Spitze.
    */
-  extendTip(p, dx, dy) {
+  extendTip(p, dx, dy, maxGap = 0) {
     const { diff, w, h } = this;
-    const low = this.opts.diffThreshold * 0.45;
+    const low = this.lowThr || this.opts.diffThreshold * 0.45;
     const at = (x, y) => {
       const xi = Math.round(x), yi = Math.round(y);
       if (xi < 1 || yi < 1 || xi >= w - 1 || yi >= h - 1) return 0;
       return diff[yi * w + xi];
     };
-    let last = 0, gap = 0;
-    for (let s = 0.5; s <= 24; s += 0.5) {
+    // quer zur Achse ±1 px (die Spitze ist dünn und nicht exakt auf der Achse), weiter weg ±2 px
+    const sample = (s, r) => {
       const x = p.x + dx * s, y = p.y + dy * s;
-      // quer zur Achse ±1 px (die Spitze ist dünn und nicht exakt auf der Achse)
-      const v = Math.max(at(x, y), at(x - dy, y + dx), at(x + dy, y - dx));
-      if (v >= low) { last = s; gap = 0; } else if (++gap > 3) break;
+      let v = 0;
+      for (let o = -r; o <= r; o++) v = Math.max(v, at(x - dy * o, y + dx * o));
+      return v;
+    };
+    let last = 0, gap = 0, s = 0.5;
+    const trace = (from) => {
+      gap = 0;
+      for (s = from; s <= from + 40; s += 0.5) {
+        if (sample(s, 1) >= low) { last = s; gap = 0; } else if (++gap > 2) break;
+      }
+    };
+    trace(0.5);
+    this.bridged = 0;
+    // Unsichtbares Stück überbrücken (z. B. schwarzes Barrel vor schwarzem Feld, silber vor Creme):
+    // weiter entlang der Achse nach einem zusammenhängenden Stück (≥ 3 px) suchen
+    for (let bridges = 0; bridges < 2 && maxGap > 0; bridges++) {
+      let run = 0, found = 0;
+      for (let t = last + 2; t <= last + maxGap; t += 0.5) {
+        if (sample(t, 2) >= low) { if (++run >= 6) { found = t - 2.5; break; } } else run = 0;
+      }
+      if (!found) break;
+      this.bridged += found - last;
+      last = found;
+      trace(found);
     }
     if (!last) return { x: p.x + dx * this.opts.tipExtend, y: p.y + dy * this.opts.tipExtend };
     // Das sichtbare Ende reicht um den Spitzenradius (+ Unschärfe) über den Einstichpunkt hinaus
@@ -472,8 +519,8 @@ export class DartDetector {
       const pxPerMm = Math.max(Math.hypot(qx.x - q0.x, qx.y - q0.y), Math.hypot(qy.x - q0.x, qy.y - q0.y));
       if (Number.isFinite(pxPerMm)) back += this.opts.tipRadiusMm * pxPerMm;
     }
-    const s = last - back;
-    return { x: p.x + dx * s, y: p.y + dy * s };
+    const sEnd = last - back;
+    return { x: p.x + dx * sEnd, y: p.y + dy * sEnd };
   }
 
   locateTip(pixels, bbox, otherBlobs) {
@@ -525,24 +572,49 @@ export class DartDetector {
     const geoStrong = exp && exp.len > 12 && Math.abs(dot) > 0.45 && (signOk || axisFromModel) && (elong >= 2 || axisFromModel);
     const tipAtMin = geoStrong ? dot > 0 : thinIsMin;
 
-    const endPoint = (atMin) => {
+    const endPoint = (atMin, maxGap = 0) => {
       const lim = atMin ? tmin + 0.04 * L : tmax - 0.04 * L;
       let sx = 0, sy = 0, c = 0;
       for (let k = 0; k < n; k++) {
         if (atMin ? t[k] <= lim : t[k] >= lim) { sx += pixels[k] % w; sy += (pixels[k] / w) | 0; c++; }
       }
-      return this.extendTip({ x: sx / c, y: sy / c }, atMin ? -ux : ux, atMin ? -uy : uy);
+      return this.extendTip({ x: sx / c, y: sy / c }, atMin ? -ux : ux, atMin ? -uy : uy, maxGap);
     };
-    const tipPx = endPoint(tipAtMin);
+    // Bei sicherer Richtung darf die Spitzensuche ein unsichtbares Stück (dunkles/silbernes
+    // Barrel vor gleichfarbigem Grund) überbrücken – bis ca. 70 mm Pfeillänge
+    const fullLen = (bx, by) => { const p0 = this.cam.point(bx, by, 0), p1 = this.cam.point(bx, by, 138); return Math.hypot(p1.x - p0.x, p1.y - p0.y); };
     const altPx = endPoint(!tipAtMin);
+    let tipPx = endPoint(tipAtMin);
+    let bridged = 0;
+    let visRatio = 1;
+    const ratioOf = (p) => { const bb = applyH(this.Hinv, p.x + 0.5, p.y + 0.5); return Number.isFinite(bb.x) ? Math.hypot(p.x - altPx.x, p.y - altPx.y) / fullLen(bb.x, bb.y) : 1; };
+    if (geoStrong) {
+      visRatio = ratioOf(tipPx);
+      // sichtbarer Pfeil zu kurz → vorne fehlt evtl. ein kontrastloses Stück: überbrücken,
+      // aber nicht länger als ein ganzer Pfeil und nicht auf einen anderen Pfeil
+      // (gedrungene Form bei seitlicher Kamera = vorderer Teil fehlt sehr wahrscheinlich)
+      if (visRatio < 0.95 || (axisFromModel && exp.len > 30)) {
+        // höchstens eine Barrel-Länge (ca. 50 mm) überbrücken
+        const cand = endPoint(tipAtMin, 0.6 * exp.len);
+        const r2 = ratioOf(cand);
+        if (this.bridged > 0 && r2 <= 1.1 && !this.isOcc(cand)) { tipPx = cand; bridged = this.bridged; visRatio = r2; }
+      }
+    }
     const toBoard = (p) => applyH(this.Hinv, p.x + 0.5, p.y + 0.5);
     let tipB = toBoard(tipPx), altB = toBoard(altPx);
     let usedAlt = false;
     const rTip = Math.hypot(tipB.x, tipB.y), rAlt = Math.hypot(altB.x, altB.y);
     // Spitze muss auf der Scheibe liegen; wenn nur das andere Ende plausibel ist, dieses nehmen
     if (!geoStrong && rTip > 200 && rAlt <= 175 && widthRatio > 0.5) { usedAlt = true; }
-    const tip = usedAlt ? altPx : tipPx;
-    const b = usedAlt ? altB : tipB;
+    let tip = usedAlt ? altPx : tipPx;
+    let b = usedAlt ? altB : tipB;
+
+    // Ein ganzer Steeldart (ca. 140 mm) hat an dieser Stelle eine ungefähr bekannte Bildlänge
+    // (±25 % je nach Neigung). Deutlich kürzer → vorderes Stück nicht sichtbar → Rückfrage.
+    const estimated = false;
+    // gedrungene Form, obwohl ein ganzer Pfeil hier lang erscheinen müsste → nur ein Teil sichtbar
+    const stubby = axisFromModel && !bridged && exp.len > 30;
+    const partial = geoStrong && !usedAlt && (visRatio < 0.7 || stubby);
     const hit = scoreAt(b.x, b.y);
 
     // Konfidenz aus nachvollziehbaren Faktoren
@@ -561,6 +633,9 @@ export class DartDetector {
       else if (widthRatio > 0.6) { conf *= 0.75; reasons.push('Spitzenrichtung unsicher'); }
     }
     if (usedAlt) { conf *= 0.6; reasons.push('Spitze am breiteren Ende angenommen'); }
+    if (estimated) { conf *= 0.3; reasons.push('Spitze kaum sichtbar – Lage über Pfeillänge geschätzt'); }
+    else if (partial) { conf *= 0.5; reasons.push('Pfeil nur teilweise sichtbar'); }
+    else if (bridged > 2) { conf *= 0.85; reasons.push('Spitze über kontrastarmes Stück verfolgt'); }
     if (hit.r <= 175) {
       // Toleranz je nach Messsicherheit: mit eindeutiger Pfeilrichtung ist die Spitze auf
       // Bruchteile von Millimetern genau, sonst deutlich ungenauer
@@ -571,6 +646,30 @@ export class DartDetector {
     const overlap = this.regions.some((r) => !(bbox.maxX < r.minX || bbox.minX > r.maxX || bbox.maxY < r.minY || bbox.minY > r.maxY));
     if (overlap) { conf *= 0.75; reasons.push('überlagert einen vorhandenen Pfeil'); }
     if (otherBlobs > 2) { conf *= 0.8; reasons.push('weitere Bildveränderungen'); }
+    // Kontrast am Spitzenende: Ist das Pfeilende (z. B. schwarze Spitze/Barrel) farblich kaum vom
+    // Untergrund direkt dahinter zu unterscheiden (schwarz vor schwarzem Feld, silber vor Creme),
+    // kann die Spitze unsichtbar weitergehen → Rückfrage statt Raten.
+    let endContrast = 255;
+    if (this.cur && this.refImg && !usedAlt) {
+      const atMinEnd = tipAtMin;
+      const tdx = atMinEnd ? -ux : ux, tdy = atMinEnd ? -uy : uy;
+      const avg = (data, off, s0, s1, r) => {
+        const c = [0, 0, 0]; let k = 0;
+        for (let s = s0; s <= s1; s += 1) for (let o = -r; o <= r; o++) {
+          const x = Math.round(tip.x + tdx * s - tdy * o), y = Math.round(tip.y + tdy * s + tdx * o);
+          if (x < 0 || y < 0 || x >= this.w || y >= this.h) continue;
+          const i = (y * this.w + x + off) * 4;
+          c[0] += data[i]; c[1] += data[i + 1]; c[2] += data[i + 2]; k++;
+        }
+        return k ? c.map((v) => v / k) : null;
+      };
+      const end = avg(this.cur, 0, -6, -2, 0), beyond = avg(this.refImg, this.refOff || 0, 2, 8, 1);
+      if (end && beyond) {
+        const e = end.map((v, i) => Math.abs(v - beyond[i]));
+        endContrast = ((e[0] + e[1] + e[2]) / 3 + Math.max(...e)) / 2;
+      }
+    }
+    if (geoStrong && endContrast < 28) { conf *= 0.5; reasons.push('Spitze kaum vom Untergrund zu unterscheiden'); }
     // Spitze hinter einem bereits steckenden Pfeil? Dann ist der sichtbare Teil deutlich kürzer
     // als ein ganzer Pfeil und endet direkt an dessen Pixeln → Spitze liegt weiter vorne, unsicher.
     let occTouch = false;
@@ -598,7 +697,7 @@ export class DartDetector {
       conf: Math.max(0, Math.min(1, conf)),
       reasons,
       bbox,
-      axis: { elong, widthRatio, length: L, expLen: exp ? exp.len : 0, occTouch },
+      axis: { elong, widthRatio, length: L, expLen: exp ? exp.len : 0, occTouch, visRatio, bridged, estimated, endContrast },
       pixels: pixels.length,
       pixelList: pixels,
     };

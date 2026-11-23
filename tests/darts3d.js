@@ -43,6 +43,20 @@ export function randomDart(rng, x, y, style = {}) {
   const dir = norm([(rng() - 0.5) * 0.5, -0.1 + rng() * 0.55, 1]);
   const spin = rng() * Math.PI;
   const palette = [[230, 200, 40], [40, 60, 160], [200, 40, 40], [25, 25, 28], [235, 235, 235], [40, 160, 70]];
+  const BLACK = [26, 26, 28], SILVER = [165, 168, 175], TIP_SILVER = [178, 180, 186];
+  if (style.preset) {
+    // typische Steeldarts: Spitze und Barrel schwarz oder silber; Schaft/Flight farbig oder gleichfarbig
+    const metal = style.preset === 'black' ? BLACK : style.preset === 'silver' ? SILVER : (rng() < 0.5 ? BLACK : SILVER);
+    const same = style.preset === 'mixed' ? rng() < 0.5 : true;
+    const col = palette[Math.floor(rng() * palette.length)];
+    return {
+      x, y, dir, spin,
+      tip: metal === BLACK && rng() < 0.5 ? BLACK : TIP_SILVER,
+      barrel: metal,
+      shaft: same ? metal : col,
+      flight: same ? (metal === SILVER ? [200, 202, 208] : BLACK) : col,
+    };
+  }
   return {
     x, y, dir, spin,
     flight: style.flight || palette[Math.floor(rng() * palette.length)],
@@ -96,7 +110,7 @@ export function drawDarts(base, cam, darts, { shadow = null, shadowStrength = 0.
   };
   const cyl = [
     // [t0, t1, Radius mm, Farbe]
-    (dt) => [0, 20, 1.15, [178, 180, 186]], // Spitze (sichtbarer Teil)
+    (dt) => [0, 20, 1.15, dt.tip || [178, 180, 186]], // Spitze (sichtbarer Teil)
     (dt) => [20, 68, 3.4, dt.barrel], // Barrel
     (dt) => [68, 104, 2.6, dt.shaft], // Schaft
   ];

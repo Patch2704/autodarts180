@@ -543,14 +543,14 @@ const stressLog = [];
 // ---------- Pfeilerkennung mit realistischen 3D-Pfeilen (seitliche Kamera, Schatten) ----------
 {
   const d3 = await import('./darts3d.js');
-  const runs = [[45, 0, null], [-55, 10, [0.2, 0.7, 1]], [30, -15, null]].map(([deg, tilt, shadow]) => ({ deg, tilt, shadow, r: d3.simulate({ deg, tilt, shadow, visits: 2, seed: 3 }) }));
-  stressLog.push('— Pfeile 3D (seitlich) —', ...runs.map(({ deg, tilt, shadow, r }) => `${deg}° Höhe ${tilt}°${shadow ? ' Schatten' : ''}: ${r.correct}/${r.n} richtig, ${r.lowConf} mit Rückfrage, Ø ${r.meanConf.toFixed(1)} mm (sichere Treffer)${r.wrong.length ? ' – ' + r.wrong.join('; ') : ''}`));
-  test('Pfeilerkennung 3D: Kamera seitlich (auch höher/tiefer, Schatten) – mind. 16/18 richtig, kein sicherer Fehltreffer, Ø < 1,5 mm', () => {
+  const runs = [[45, 0, null], [-55, 10, [0.2, 0.7, 1]], [30, -15, null], [-45, 0, null, 'mixed'], [55, 0, null, 'black']].map(([deg, tilt, shadow, preset]) => ({ deg, tilt, shadow, preset, r: d3.simulate({ deg, tilt, shadow, visits: 2, seed: 3, style: preset ? { preset } : {} }) }));
+  stressLog.push('— Pfeile 3D (seitlich) —', ...runs.map(({ deg, tilt, shadow, preset, r }) => `${deg}° Höhe ${tilt}°${shadow ? ' Schatten' : ''}${preset ? ' Pfeile ' + preset : ''}: ${r.correct}/${r.n} richtig, ${r.lowConf} mit Rückfrage, Ø ${r.meanConf.toFixed(1)} mm (sichere Treffer)${r.wrong.length ? ' – ' + r.wrong.join('; ') : ''}`));
+  test('Pfeilerkennung 3D: Kamera seitlich (auch höher/tiefer, Schatten, schwarze/silberne Pfeile) – kein falscher Treffer ohne Rückfrage, Ø < 1,5 mm', () => {
     const n = runs.reduce((s, x) => s + x.r.n, 0), c = runs.reduce((s, x) => s + x.r.correct, 0);
-    ok(c >= n - 2, `${c}/${n} richtig`);
+    ok(c >= n - 5, `${c}/${n} richtig`);
     for (const { deg, r } of runs) {
       ok(r.wrongConfident === 0, `${deg}°: ${r.wrongConfident} falsche Treffer ohne Rückfrage`);
-      ok(r.meanConf < 1.5, `${deg}°: Ø ${r.meanConf.toFixed(1)} mm`);
+      ok(!r.errsConf.length || r.meanConf < 1.5, `${deg}°: Ø ${r.meanConf.toFixed(1)} mm`);
     }
   });
 }

@@ -30,14 +30,14 @@
     const img = D.drawDarts(base, cam, darts, { shadow: [0.2, 0.7, 1] });
     show(D.grabCrop(img, cal.boardCrop(cam.H)));
   }
-  const conds = q.get('quick') ? [[0, 0], [45, 0], [-55, 10]] : [[0, 0], [30, 0], [-30, 0], [45, 0], [-45, 0], [55, 0], [-55, 0], [45, 15], [-45, -15], [30, 20]];
+  const conds = q.get('side') ? [[30, 0], [-30, 0], [45, 0], [-45, 0], [55, 0], [-55, 0], [45, 15], [-45, -15]] : q.get('quick') ? [[0, 0], [45, 0], [-55, 10]] : [[0, 0], [30, 0], [-30, 0], [45, 0], [-45, 0], [55, 0], [-55, 0], [45, 15], [-45, -15], [30, 20]];
   const shadows = q.get('noshadow') ? [null] : [null, [0.2, 0.7, 1]];
   let tot = 0, totC = 0, totM = 0, totW = 0;
   const t0 = performance.now();
   for (const [deg, tilt] of conds) for (const sh of shadows) {
     // kurz abgeben (MessageChannel wird auch in Hintergrund-Tabs nicht gedrosselt)
     await new Promise((res) => { const c = new MessageChannel(); c.port1.onmessage = res; c.port2.postMessage(0); });
-    const r = D.simulate({ deg, tilt, shadow: sh, visits: Number(q.get('visits') ?? 4), seed: Number(q.get('seed') ?? 1) });
+    const r = D.simulate({ deg, tilt, shadow: sh, visits: Number(q.get('visits') ?? 4), seed: Number(q.get('seed') ?? 1), style: q.get('preset') ? { preset: q.get('preset') } : {} });
     tot += r.n; totC += r.correct; totM += r.missed; totW += r.wrongConfident;
     lines.push(`${deg}° Höhe ${tilt}°${sh ? ' Schatten' : ''}: ${r.correct}/${r.n} richtig, verpasst ${r.missed}, mit Rückfrage ${r.lowConf}, falsch ohne Rückfrage ${r.wrongConfident}, Fehler Ø ${r.mean.toFixed(1)} mm, 90% ${r.p90.toFixed(1)}, max ${r.max.toFixed(1)}, Versatz Spitze entlang ${r.biasAlong.toFixed(1)} px / quer ${r.biasPerp.toFixed(1)} px`);
     for (const w of r.wrong) lines.push('    ' + w);
