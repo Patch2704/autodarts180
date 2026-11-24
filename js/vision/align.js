@@ -1,5 +1,5 @@
-// Feinausrichtung zweier Bilder derselben Szene (Stativ wackelt, Scheibe verrutscht minimal):
-// Verschiebung, Drehung und Maßstab auf Bruchteile eines Pixels, dazu ein Helligkeitsabgleich.
+// Feinausrichtung zweier Bilder derselben Scheibe (Stativ wackelt, Scheibe verrutscht minimal): zuerst
+// Verschiebung, Drehung und Maßstab, dann Scherung und Perspektive, auf Bruchteile eines Pixels genau, dazu ein Helligkeitsabgleich.
 // Pfeile, Hände usw. zählen als Ausreißer und beeinflussen das Ergebnis kaum.
 
 const lumCache = new WeakMap();
@@ -20,7 +20,10 @@ export const IDENTITY = { a: 0, b: 0, tx: 0, ty: 0, cx: 0, cy: 0 };
 /** Bildpunkt (x, y) des aktuellen Bilds → Bildpunkt in der Referenz */
 export function applyT(T, x, y) {
   const X = x - T.cx, Y = y - T.cy;
-  return { x: x + T.a * X - T.b * Y + T.tx, y: y + T.b * X + T.a * Y + T.ty };
+  const q = T.g ? T.g[0] * X + T.g[1] * Y : 0;
+  return T.s
+    ? { x: x + T.a * X - T.b * Y + T.s[0] * X + T.s[1] * Y + X * q + T.tx, y: y + T.b * X + T.a * Y + T.s[1] * X - T.s[0] * Y + Y * q + T.ty }
+    : { x: x + T.a * X - T.b * Y + T.tx, y: y + T.b * X + T.a * Y + T.ty };
 }
 
 /** Größte Verschiebung (px), die T innerhalb eines Radius r um die Mitte bewirkt */
@@ -81,23 +84,56 @@ export function estimateTransform(cur, ref, w, h, idx, init = null, maxSamples =
     if (sr > 0) gain = Math.min(1.5, Math.max(0.65, sc / sr));
     if (Math.abs(d[2]) + Math.abs(d[3]) + (Math.abs(d[0]) + Math.abs(d[1])) * cx < 0.01) break;
   }
-  return { ...T, gain, ok: Math.hypot(T.tx, T.ty) < 14 && Math.hypot(T.a, T.b) < 0.03 };
+  const ok = Math.hypot(T.tx, T.ty) < 14 && Math.hypot(T.a, T.b) < 0.03;
+  if (ok) {
+    // Feinstufe mit 8 Parametern: eine leicht gedrehte oder gekippte Kamera verändert auch Scherung und
+    // Perspektive. Parameter: a, b, s0, s1 (Scherung), g0, g1 (Perspektive), tx, ty; auf Bildgröße normiert.
+    const R = Math.max(w, h) / 2, F = { ...T, s: [0, 0], g: [0, 0] };
+    let fine = true;
+    for (let it = 0; it < 4; it++) {
+      const N = Array.from({ length: 8 }, () => new Float64Array(9)), J = new Float64Array(8);
+      let used = 0;
+      for (let k = 0; k < pts.length; k += keep) {
+        const p = pts[k], x = p % w, y = (p / w) | 0, X = x - cx, Y = y - cy, t = applyT(F, x, y);
+        if (t.x < 3 || t.y < 3 || t.x >= w - 4 || t.y >= h - 4) continue;
+        const e = lc[p] / gain - bil(lr, t.x, t.y);
+        const gx = (bil(lr, t.x + 1, t.y) - bil(lr, t.x - 1, t.y)) / 2, gy = (bil(lr, t.x, t.y + 1) - bil(lr, t.x, t.y - 1)) / 2;
+        const wt = 1 / (1 + (e / 18) * (e / 18)), w2 = wt * wt, u = X / R, v = Y / R, d = gx * u + gy * v;
+        J[0] = d; J[1] = -gx * v + gy * u; J[2] = gx * u - gy * v; J[3] = gx * v + gy * u; J[4] = d * u; J[5] = d * v; J[6] = gx; J[7] = gy;
+        for (let r = 0; r < 8; r++) { const q = w2 * J[r], row = N[r]; for (let c = r; c < 8; c++) row[c] += q * J[c]; row[8] += q * e; }
+        used++;
+      }
+      if (used < 400) { fine = false; break; }
+      for (let r = 0; r < 8; r++) { for (let c = 0; c < r; c++) N[r][c] = N[c][r]; N[r][r] *= 1.0005; }
+      const D = solveN(N, 8);
+      if (!D) { fine = false; break; }
+      F.a += D[0] / R; F.b += D[1] / R; F.s[0] += D[2] / R; F.s[1] += D[3] / R; F.g[0] += D[4] / (R * R); F.g[1] += D[5] / (R * R); F.tx += D[6]; F.ty += D[7];
+      if (Math.max(...D.map(Math.abs)) < 0.01) break;
+    }
+    // nur übernehmen, wenn die Zusatzanteile klein bleiben (sonst hat sich die Schätzung verrannt)
+    if (fine && Math.hypot(...F.s) < 0.012 && Math.hypot(...F.g) * R < 0.012 && Math.hypot(F.tx - T.tx, F.ty - T.ty) < 3) Object.assign(T, F);
+  }
+  return { ...T, gain, ok };
 }
 
 function solve4(N, v) {
-  const M = [0, 1, 2, 3].map((r) => [N[r * 4], N[r * 4 + 1], N[r * 4 + 2], N[r * 4 + 3], v[r]]);
-  for (let c = 0; c < 4; c++) {
+  return solveN([0, 1, 2, 3].map((r) => [N[r * 4], N[r * 4 + 1], N[r * 4 + 2], N[r * 4 + 3], v[r]]), 4);
+}
+
+/** Lineares Gleichungssystem n×(n+1) (wird verändert) */
+function solveN(M, n) {
+  for (let c = 0; c < n; c++) {
     let p = c;
-    for (let r = c + 1; r < 4; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
     if (Math.abs(M[p][c]) < 1e-9) return null;
     [M[c], M[p]] = [M[p], M[c]];
-    for (let r = 0; r < 4; r++) {
+    for (let r = 0; r < n; r++) {
       if (r === c) continue;
       const f = M[r][c] / M[c][c];
-      for (let k = c; k < 5; k++) M[r][k] -= f * M[c][k];
+      for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
     }
   }
-  return [0, 1, 2, 3].map((r) => M[r][4] / M[r][r]);
+  return Array.from({ length: n }, (_, r) => M[r][n] / M[r][r]);
 }
 
 /** Referenz auf das aktuelle Bild ausgerichtet (inkl. Helligkeit): Ergebnis(p) = ref(T(p)) · gain je Kanal */
@@ -112,8 +148,10 @@ export function warpRef(cur, ref, T, w, h, idx) {
     // entlang der Zeile ändert sich die Quellposition gleichmäßig
     let sx = -T.a * T.cx - T.b * Y + T.tx, sy = y - T.b * T.cx + T.a * Y + T.ty;
     const ax = 1 + T.a, bx = T.b;
+    const s0 = T.s ? T.s[0] : 0, s1 = T.s ? T.s[1] : 0, g0p = T.g ? T.g[0] : 0, g1p = T.g ? T.g[1] : 0;
     for (let x = 0; x < w; x++, i += 4, sx += ax, sy += bx) {
-      const rx = sx < 0 ? 0 : sx > mx ? mx : sx, ry = sy < 0 ? 0 : sy > my ? my : sy;
+      const X = x - T.cx, q0 = g0p * X + g1p * Y, px = sx + s0 * X + s1 * Y + X * q0, py = sy + s1 * X - s0 * Y + Y * q0;
+      const rx = px < 0 ? 0 : px > mx ? mx : px, ry = py < 0 ? 0 : py > my ? my : py;
       const x0 = rx | 0, y0 = ry | 0, fx = rx - x0, fy = ry - y0;
       const q = (y0 * w + x0) * 4, q2 = q + s;
       const w11 = fx * fy, w10 = fx - w11, w01 = fy - w11, w00 = 1 - fx - w01;

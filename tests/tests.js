@@ -578,6 +578,42 @@ const stressLog = [];
   test('Pfeilerkennung: unscharfes Startbild erzeugt kein Phantom, alle Entnahmen werden erkannt', () => {
     for (const { deg, r } of runs) { eq(r.phantom, 0, `${deg}° Phantom`); eq(r.noTakeout || 0, 0, `${deg}° Entnahme fehlt`); ok(r.missed <= 1, `${deg}° verpasst ${r.missed}`); }
   });
+  // Spielablauf: Warten auf das Herausziehen darf nie hängen bleiben
+  const flow = () => {
+    const w = 540, h = 960, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), base = d3.realScene(cam, w, h), det = new DartDetector();
+    let seed = 1;
+    const frame = (darts, hand) => { const img = d3.addNoiseFast(darts.length ? d3.drawDarts(base, cam, darts) : base, 4, seed++); if (hand) for (let y = 400; y < 760; y++) for (let x = 120; x < 330; x++) { const i = (y * w + x) * 4; img.data[i] = 200; img.data[i + 1] = 150; img.data[i + 2] = 120; } return img; };
+    det.setCalibration(cam.H, w, h);
+    const run = (darts, n = 10) => { const ev = []; for (let k = 0; k < n; k++) ev.push(...det.process(frame(darts))); return ev.map((e) => e.type); };
+    const hand = () => { for (let k = 0; k < 3; k++) det.process(frame([], k % 2 === 0)); };
+    const rng = (() => { let s = 7; return () => (s = (s * 16807) % 2147483647) / 2147483647; })();
+    const dart = (x, y) => d3.randomDart(rng, x, y, { preset: 'user', up: 20 });
+    run([]);
+    return { det, run, hand, dart };
+  };
+  test('Spielablauf: spät bestätigter dritter Pfeil (Scheibe schon leer) blockiert die nächste Aufnahme nicht', () => {
+    const { det, run, dart } = flow();
+    det.awaitTakeout();
+    ok(run([]).includes('takeout'), 'leere Scheibe nicht als Entnahme erkannt'); eq(det.awaitingTakeout, false);
+    ok(run([dart(30, 60)]).includes('dart'), 'nächster Pfeil nicht erkannt');
+  });
+  test('Spielablauf: sich überdeckende Pfeile werden nach dem Ziehen als entfernt erkannt', () => {
+    const { det, run, hand, dart } = flow(), a = dart(40, 40), b = dart(46, 44), c = dart(36, 48);
+    run([a]); run([a, b]); run([a, b, c]); ok(det.dartsOnBoard >= 2, `nur ${det.dartsOnBoard} erkannt`);
+    det.awaitTakeout(); ok(!run([a, b, c], 30).includes('takeout'), 'Entnahme gemeldet, obwohl Pfeile stecken');
+    hand(); ok(run([]).includes('takeout'), 'Entnahme nicht erkannt'); eq(det.dartsOnBoard, 0);
+  });
+  test('Spielablauf: verworfener Pfeil („Kein Pfeil“) erzeugt beim Ziehen keinen neuen Treffer', () => {
+    const { det, run, hand, dart } = flow(), a = dart(-50, 30);
+    run([a]); det.forget(null); eq(det.dartsOnBoard, 0);
+    hand(); ok(!run([]).includes('dart'), 'Herausziehen als Treffer gemeldet');
+    ok(run([dart(60, -40)]).includes('dart'), 'nächster Pfeil nicht erkannt');
+  });
+  test('Spielablauf: Rückgängig hebt das Warten auf das Herausziehen auf', () => {
+    const { det, run, dart } = flow(), a = dart(20, 90);
+    run([a]); det.awaitTakeout(); det.cancelWait(); eq(det.awaitingTakeout, false);
+    ok(run([a, dart(-60, -30)]).includes('dart'), 'Pfeil nach Rückgängig nicht erkannt');
+  });
   test('Pfeilerkennung: „Kein Pfeil“ vergisst die Meldung vollständig', () => {
     const det = new DartDetector();
     const { img, H } = scene.renderScene({ w: 320, h: 400, pts: cal.pointsFromH(stress.sideViewH(20, 320, 400)), light: 0.9, noise: 0, seed: 5 });

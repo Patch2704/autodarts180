@@ -16,6 +16,7 @@ const DEFAULTS = {
   maxDartFraction: 0.07, // größer = Hand/Person/Lichtwechsel
   edgeTolerance: 0.3, // so weit (px) dürfen Kanten gegenüber der ausgerichteten Referenz verrutschen
   minUnexplained: 0.1, // so viel einer Veränderung darf kein Kantenrest (minimal verschobene/anders scharfe Kante) sein
+  minUnexplainedOut: 0.5, // dasselbe neben der Scheibe
   tipExtend: 1.0, // Korrektur der Spitzenposition, falls die Spitze nicht weiter verfolgt werden kann (px)
   tipRadiusMm: 1.0, // halbe Dicke der Stahlspitze: so weit reicht ihr sichtbares Ende über den Einstich hinaus
   tipBlurPx: 0.4, // Unschärfe/Glättung am Spitzenende (px)
@@ -308,6 +309,10 @@ export class DartDetector {
       if ((Number.isFinite(b.x) && b.x * b.x + b.y * b.y <= 300 * 300) || inConvex(hull, x, y)) roi.push(y * w + x);
     }
     this.roi = Int32Array.from(roi);
+    // Ausrichtung nur an der Scheibenebene (LED-Arme, Wand und Pfeile liegen in anderer Entfernung)
+    this.planeIdx = Int32Array.from(roi.filter((p) => { const b = applyH(this.Hinv, p % w, (p / w) | 0); return Number.isFinite(b.x) && b.x * b.x + b.y * b.y <= 224 * 224; }));
+    this.inside = new Uint8Array(w * h);
+    for (const p of roi) { const b = applyH(this.Hinv, p % w, (p / w) | 0); if (Number.isFinite(b.x) && b.x * b.x + b.y * b.y <= 222 * 222) this.inside[p] = 1; }
     // Bewegungskontrolle nur auf der Scheibe selbst (Personen, Monitore daneben stören nicht)
     this.boardIdx = Int32Array.from(roi.filter((p, k) => { if (k % 3) return false; const b = applyH(this.Hinv, p % w, (p / w) | 0); return Number.isFinite(b.x) && b.x * b.x + b.y * b.y <= 230 * 230; }));
     { const q0 = applyH(this.Hpx, 0, 0), qx = applyH(this.Hpx, 10, 0), qy = applyH(this.Hpx, 0, 10); this.pxPerMm = Math.max(Math.hypot(qx.x - q0.x, qx.y - q0.y), Math.hypot(qy.x - q0.x, qy.y - q0.y)) / 10; }
@@ -321,6 +326,7 @@ export class DartDetector {
     this.ref = null; this.emptyRef = null; this.prev = null;
     this.stable = 0; this.hadMotion = false;
     this.dartsOnBoard = 0; this.awaitingTakeout = false;
+    this.checkNow = false; this.bigMotion = false; this.round = this.round || 0; // round zählt die Entnahmen (läuft weiter)
     this.regions = []; this.largeChangeCount = 0; this.clearOcc();
     this.lastRefBefore = null;
     this.status = 'init';
@@ -338,8 +344,8 @@ export class DartDetector {
       for (const l of [this.segs, this.dartPx, this.dartMem, this.regions]) l.splice(k, 1);
     }
     this.dartsOnBoard = Math.max(0, this.dartsOnBoard - 1);
-    // war es der einzige, ist die Scheibe leer: aktuelles Bild wird neue Leer-Referenz
-    if (!this.dartsOnBoard && this.ref) { this.setEmpty(this.ref); this.clearOcc(); }
+    // Das Leerbild bleibt: Es kann ein echter Pfeil sein, den der Nutzer lieber von Hand einträgt
+    if (!this.dartsOnBoard) this.clearOcc();
   }
 
   /** Liegt ein bereits steckender Pfeil in der Nähe (±2 px) dieses Bildpunkts? */
@@ -365,6 +371,7 @@ export class DartDetector {
     const raw = img.data.slice(), c = softImage(raw, this.w, this.h);
     this.setEmpty(c);
     this.ref = c; this.refRaw = raw; this.prev = raw;
+    this.round = (this.round || 0) + 1; this.bigMotion = false;
     this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.stable = 0; this.clearOcc();
     this.lastRefBefore = null;
     this.status = 'bereit';
@@ -373,7 +380,7 @@ export class DartDetector {
   /** Neues Bild der leeren Scheibe. Merkt sich, wie weit es gegenüber der Kalibrierung verrutscht ist. */
   setEmpty(c) {
     if (!this.calibRef) { this.calibRef = c; this.T0 = { ...IDENTITY, cx: this.w / 2, cy: this.h / 2 }; } else {
-      const T = estimateTransform(c, this.calibRef, this.w, this.h, this.roi, this.T0);
+      const T = estimateTransform(c, this.calibRef, this.w, this.h, this.planeIdx, this.T0);
       if (T.ok) this.T0 = T;
     }
     this.emptyRef = c;
@@ -382,12 +389,19 @@ export class DartDetector {
   /** Referenz passend zum aktuellen Bild ausrichten: { img, T } */
   alignTo(data, ref) {
     const s = this.estimateShift(data, ref);
-    const T = estimateTransform(data, ref, this.w, this.h, this.roi, { tx: s.dx, ty: s.dy });
+    const T = estimateTransform(data, ref, this.w, this.h, this.planeIdx, { tx: s.dx, ty: s.dy });
     if (!T.ok) return { img: ref, T: { ...IDENTITY, cx: this.w / 2, cy: this.h / 2 }, ok: false };
     return { img: warpRef(data, ref, T, this.w, this.h, this.roi), T, ok: true };
   }
 
-  awaitTakeout() { this.awaitingTakeout = true; this.status = 'warte auf Entfernen'; }
+  /** Aufnahme fertig: Pfeile müssen heraus. Ist die Scheibe schon leer, erledigt sich das bei der nächsten Auswertung. */
+  awaitTakeout() { this.awaitingTakeout = true; this.status = 'warte auf Entfernen'; this.checkNow = true; this.bigMotion = false; }
+
+  /** Aufnahme wieder offen (Rückgängig usw.): nicht länger auf das Entfernen warten */
+  cancelWait() {
+    if (!this.awaitingTakeout) return;
+    this.awaitingTakeout = false; this.status = 'bereit'; this.checkNow = true;
+  }
 
   /** Verarbeitet ein Frame (ImageData in Verarbeitungsauflösung). Liefert Ereignisse. */
   process(img) {
@@ -402,6 +416,7 @@ export class DartDetector {
       if (s) motion = this.motionFraction(data, this.prev, s.dy * this.w + s.dx);
     }
     this.prev = data.slice();
+    if (motion > 0.02) this.bigMotion = true; // Hand oder Person vor der Scheibe
     if (motion > this.opts.motionFraction) {
       this.stable = 0; this.hadMotion = true;
       if (this.status !== 'warte auf Entfernen') this.status = 'Bewegung';
@@ -410,11 +425,13 @@ export class DartDetector {
     this.stable++;
     if (this.stable < this.opts.stableFrames) return [];
     // nach Bewegung sofort auswerten, sonst periodisch (falls ein Pfeil ohne messbare Bewegung landete)
-    if (!this.hadMotion) {
+    if (!this.hadMotion && !this.checkNow) {
       if (this.stable % 12 !== 0) return [];
+      // beim Warten auf das Entfernen auch ohne neue Bewegung nachsehen (alle paar Sekunden)
+      if (this.awaitingTakeout && this.stable % 24 === 0) this.lastEval = null;
       if (this.lastEval && this.motionFraction(data, this.lastEval) < 0.0003) return []; // nichts Neues
     }
-    this.hadMotion = false;
+    this.hadMotion = false; this.checkNow = false;
     this.lastEval = data.slice();
     return this.evaluate(data);
   }
@@ -500,6 +517,15 @@ export class DartDetector {
     return { dx: bdx, dy: bdy };
   }
 
+  /** Sieht das Bild wie die leere Scheibe aus? (für „Referenz neu“) */
+  seemsEmpty(img) {
+    if (!this.emptyRef || !img || img.width !== this.w || img.height !== this.h) return true;
+    const data = softImage(img.data.slice(), this.w, this.h), E = this.alignTo(data, this.emptyRef);
+    const M = this.matchSharpness(data, E.img);
+    this.buildMask(M.a, M.b);
+    return this.looksEmpty();
+  }
+
   /** Scheibe leer und frei (keine Pfeile, niemand davor)? Für Kamerakontrolle und Nachführung. */
   isClear(img) {
     if (!this.emptyRef || this.dartsOnBoard > 0 || this.awaitingTakeout || this.status !== 'bereit') return false;
@@ -516,8 +542,7 @@ export class DartDetector {
   looksEmpty() {
     const minPx = this.opts.minDartFraction * this.roi.length;
     const comps = this.components();
-    const big = comps.length ? comps[0].px.length : 0;
-    return big < 0.45 * minPx;
+    return !comps.length || comps[0].px.length < 0.45 * minPx;
   }
 
   /** Lage des aktuellen Bilds gegenüber der Kalibrierung (für die Umrechnung auf die Scheibe) */
@@ -544,22 +569,31 @@ export class DartDetector {
     if (this.dartsOnBoard > 0 || this.awaitingTakeout) {
       // Sehen die Stellen aller bekannten Pfeile wieder aus wie vor ihrem Treffer? (unabhängig davon, ob sich
       // Schärfe oder Licht seit dem Bild der leeren Scheibe geändert haben)
-      const gone = this.allGone(data, E.T);
+      const gone = this.allGone(data, E);
       const maybe = gone || this.vanished(data, E.img);
       if (maybe) { const m = this.matchSharpness(data, E.img); this.buildMask(m.a, m.b, null); }
       const empty = maybe && this.looksEmpty();
-      if (empty || gone) {
-        if (empty) { this.setEmpty(data); this.ref = data; this.refRaw = raw; } else this.ref = this.emptyRef;
+      // keine bekannten Pfeile (von Hand eingetragen) und es war jemand an der Scheibe: als Entnahme werten
+      const manual = this.awaitingTakeout && !this.dartMem.length && this.bigMotion;
+      if (empty || gone || manual) {
+        if (empty || manual) { this.setEmpty(data); this.ref = data; this.refRaw = raw; } else this.ref = this.emptyRef;
         this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.clearOcc();
         this.lastRefBefore = null;
         this.status = 'bereit';
-        events.push({ type: 'takeout' });
-        if (empty) return events;
+        this.round++; this.bigMotion = false;
+        events.push({ type: 'takeout', round: this.round });
+        if (empty || manual) return events;
         healed = true;
       }
     }
     if (this.awaitingTakeout) { this.status = 'warte auf Entfernen'; return [{ type: 'waiting-takeout' }]; }
 
+    // Ein nicht erkannter Pfeil (von Hand eingetragen) ist wieder weg: Das ist kein neuer Pfeil
+    if (!this.dartsOnBoard && !events.length && this.ref !== this.emptyRef) {
+      const m = this.matchSharpness(data, E.img);
+      this.buildMask(m.a, m.b, null);
+      if (this.looksEmpty()) { this.setEmpty(data); this.ref = data; this.refRaw = raw; this.status = 'bereit'; return events; }
+    }
     // Referenz auf Bruchteile eines Pixels ausrichten (Stativ wackelt, Scheibe verrutscht minimal)
     const A = this.ref === this.emptyRef ? E : this.alignTo(data, this.ref);
     this.setFrameTransform(data, E);
@@ -572,8 +606,9 @@ export class DartDetector {
     if (frac < this.opts.minDartFraction || this.looksEmpty()) {
       this.status = 'bereit';
       // minimale Drift (Licht, leichtes Verrutschen) in die Referenz übernehmen
+      const wasEmptyRef = this.ref === this.emptyRef; // sonst kann ein nicht erkannter Pfeil im Bild sein
       this.ref = data; this.refRaw = raw;
-      if (!this.dartsOnBoard) this.setEmpty(data);
+      if (!this.dartsOnBoard && wasEmptyRef) this.setEmpty(data);
       return events;
     }
     if (frac > this.opts.maxDartFraction) {
@@ -594,8 +629,6 @@ export class DartDetector {
     this.ref = data; this.refRaw = raw;
     this.status = 'bereit';
     if (!dets.length) {
-      // alle Pfeile weg und nichts Neues, nur Reste (Schärfe, Licht): das ist jetzt die leere Scheibe
-      if (healed || this.dartsOnBoard === 0) this.setEmpty(data);
       return healed ? events : [...events, { type: 'unclear' }];
     }
     for (const det of dets) {
@@ -637,7 +670,7 @@ export class DartDetector {
   diagnose(img) {
     if (!this.emptyRef || !img || img.width !== this.w || img.height !== this.h) return null;
     const data = softImage(img.data.slice(), this.w, this.h), E = this.alignTo(data, this.emptyRef);
-    this.allGone(data, E.T);
+    this.allGone(data, E);
     const M = this.matchSharpness(data, E.img);
     this.buildMask(M.a, M.b, null);
     const comps = this.components();
@@ -649,23 +682,27 @@ export class DartDetector {
   remember(px, conf, T) {
     const n = px.length, before = new Uint8Array(n * 3), after = new Uint8Array(n * 3);
     for (let k = 0; k < n; k++) for (let c = 0; c < 3; c++) { before[k * 3 + c] = this.refImg[px[k] * 4 + c]; after[k * 3 + c] = this.cur[px[k] * 4 + c]; }
-    return { px, before, after, conf, tx: T.tx, ty: T.ty };
+    return { px, before, after, conf, T };
   }
 
   /** Sind alle bekannten Pfeile verschwunden? Je Pixel: Ist das Bild jetzt näher an „vorher“ oder an „mit Pfeil“? */
-  allGone(data, T) {
+  allGone(data, E) {
+    const T = E.T;
     if (!this.dartMem.length) return false;
     let total = 0, gone = 0, any = false;
     for (const m of this.dartMem) {
-      const off = (Math.round(m.ty - T.ty) * this.w + Math.round(m.tx - T.tx)) * 4;
+      // Verschiebung zwischen damals und jetzt an der Stelle des Pfeils
+      const mid = m.px[m.px.length >> 1], cx = mid % this.w, cy = (mid / this.w) | 0, p0 = applyT(m.T, cx, cy), p1 = applyT(T, cx, cy);
+      const off = (Math.round(p0.y - p1.y) * this.w + Math.round(p0.x - p1.x)) * 4;
       let back = 0, all = 0;
       for (let k = 0; k < m.px.length; k += 2) {
         const i = m.px[k] * 4 + off;
         if (i < 0 || i + 2 >= data.length) continue;
-        let db = 0, da = 0, d = 0;
-        for (let c = 0; c < 3; c++) { const v = data[i + c], b = m.before[k * 3 + c], a = m.after[k * 3 + c]; db += Math.abs(v - b); da += Math.abs(v - a); d += Math.abs(a - b); }
+        let db = 0, da = 0, d = 0, de = 0;
+        for (let c = 0; c < 3; c++) { const v = data[i + c], b = m.before[k * 3 + c], a = m.after[k * 3 + c]; db += Math.abs(v - b); da += Math.abs(v - a); d += Math.abs(a - b); de += Math.abs(v - E.img[i + c]); }
         if (d < 45) continue; // kaum Unterschied: sagt nichts aus
-        all += d; if (db < 0.6 * da) back += d;
+        // wieder wie davor – oder wie die leere Scheibe (davor steckte dort evtl. ein anderer Pfeil)
+        all += d; if (Math.min(db, de) < 0.6 * da) back += d;
       }
       if (all < 400) continue;
       const isGone = back > 0.75 * all;
@@ -770,7 +807,8 @@ export class DartDetector {
       for (let c = 0; c < 3; c++) {
         const v = cur[i + c];
         let lo = 255, hi = 0;
-        for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) { const q = refImg[i + c + (dy * w + dx) * 4]; if (q < lo) lo = q; if (q > hi) hi = q; }
+        const r = this.inside[px[k]] ? 2 : 4; // LED-Arme liegen näher an der Kamera und verschieben sich stärker
+        for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) { const q = refImg[i + c + (dy * w + dx) * 4]; if (q < lo) lo = q; if (q > hi) hi = q; }
         if (v < lo - M || v > hi + M) { out++; break; }
       }
     }
@@ -799,7 +837,12 @@ export class DartDetector {
           if (q >= 0 && q < w * h && mask[q] && !seen[q]) { seen[q] = 1; stack[sp++] = q; }
         }
       }
-      if (px.length >= 12 && this.unexplained(px) >= this.opts.minUnexplained) comps.push({ px, bbox: { minX, minY, maxX, maxY } });
+      if (px.length < 12) continue;
+      // Neben der Scheibe (LED-Arme, Wand) müssen Veränderungen eindeutig neu sein: Die Arme liegen näher an der
+      // Kamera und verschieben sich beim Wackeln stärker. Herausragende Flights sind klar neu.
+      let inside = 0;
+      for (const p of px) inside += this.inside[p];
+      if (this.unexplained(px) >= (inside >= 12 ? this.opts.minUnexplained : this.opts.minUnexplainedOut)) comps.push({ px, bbox: { minX, minY, maxX, maxY } });
     }
     return comps.sort((a, b) => b.px.length - a.px.length);
   }
@@ -1346,7 +1389,7 @@ export class DartDetector {
     if (L > 1.15 * this.maxDartLen(mx, my)) { conf *= 0.5; reasons.push('Veränderung länger als ein Pfeil'); }
     // nur ein kurzes Stück sichtbar (weniger als gut die Hälfte eines Pfeils) → Richtung und Spitze unsicher
     if (exp && exp.len > 12 && L < 0.95 * exp.len) { conf *= 0.6; reasons.push('nur ein kurzes Stück des Pfeils sichtbar'); }
-    if (hit.r > 175 && hit.r < 190) { conf *= 0.55; reasons.push('knapp außerhalb des Doppels'); }
+    if (hit.r > 170 && hit.r < 190) { conf *= 0.55; reasons.push('knapp außerhalb des Doppels'); }
     // ein „Fehlwurf“ weit draußen ist selten; oft fehlt nur der vordere Pfeilteil → nachfragen
     else if (hit.r >= 190) { conf *= 0.55; reasons.push('außerhalb der Wertungsfläche'); }
     // Liegt die Spitze direkt auf/an einem schon steckenden Pfeil? (Nur Überschneidung der

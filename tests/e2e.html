@@ -45,6 +45,8 @@
   const oe = det.DartDetector.prototype.evaluate;
   det.DartDetector.prototype.evaluate = function (d) { const t = performance.now(); const r = oe.call(this, d); evTimes.push(performance.now() - t); return r; };
   const oldCal = st.calibration.current;
+  const oldThr = st.settings.get('confThreshold');
+  if (q.get('thr')) st.settings.set('confThreshold', Number(q.get('thr'))); // z. B. 1.1: jeder Pfeil braucht eine Rückfrage
   // Kalibrierung wie von der App: automatisch aus dem Bild (nicht aus der Wahrheit)
   g.putImageData(frames[0], 0, 0);
   const half = document.createElement('canvas'); half.width = 720; half.height = Math.round(720 * H / W); half.getContext('2d').drawImage(cv, 0, 0, half.width, half.height);
@@ -63,6 +65,8 @@
   const rng = mulberry32(Number(q.get('seed') ?? 7));
   const truth = [], asked = [];
   const btn = (t) => [...doc.querySelectorAll('button')].find((b) => b.textContent.trim().startsWith(t));
+  const mode = q.get('mode') || '';
+  const padClick = () => { const b = [...doc.querySelectorAll('button')].find((x) => x.textContent.trim() === '1'); if (b) b.click(); else log('Tastenfeld nicht gefunden'); };
   let exported = null;
   const oc = w.HTMLAnchorElement.prototype.click;
   w.HTMLAnchorElement.prototype.click = function () { if (this.download) { const ex = { name: this.download }; ex.blob = w.fetch(this.href).then((r) => r.blob()); exported = ex; return; } return oc.call(this); };
@@ -74,14 +78,20 @@
       truth.push(scoreAt(x, y).label);
       doSlip(); setScene(darts);
       await sleep(2500);
-      const c = btn('Bestätigen');
-      if (c) { asked.push(truth.length); c.click(); await sleep(300); }
+      // mode=late: Rückfragen erst nach dem Herausziehen bestätigen; mode=manual: alles verwerfen und von Hand eintragen
+      if (mode !== 'late') for (let c; (c = btn(mode === 'manual' ? 'Kein Pfeil' : 'Bestätigen'));) { asked.push(truth.length); c.click(); await sleep(300); }
     }
     if (v === 0) {
       const b = btn('Erkennung speichern');
       if (b && !b.disabled) { b.click(); await sleep(1500); if (exported) { const im = new Image(); await new Promise((r) => { im.onload = r; im.onerror = r; exported.blob.then((bl) => { im.src = URL.createObjectURL(bl); }); }); log(`Erkennung speichern: ${exported.name} ${im.naturalWidth}×${im.naturalHeight}`); im.style.width = '500px'; document.body.append(im); } else log('Erkennung speichern: KEIN BILD'); } else log('Erkennung speichern: Knopf fehlt/gesperrt');
     }
     hand = true; await sleep(1500); doSlip(); setScene([]); await sleep(300); hand = false; await sleep(2500);
+    if (mode) {
+      for (let c; (c = btn('Bestätigen'));) { asked.push('spät'); c.click(); await sleep(300); }
+      // fehlende Pfeile der Aufnahme von Hand eintragen (Scheibe ist schon leer)
+      for (let g = 0; g < 3; g++) { const cur = (await repo.matches.get(m.id)).legs.flatMap((l) => l.visits); const lastV = cur[cur.length - 1]; if (cur.length === v + 1 && lastV.darts.length === 3) break; padClick(); await sleep(400); }
+      await sleep(2500);
+    }
   }
   const mm = await repo.matches.get(m.id);
   const got = mm.legs.flatMap((l) => l.visits.flatMap((x) => x.darts.map((d) => d.label)));
@@ -91,6 +101,7 @@
   log(`Bildgröße Auswertung ${window.__size}; pro Bild ${s(times)}; Auswertung ${s(evTimes)}; Bilder ${times.length}`);
   log('Hinweise: ' + [...doc.querySelectorAll('.notice')].map((n) => n.textContent).join(' | '));
   w.location.hash = '#/dashboard'; await sleep(300);
+  if (q.get('thr')) st.settings.set('confThreshold', oldThr);
   await repo.matches.remove(m.id); if (oldCal) await st.calibration.save(oldCal); else await st.calibration.clear();
   window.__e2e.done = true; log('FERTIG');
 </script></body></html>
