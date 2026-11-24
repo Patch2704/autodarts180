@@ -1,5 +1,5 @@
 // Service Worker: Offline-Betrieb. Netzwerk zuerst (immer aktuell), sonst Cache.
-const CACHE = 'autodarts180-v19';
+const CACHE = 'autodarts180-v20';
 const CORE = [
   './', './index.html', './css/app.css', './manifest.webmanifest', './icon.svg',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png',

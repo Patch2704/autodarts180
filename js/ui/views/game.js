@@ -237,6 +237,7 @@ export async function render(root, params) {
 
   // ---------- Kamera ----------
   async function startCamera() {
+    focusReady = false; focusLog.length = 0;
     const cal = calibration.current;
     if (!cal) { inputMode = 'manual'; draw(); return; }
     try {
@@ -281,6 +282,8 @@ export async function render(root, params) {
 
   let pendingWarn = '';
   let settingsLocked = null;
+  let focusReady = false; // Autofokus beim Start abwarten
+  const focusLog = [];
   let needReadjust = false;
   function onFrame() {
     if (destroyed || !crop) return;
@@ -292,11 +295,22 @@ export async function render(root, params) {
     if (needReadjust) { needReadjust = false; readjust(); return; }
     const img = camera.grab({ crop, maxW: detMaxW });
     lastImg = img;
+    // Erst anfangen, wenn der Autofokus zur Ruhe gekommen ist: Ein unscharfes Leerbild als Referenz würde
+    // später überall Kantenreste ergeben
+    if (!focusReady) {
+      const s = frameMetrics(img).sharpness;
+      focusLog.push(s); if (focusLog.length > 12) focusLog.shift();
+      // Trend statt Schwankung: Wackeln ändert die Schärfe von Bild zu Bild, der Autofokus in eine Richtung
+      const avg = (l) => l.reduce((p, q) => p + q, 0) / l.length, m1 = avg(focusLog.slice(0, 6)), m2 = avg(focusLog.slice(6).length ? focusLog.slice(6) : [0]);
+      if ((focusLog.length < 12 || Math.abs(m2 - m1) > 0.06 * m1) && now - (camera.startedAt || 0) < 7000) { detStatus = 'Kamera stellt scharf …'; drawOverlay(); return; }
+      focusReady = true;
+      detector.rebase(img);
+    }
     const events = paused ? [] : detector.process(img);
     for (const ev of events) {
       // für „Erkennung speichern“: Bild vorher/nachher der letzten Pfeile (bleibt nur im Speicher)
       if (ev.type === 'dart' && detector.lastRefBefore) {
-        detLog.push({ before: detector.lastRefBefore, after: img, H: cropHm, tip: { ...ev.tip }, label: ev.hit.label, conf: ev.conf, reasons: ev.reasons, board: ev.board, at: Date.now() });
+        detLog.push({ before: detector.lastRawBefore || detector.lastRefBefore, after: img, mask: detector.mask.slice(), state: `Pfeile davor ${Math.max(0, detector.dartsOnBoard - 1)}, Ausrichtung ${detector.lastShift ? detector.lastShift.tx.toFixed(2) + '/' + detector.lastShift.ty.toFixed(2) + ' Maßstab ' + (detector.lastShift.a || 0).toFixed(5) : '–'}, Schärfe ${(detector.sharpRatio || 1).toFixed(2)}, Rauschen ${detector.noise}`, H: cropHm, tip: { ...ev.tip }, label: ev.hit.label, conf: ev.conf, reasons: ev.reasons, board: ev.board, at: Date.now() });
         if (detLog.length > 3) detLog.shift();
       }
       if (ev.tip) ev.tip = uncropPoint(ev.tip, crop);
@@ -522,7 +536,7 @@ export async function render(root, params) {
       calibration.current ? h('button', { class: 'btn', onclick: () => { inputMode = inputMode === 'camera' ? 'manual' : 'camera'; match.inputMode = inputMode; save(); if (inputMode === 'camera') startCamera(); else stopCamera(); draw(); } }, icon(inputMode === 'camera' ? 'hand' : 'camera'), inputMode === 'camera' ? 'Nur Tastenfeld' : 'Kamera an') : null,
       inputMode === 'camera' ? h('button', { class: `btn ${waitingTakeout ? 'primary' : ''}`, onclick: () => { if (lastImg) detector.rebase(lastImg); pending = []; toast('Referenzbild neu gesetzt'); draw(); } }, icon('hand'), waitingTakeout ? 'Pfeile entfernt' : 'Referenz neu') : null,
       inputMode === 'camera' ? h('button', { class: 'btn', disabled: !lastImg || botTurn, onclick: redetect }, icon('refresh'), 'Erneut erkennen') : null,
-      inputMode === 'camera' ? h('button', { class: 'btn', disabled: !detLog.length, onclick: exportDetections, title: 'Bilder der letzten erkannten Pfeile (vorher/nachher mit erkannter Spitze) speichern, z. B. zur Fehleranalyse' }, icon('download'), 'Erkennung speichern') : null,
+      inputMode === 'camera' ? h('button', { class: 'btn', disabled: !lastImg, onclick: exportDetections, title: 'Bilder der letzten erkannten Pfeile (vorher/nachher mit erkannter Spitze) speichern, z. B. zur Fehleranalyse' }, icon('download'), 'Erkennung speichern') : null,
     ].filter(Boolean));
     if (waitingTakeout && !botTurn && match.status === 'running') {
       actionsEl.append(h('div', { class: 'notice', style: { gridColumn: '1 / -1' } }, 'Bitte Pfeile aus der Scheibe ziehen – die Kamera erkennt das automatisch.'));
@@ -536,19 +550,29 @@ export async function render(root, params) {
   // Diagnosebild der letzten (bis zu 3) erkannten Pfeile: links Bild davor, rechts danach mit
   // erkannter Spitze und Ringen der Kalibrierung. Bleibt lokal, bis du es selbst weitergibst.
   async function exportDetections() {
-    if (!detLog.length) return;
-    const w = detLog[0].after.width, hh = detLog[0].after.height;
+    const now = lastImg && detector.diagnose(lastImg);
+    if (!detLog.length && !now) return;
+    const w = lastImg ? lastImg.width : detLog[0].after.width, hh = lastImg ? lastImg.height : detLog[0].after.height;
     const rows = detLog.filter((e) => e.after.width === w && e.after.height === hh);
+    if (now) rows.push({ before: now.empty, after: lastImg, H: cropHm, mask: now.mask, state: now.text, now: true });
+    if (!rows.length) return;
+    const version = (await globalThis.caches?.keys?.().catch(() => []) || []).filter((k) => k.startsWith('autodarts180')).join(' ');
     const c = document.createElement('canvas');
-    c.width = w * 2; c.height = hh * rows.length;
+    c.width = w * 3; c.height = hh * rows.length;
     const g = c.getContext('2d');
     rows.forEach((e, i) => {
       const y0 = i * hh;
       g.putImageData(new ImageData(new Uint8ClampedArray(e.before), w, hh), 0, y0);
       g.putImageData(e.after, w, y0);
-      // Ringe der Kalibrierung (dünn) auf beiden Hälften
+      if (e.mask) {
+        // dritte Spalte: was die Erkennung als verändert ansieht
+        const m = new ImageData(new Uint8ClampedArray(e.after.data), w, hh);
+        for (let p = 0; p < e.mask.length; p++) if (e.mask[p]) { m.data[p * 4] = 255; m.data[p * 4 + 1] = 0; m.data[p * 4 + 2] = 255; }
+        g.putImageData(m, w * 2, y0);
+      }
+      // Ringe der Kalibrierung (dünn), nur links, damit das Nachher-Bild unverändert bleibt
       g.strokeStyle = 'rgba(61,220,132,0.6)'; g.lineWidth = 1;
-      for (const off of [0, w]) for (const r of [6.35, 15.9, 99, 107, 162, 170]) {
+      for (const off of [0]) for (const r of [6.35, 15.9, 99, 107, 162, 170]) {
         g.beginPath();
         for (let k = 0; k <= 72; k++) {
           const t = (k * 5 * Math.PI) / 180, p = applyH(e.H, r * Math.cos(t), r * Math.sin(t));
@@ -557,15 +581,18 @@ export async function render(root, params) {
         }
         g.stroke();
       }
-      const tx = w + e.tip.x * w, ty = y0 + e.tip.y * hh;
-      g.strokeStyle = '#ff3b3b'; g.lineWidth = 2;
-      g.beginPath(); g.arc(tx, ty, 7, 0, 2 * Math.PI); g.moveTo(tx - 12, ty); g.lineTo(tx + 12, ty); g.moveTo(tx, ty - 12); g.lineTo(tx, ty + 12); g.stroke();
-      g.font = 'bold 16px system-ui, sans-serif'; g.fillStyle = 'rgba(0,0,0,0.6)'; g.fillRect(w, y0, w, 44);
+      if (e.tip) {
+        const tx = w + e.tip.x * w, ty = y0 + e.tip.y * hh;
+        g.strokeStyle = '#ff3b3b'; g.lineWidth = 2;
+        g.beginPath(); g.arc(tx, ty, 7, 0, 2 * Math.PI); g.moveTo(tx - 12, ty); g.lineTo(tx + 12, ty); g.moveTo(tx, ty - 12); g.lineTo(tx, ty + 12); g.stroke();
+      }
+      g.font = 'bold 16px system-ui, sans-serif'; g.fillStyle = 'rgba(0,0,0,0.6)'; g.fillRect(w, y0, w * 2, 44);
       g.fillStyle = '#fff';
-      g.fillText(`${i + 1}. erkannt: ${e.label} (${Math.round(e.conf * 100)} %)  x ${e.board.x.toFixed(1)} / y ${e.board.y.toFixed(1)} mm`, w + 8, y0 + 18);
+      g.fillText(e.now ? `Jetzt (Vergleich mit der leeren Scheibe) ${version}` : `${i + 1}. erkannt: ${e.label} (${Math.round(e.conf * 100)} %)  x ${e.board.x.toFixed(1)} / y ${e.board.y.toFixed(1)} mm`, w + 8, y0 + 18);
       g.font = '13px system-ui, sans-serif';
-      g.fillText(e.reasons.join(', ') || 'keine Auffälligkeiten', w + 8, y0 + 36);
-      g.fillStyle = 'rgba(0,0,0,0.6)'; g.fillRect(0, y0, 70, 24); g.fillStyle = '#fff'; g.fillText('vorher', 8, y0 + 17);
+      if (!e.now) g.fillText(e.reasons.join(', ') || 'keine Auffälligkeiten', w + 8, y0 + 36);
+      g.font = '12px system-ui, sans-serif'; g.fillText(e.state || '', e.now ? w + 8 : w * 2 + 8, e.now ? y0 + 36 : y0 + 18, e.now ? w * 2 - 16 : w - 16);
+      g.fillStyle = 'rgba(0,0,0,0.6)'; g.fillRect(0, y0, 70, 24); g.fillStyle = '#fff'; g.fillText(e.now ? 'leer' : 'vorher', 8, y0 + 17);
     });
     const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
     if (!blob) return;
@@ -624,7 +651,7 @@ export async function render(root, params) {
     };
     // bestätigte Pfeile zeigen der Erkennung, in welche Richtung die Pfeile im Bild stecken
     if (action === 'confirm') detector.learnDirection({ ...pd.ev, conf: 1 });
-    if (action === 'discard') detector.dartsOnBoard = Math.max(0, detector.dartsOnBoard - 1);
+    if (action === 'discard') detector.forget(pd.ev);
     if (action === 'confirm') finish({ ...pd.dart, confirmed: true });
     else if (action === 'discard') { draw(); }
     else {

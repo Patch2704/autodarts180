@@ -568,6 +568,26 @@ const stressLog = [];
   });
 }
 
+// ---------- Autofokus beim Start noch nicht fertig: früher Phantom → nie wieder eine Entnahme ----------
+{
+  const d3 = await import('./darts3d.js');
+  const { DartDetector } = await import('../js/vision/detector.js');
+  const style = d3.REAL_SCENARIOS.find(([l]) => l.includes('Autofokus'))[1];
+  const runs = [[-23, -8], [25, -5]].map(([deg, tilt]) => ({ deg, r: d3.simulate({ deg, tilt, visits: 2, seed: 303, style }) }));
+  stressLog.push('— Autofokus beim Start —', ...runs.map(({ deg, r }) => `${deg}°: ohne Rückfrage richtig ${r.auto}/${r.n}, verpasst ${r.missed}, Phantom ${r.phantom}, Entnahme fehlt ${r.noTakeout || 0}`));
+  test('Pfeilerkennung: unscharfes Startbild erzeugt kein Phantom, alle Entnahmen werden erkannt', () => {
+    for (const { deg, r } of runs) { eq(r.phantom, 0, `${deg}° Phantom`); eq(r.noTakeout || 0, 0, `${deg}° Entnahme fehlt`); ok(r.missed <= 1, `${deg}° verpasst ${r.missed}`); }
+  });
+  test('Pfeilerkennung: „Kein Pfeil“ vergisst die Meldung vollständig', () => {
+    const det = new DartDetector();
+    const { img, H } = scene.renderScene({ w: 320, h: 400, pts: cal.pointsFromH(stress.sideViewH(20, 320, 400)), light: 0.9, noise: 0, seed: 5 });
+    det.setCalibration(H, img.width, img.height); det.process(img);
+    det.dartsOnBoard = 1; det.segs.push({ tip: { x: 10, y: 10 }, far: { x: 30, y: 30 } }); det.dartPx.push([5000, 5001]); det.dartMem.push({ px: [5000, 5001], conf: 0.1 }); det.regions.push({}); det.markOcc([5000, 5001]);
+    det.forget({ tipPx: { x: 10, y: 10 } });
+    eq(det.dartsOnBoard, 0); eq(det.segs.length + det.dartPx.length + det.dartMem.length + det.regions.length, 0); eq(det.occ[5000], 0);
+  });
+}
+
 // ---------- Ausgabe ----------
 const out = document.getElementById('out');
 const failed = results.filter((r) => !r.ok);

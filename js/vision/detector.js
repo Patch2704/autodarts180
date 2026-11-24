@@ -8,13 +8,14 @@ import { scoreAt } from '../core/board.js';
 
 const DEFAULTS = {
   diffThreshold: 28, // mittlere RGB-Differenz pro Pixel (nach 3x3-Glättung), Obergrenze
-  minDiffThreshold: 15, // Untergrenze bei sehr rauscharmem Bild (Schwelle passt sich dem Rauschen an)
+  minDiffThreshold: 13, // Untergrenze bei sehr rauscharmem Bild (Schwelle passt sich dem Rauschen an; Bilder sind vorher geglättet)
   motionFraction: 0.0015, // Anteil veränderter Scheiben-Pixel (ohne Kantenwackeln), ab dem "Bewegung" gilt
   stableFrames: 5, // so viele ruhige Frames in Folge, bevor ausgewertet wird
   minDartFraction: 0.0005, // minimale Pfeilfläche relativ zur ROI (dunkler Pfeil vor dunklem Grund ist klein)
   smallDartFraction: 0.0012, // darunter muss die Form deutlich länglich sein (sonst kein Pfeil)
   maxDartFraction: 0.07, // größer = Hand/Person/Lichtwechsel
   edgeTolerance: 0.3, // so weit (px) dürfen Kanten gegenüber der ausgerichteten Referenz verrutschen
+  minUnexplained: 0.1, // so viel einer Veränderung darf kein Kantenrest (minimal verschobene/anders scharfe Kante) sein
   tipExtend: 1.0, // Korrektur der Spitzenposition, falls die Spitze nicht weiter verfolgt werden kann (px)
   tipRadiusMm: 1.0, // halbe Dicke der Stahlspitze: so weit reicht ihr sichtbares Ende über den Einstich hinaus
   tipBlurPx: 0.4, // Unschärfe/Glättung am Spitzenende (px)
@@ -225,6 +226,40 @@ function isShadowAt(a, b, i, s) {
   return Math.abs(ar / la - br / lb) < tol && Math.abs(ag / la - bg / lb) < tol;
 }
 /**
+ * Leichte Glättung (3×3-Binomial) vor dem Vergleich: Rauschen, Faserstruktur und Schärfeschwankungen
+ * haben wechselnde Vorzeichen und mitteln sich weg, ein Pfeil (mehrere Pixel breit) bleibt.
+ */
+const softCache = new WeakMap(), rawOf = new WeakMap(); // rawOf: geglättet → Original
+export function softImage(src, w, h) {
+  let out = softCache.get(src);
+  if (out) return out;
+  out = blurOnce(src, w, h);
+  softCache.set(src, out);
+  softCache.set(out, out);
+  rawOf.set(out, src);
+  return out;
+}
+function blurOnce(src, w, h) {
+  const out = new Uint8ClampedArray(src);
+  const W = w * 4, row = new Uint16Array(W * 3); // drei waagerecht geglättete Zeilen
+  const hpass = (y, o) => {
+    const b = y * W;
+    for (let i = 4; i < W - 4; i++) row[o + i] = src[b + i - 4] + 2 * src[b + i] + src[b + i + 4];
+  };
+  hpass(0, 0); hpass(1, W);
+  for (let y = 1; y < h - 1; y++) {
+    const o0 = ((y - 1) % 3) * W, o1 = (y % 3) * W, o2 = ((y + 1) % 3) * W, b = y * W;
+    hpass(y + 1, o2);
+    for (let i = 4; i < W - 4; i += 4) {
+      out[b + i] = (row[o0 + i] + 2 * row[o1 + i] + row[o2 + i]) / 16;
+      out[b + i + 1] = (row[o0 + i + 1] + 2 * row[o1 + i + 1] + row[o2 + i + 1]) / 16;
+      out[b + i + 2] = (row[o0 + i + 2] + 2 * row[o1 + i + 2] + row[o2 + i + 2]) / 16;
+    }
+  }
+  return out;
+}
+
+/**
  * Abweichung vom Wertebereich der Referenz in ±tol px Umgebung: Kanten, die um Bruchteile eines Pixels
  * verrutscht sind, zählen nicht; ein Pfeil vor gleichmäßigem Grund zählt voll. s = Bytes je Bildzeile.
  */
@@ -292,7 +327,20 @@ export class DartDetector {
   }
 
   /** Pixel bereits steckender Pfeile (für die Erkennung verdeckter Spitzen) */
-  clearOcc() { if (this.occ) this.occ.fill(0); this.lastPixels = null; this.segs = []; this.dartPx = []; }
+  clearOcc() { if (this.occ) this.occ.fill(0); this.lastPixels = null; this.segs = []; this.dartPx = []; this.dartMem = []; }
+
+  /** „Kein Pfeil“: die zuletzt gemeldete (oder die passende) Erkennung wieder vergessen */
+  forget(ev) {
+    let k = this.segs.findIndex((s) => ev && ev.tipPx && Math.hypot(s.tip.x - ev.tipPx.x, s.tip.y - ev.tipPx.y) < 2);
+    if (k < 0) k = this.segs.length - 1;
+    if (k >= 0) {
+      this.markOcc(this.dartPx[k], -1);
+      for (const l of [this.segs, this.dartPx, this.dartMem, this.regions]) l.splice(k, 1);
+    }
+    this.dartsOnBoard = Math.max(0, this.dartsOnBoard - 1);
+    // war es der einzige, ist die Scheibe leer: aktuelles Bild wird neue Leer-Referenz
+    if (!this.dartsOnBoard && this.ref) { this.setEmpty(this.ref); this.clearOcc(); }
+  }
 
   /** Liegt ein bereits steckender Pfeil in der Nähe (±2 px) dieses Bildpunkts? */
   isOcc(p) {
@@ -314,9 +362,9 @@ export class DartDetector {
 
   /** Aktuelles Bild wird neue Referenz (z. B. "Pfeile entfernt" manuell bestätigt) */
   rebase(img) {
-    const c = img.data.slice();
+    const raw = img.data.slice(), c = softImage(raw, this.w, this.h);
     this.setEmpty(c);
-    this.ref = c; this.prev = c;
+    this.ref = c; this.refRaw = raw; this.prev = raw;
     this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.stable = 0; this.clearOcc();
     this.lastRefBefore = null;
     this.status = 'bereit';
@@ -412,9 +460,11 @@ export class DartDetector {
   /** Wertet den zuletzt erkannten Pfeil im aktuellen Bild erneut aus (Referenz = Bild davor) */
   redetectLast(img) {
     if (!img || !this.lastRefBefore || (this.awaitingTakeout && this.dartsOnBoard === 0)) return null;
-    const A = this.alignTo(img.data, this.lastRefBefore);
-    this.setFrameTransform(img.data);
-    const count = this.buildMask(img.data, A.img);
+    const data = softImage(img.data, this.w, this.h);
+    const A = this.alignTo(data, this.lastRefBefore);
+    this.setFrameTransform(data);
+    this.pair = { cur: data, ref: this.lastRefBefore, T: A.T, raw: null };
+    const count = this.buildMask(data, A.img);
     if (count < this.opts.minDartFraction * this.roi.length) return null;
     const own = this.regions.pop();
     const ownSeg = this.segs.pop();
@@ -454,9 +504,11 @@ export class DartDetector {
   isClear(img) {
     if (!this.emptyRef || this.dartsOnBoard > 0 || this.awaitingTakeout || this.status !== 'bereit') return false;
     if (!img || img.width !== this.w || img.height !== this.h) return false;
-    if (this.motionFraction(img.data, this.emptyRef) > 0.004) return false; // schnelle Vorprüfung
-    const E = this.alignTo(img.data, this.emptyRef);
-    this.buildMask(img.data, E.img);
+    const data = softImage(img.data, this.w, this.h);
+    if (this.motionFraction(data, this.emptyRef) > 0.004) return false; // schnelle Vorprüfung
+    const E = this.alignTo(data, this.emptyRef);
+    const M = this.matchSharpness(data, E.img);
+    this.buildMask(M.a, M.b);
     return this.looksEmpty();
   }
 
@@ -482,26 +534,28 @@ export class DartDetector {
     return p;
   }
 
-  evaluate(data) {
+  evaluate(frame) {
+    const raw = frame.slice(), data = softImage(raw, this.w, this.h);
     const roiN = this.roi.length;
+    let healed = false; // Entnahme erkannt, obwohl die Scheibe nicht ganz wie das alte Leerbild aussieht
     const events = [];
     const E = this.alignTo(data, this.emptyRef);
     // Pfeile entfernt?
     if (this.dartsOnBoard > 0 || this.awaitingTakeout) {
-      // Die volle Prüfung nur, wenn ein guter Teil der bekannten Pfeile verschwunden ist
-      const maybe = this.vanished(data, E.img);
-      if (maybe) this.buildMask(data, E.img, null);
+      // Sehen die Stellen aller bekannten Pfeile wieder aus wie vor ihrem Treffer? (unabhängig davon, ob sich
+      // Schärfe oder Licht seit dem Bild der leeren Scheibe geändert haben)
+      const gone = this.allGone(data, E.T);
+      const maybe = gone || this.vanished(data, E.img);
+      if (maybe) { const m = this.matchSharpness(data, E.img); this.buildMask(m.a, m.b, null); }
       const empty = maybe && this.looksEmpty();
-      // … oder sind alle bekannten Pfeile weg, aber es steckt schon etwas Neues (schnell weitergespielt)
-      const gone = maybe && !empty && this.dartPx.length > 0 && this.dartPx.every((px) => this.goneFraction(px) > 0.75);
       if (empty || gone) {
-        const c = data.slice();
-        if (empty) { this.setEmpty(c); this.ref = c; } else this.ref = this.emptyRef;
+        if (empty) { this.setEmpty(data); this.ref = data; this.refRaw = raw; } else this.ref = this.emptyRef;
         this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.clearOcc();
         this.lastRefBefore = null;
         this.status = 'bereit';
         events.push({ type: 'takeout' });
         if (empty) return events;
+        healed = true;
       }
     }
     if (this.awaitingTakeout) { this.status = 'warte auf Entfernen'; return [{ type: 'waiting-takeout' }]; }
@@ -510,13 +564,16 @@ export class DartDetector {
     const A = this.ref === this.emptyRef ? E : this.alignTo(data, this.ref);
     this.setFrameTransform(data, E);
     this.lastShift = A.T;
-    const count = this.buildMask(data, A.img, this.dartsOnBoard > 0 ? E.img : null);
+    this.pair = { cur: data, ref: this.ref, T: A.T, raw: null };
+    const M = this.matchSharpness(data, A.img);
+    if (M.changed) this.pair.raw = { cur: M.a, ref: M.b };
+    const count = this.buildMask(M.a, M.b, this.dartsOnBoard > 0 ? E.img : null);
     const frac = count / roiN;
     if (frac < this.opts.minDartFraction || this.looksEmpty()) {
       this.status = 'bereit';
       // minimale Drift (Licht, leichtes Verrutschen) in die Referenz übernehmen
-      this.ref = data.slice();
-      if (!this.dartsOnBoard) this.setEmpty(this.ref);
+      this.ref = data; this.refRaw = raw;
+      if (!this.dartsOnBoard) this.setEmpty(data);
       return events;
     }
     if (frac > this.opts.maxDartFraction) {
@@ -525,31 +582,99 @@ export class DartDetector {
       if (this.largeChangeCount >= 3) {
         // dauerhafte Veränderung ohne Pfeil (Licht, verschobene Kamera) → neue Referenz
         this.largeChangeCount = 0;
-        const c = data.slice();
-        this.ref = c;
-        if (this.dartsOnBoard === 0) this.setEmpty(c);
+        this.ref = data; this.refRaw = raw;
+        if (this.dartsOnBoard === 0) this.setEmpty(data);
         return [...events, { type: 'lighting' }];
       }
       return [...events, { type: 'large-change', fraction: frac }];
     }
     this.largeChangeCount = 0;
     const dets = this.analyse(Math.max(1, 3 - this.dartsOnBoard));
-    this.lastRefBefore = this.ref;
-    this.ref = data.slice();
+    this.lastRefBefore = this.ref; this.lastRawBefore = this.refRaw;
+    this.ref = data; this.refRaw = raw;
     this.status = 'bereit';
-    if (!dets.length) return [...events, { type: 'unclear' }];
+    if (!dets.length) {
+      // alle Pfeile weg und nichts Neues, nur Reste (Schärfe, Licht): das ist jetzt die leere Scheibe
+      if (healed || this.dartsOnBoard === 0) this.setEmpty(data);
+      return healed ? events : [...events, { type: 'unclear' }];
+    }
     for (const det of dets) {
       if (this.dartsOnBoard >= 3) { det.conf = Math.min(det.conf, 0.4); det.reasons.push('mehr als drei Pfeile'); }
       this.dartsOnBoard++;
       this.regions.push(det.bbox);
       this.segs.push({ tip: det.tipPx, far: det.far });
       this.dartPx.push(det.pixelList);
+      this.dartMem.push(this.remember(det.pixelList, det.conf, E.T));
       this.markOcc(det.pixelList);
       this.learnDirection(det);
       delete det.pixelList;
       events.push({ type: 'dart', ...det });
     }
     return events;
+  }
+
+  /**
+   * Gleiche Schärfe für beide Bilder: War der Autofokus bei einem der beiden noch nicht fertig, wird das
+   * schärfere weicher gezeichnet (sonst gibt es an allen Kanten Reste). Liefert { a, b, changed }.
+   */
+  matchSharpness(a, b) {
+    const { boardIdx, w, h } = this, step = Math.max(1, Math.floor(boardIdx.length / 12000));
+    const energy = (d) => {
+      let s = 0;
+      for (let k = 0; k < boardIdx.length; k += step) { const i = boardIdx[k] * 4 + 1; s += Math.abs(4 * d[i] - d[i - 4] - d[i + 4] - d[i - w * 4] - d[i + w * 4]); }
+      return s;
+    };
+    let ea = energy(a), eb = energy(b), changed = 0;
+    this.sharpRatio = eb > 0 ? ea / eb : 1;
+    while (changed < 8 && (ea > 1.12 * eb || eb > 1.12 * ea)) {
+      if (ea > eb) { const n = blurOnce(a, w, h), en = energy(n); if (en < eb && eb / en > ea / eb) break; a = n; ea = en; } else { const n = blurOnce(b, w, h), en = energy(n); if (en < ea && ea / en > eb / ea) break; b = n; eb = en; }
+      changed++;
+    }
+    return { a, b, changed };
+  }
+
+  /** Zustand für „Erkennung speichern“: aktuelles Bild gegen die leere Scheibe */
+  diagnose(img) {
+    if (!this.emptyRef || !img || img.width !== this.w || img.height !== this.h) return null;
+    const data = softImage(img.data.slice(), this.w, this.h), E = this.alignTo(data, this.emptyRef);
+    this.allGone(data, E.T);
+    const M = this.matchSharpness(data, E.img);
+    this.buildMask(M.a, M.b, null);
+    const comps = this.components();
+    return { mask: this.mask.slice(), empty: this.emptyRef,
+      text: `Pfeile laut Erkennung ${this.dartsOnBoard}, ${this.status}; Ausrichtung ${E.T.tx.toFixed(2)}/${E.T.ty.toFixed(2)} Maßstab ${(E.T.a || 0).toFixed(5)} Drehung ${(E.T.b || 0).toFixed(5)}${E.ok ? '' : ' (unsicher)'}; Schärfe ${this.sharpRatio.toFixed(2)}, Rauschen ${this.noise}; Flecken ${comps.slice(0, 5).map((c) => c.px.length).join(' ') || 'keine'} (Pfeil ab ${Math.round(this.opts.minDartFraction * this.roi.length)}); weg: ${this.dartMem.map((m) => (m.gone == null ? '?' : Math.round(m.gone * 100) + '%')).join(' ') || '–'}` };
+  }
+
+  /** Merkt sich für einen Pfeil, wie seine Pixel vorher und mit ihm aussahen */
+  remember(px, conf, T) {
+    const n = px.length, before = new Uint8Array(n * 3), after = new Uint8Array(n * 3);
+    for (let k = 0; k < n; k++) for (let c = 0; c < 3; c++) { before[k * 3 + c] = this.refImg[px[k] * 4 + c]; after[k * 3 + c] = this.cur[px[k] * 4 + c]; }
+    return { px, before, after, conf, tx: T.tx, ty: T.ty };
+  }
+
+  /** Sind alle bekannten Pfeile verschwunden? Je Pixel: Ist das Bild jetzt näher an „vorher“ oder an „mit Pfeil“? */
+  allGone(data, T) {
+    if (!this.dartMem.length) return false;
+    let total = 0, gone = 0, any = false;
+    for (const m of this.dartMem) {
+      const off = (Math.round(m.ty - T.ty) * this.w + Math.round(m.tx - T.tx)) * 4;
+      let back = 0, all = 0;
+      for (let k = 0; k < m.px.length; k += 2) {
+        const i = m.px[k] * 4 + off;
+        if (i < 0 || i + 2 >= data.length) continue;
+        let db = 0, da = 0, d = 0;
+        for (let c = 0; c < 3; c++) { const v = data[i + c], b = m.before[k * 3 + c], a = m.after[k * 3 + c]; db += Math.abs(v - b); da += Math.abs(v - a); d += Math.abs(a - b); }
+        if (d < 45) continue; // kaum Unterschied: sagt nichts aus
+        all += d; if (db < 0.6 * da) back += d;
+      }
+      if (all < 400) continue;
+      const isGone = back > 0.75 * all;
+      m.gone = all ? back / all : 0;
+      // jeder sichere Pfeil muss weg sein; unsichere Meldungen (evtl. gar kein Pfeil) blockieren nicht allein
+      if (!isGone && m.conf >= 0.5) return false;
+      total += all; if (isGone) { gone += all; any = true; }
+    }
+    return any && gone >= 0.8 * total;
   }
 
   /** Schnelle Vorprüfung: Sieht mindestens ein Drittel der bekannten Pfeilpixel wieder aus wie die leere Scheibe? */
@@ -562,13 +687,6 @@ export class DartDetector {
       n++; if (d < 18) gone++;
     }
     return n < 20 || gone > n / 3;
-  }
-
-  /** Anteil der Pixel eines bekannten Pfeils, die wieder wie die leere Scheibe aussehen (nach buildMask gegen leer) */
-  goneFraction(px) {
-    let gone = 0;
-    for (const p of px) if (this.diff[p] < this.lowThr) gone++;
-    return px.length ? gone / px.length : 1;
   }
 
   /** Alle Pfeile eines Spielers zeigen im Bild meist in eine ähnliche Richtung – das lernt die Erkennung mit */
@@ -631,15 +749,32 @@ export class DartDetector {
     this.noise = med;
     const thrMean = Math.min(this.opts.diffThreshold, Math.max(this.opts.minDiffThreshold, 4 * med + 2));
     this.lowThr = Math.min(18, Math.max(10, 3.5 * med + 2));
-    const thr = thrMean * 9;
     let count = 0;
     for (let k = 0; k < roi.length; k++) {
       const p = roi[k];
-      const q = diff[p - w - 1] + diff[p - w] + diff[p - w + 1] + diff[p - 1] + diff[p] + diff[p + 1]
-        + diff[p + w - 1] + diff[p + w] + diff[p + w + 1];
-      if (q > thr) { mask[p] = 1; count++; }
+      // die Bilder sind schon geglättet, hier nur noch einzelne Ausreißer unterdrücken
+      if (2 * diff[p] + diff[p - w] + diff[p - 1] + diff[p + 1] + diff[p + w] > 6 * thrMean) { mask[p] = 1; count++; }
     }
     return count;
+  }
+
+  /**
+   * Anteil der Pixel, die sich nicht durch minimal verschobene oder anders scharfe Kanten erklären lassen:
+   * Ihre Farbe kommt in der 5×5-Umgebung der Referenz nicht vor. Kantenreste ≈ 0, Pfeile deutlich mehr.
+   */
+  unexplained(px) {
+    const { w, cur, refImg } = this, step = Math.max(1, Math.floor(px.length / 300)), M = 10;
+    let n = 0, out = 0;
+    for (let k = 0; k < px.length; k += step) {
+      const i = px[k] * 4; n++;
+      for (let c = 0; c < 3; c++) {
+        const v = cur[i + c];
+        let lo = 255, hi = 0;
+        for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) { const q = refImg[i + c + (dy * w + dx) * 4]; if (q < lo) lo = q; if (q > hi) hi = q; }
+        if (v < lo - M || v > hi + M) { out++; break; }
+      }
+    }
+    return n ? out / n : 0;
   }
 
   /** Zusammenhängende Regionen der Maske, größte zuerst */
@@ -664,7 +799,7 @@ export class DartDetector {
           if (q >= 0 && q < w * h && mask[q] && !seen[q]) { seen[q] = 1; stack[sp++] = q; }
         }
       }
-      if (px.length >= 12) comps.push({ px, bbox: { minX, minY, maxX, maxY } });
+      if (px.length >= 12 && this.unexplained(px) >= this.opts.minUnexplained) comps.push({ px, bbox: { minX, minY, maxX, maxY } });
     }
     return comps.sort((a, b) => b.px.length - a.px.length);
   }
@@ -725,7 +860,10 @@ export class DartDetector {
     // Querprofil im vorderen Teil: zwei klar getrennte Streifen (Tal dazwischen) = zwei Barrels
     const R0 = Math.ceil(30 * s), prof = new Float32Array(2 * R0 + 1);
     const front = [];
+    // nur deutlich veränderte Pixel: Die Glättung füllt sonst den schmalen Spalt zwischen zwei Barrels
+    const strong = this.lowThr * 2.2;
     for (const p of pixels) {
+      if (this.diff[p] < strong) continue;
       const dx = (p % w) - tx, dy = ((p / w) | 0) - ty, al = dx * ux + dy * uy, pe = dx * uy - dy * ux;
       if (al < 0.05 * L || al > 0.45 * L || Math.abs(pe) > R0) continue;
       front.push([p, al, pe]); prof[Math.round(pe) + R0]++;
@@ -848,6 +986,7 @@ export class DartDetector {
       }
     }
     const det = this.locateTip(pixels, bb, extra);
+    if (det && !cluster && det.axis.elong < 2 && det.reasons.includes('Veränderung länger als ein Pfeil')) return null;
     if (det && cluster) {
       det.conf *= 0.6; det.reasons.push('aus einer Pfeilgruppe herausgelöst');
       // In der Gruppe ist der neue Pfeil oft nur teilweise sichtbar: kürzer als ein ganzer Pfeil
@@ -950,6 +1089,14 @@ export class DartDetector {
     return { x: dx / len, y: dy / len, len, variants };
   }
 
+  /** Ungeglättetes Bild und ausgerichtete ungeglättete Referenz (nur für die dünne Spitze) */
+  rawImages() {
+    const p = this.pair;
+    if (!p) return { cur: this.cur, ref: this.refImg };
+    if (!p.raw) { const cur = rawOf.get(p.cur) || p.cur, ref = rawOf.get(p.ref) || p.ref; p.raw = { cur, ref: warpRef(cur, ref, p.T, this.w, this.h, this.roi) }; }
+    return p.raw;
+  }
+
   /**
    * Verfolgt die dünne Spitze vom Ende der Pfeilregion weiter nach außen: Die Spitze ist nur
    * 1–3 px breit und fällt nach der Glättung oft unter die Schwelle. (dx, dy) zeigt zur Spitze.
@@ -957,10 +1104,17 @@ export class DartDetector {
   extendTip(p, dx, dy, maxGap = 0) {
     const { diff, w, h } = this;
     const low = this.lowThr || this.opts.diffThreshold * 0.45;
+    const R = this.rawImages(), st = w * 4, tol = this.opts.edgeTolerance;
+    const rawThr = Math.max(18, 1.8 * low); // ungeglättet rauscht stärker
+    const rawDev = (i) => { const r = tolDev(R.cur, R.ref, i, st, tol), g = tolDev(R.cur, R.ref, i + 1, st, tol), l = tolDev(R.cur, R.ref, i + 2, st, tol); return ((r + g + l) / 3 + Math.max(r, g, l)) / 2; };
     const at = (x, y) => {
       const xi = Math.round(x), yi = Math.round(y);
-      if (xi < 1 || yi < 1 || xi >= w - 1 || yi >= h - 1) return 0;
-      return diff[yi * w + xi];
+      if (xi < 2 || yi < 2 || xi >= w - 2 || yi >= h - 2) return 0;
+      const p = yi * w + xi, v = diff[p];
+      if (v >= low) return v;
+      // die dünne Spitze wird durch die Glättung blasser: im Original nachsehen
+      const d = rawDev(p * 4);
+      return d < rawThr || isShadowAt(R.cur, R.ref, p * 4, st) ? v : d;
     };
     // quer zur Achse ±1 px (die Spitze ist dünn und nicht exakt auf der Achse), weiter weg ±2 px
     const sample = (s, r) => {
@@ -995,12 +1149,10 @@ export class DartDetector {
     // Eine graue Spitze vor hellem Feld sieht wie ein Schatten aus und wurde ausgefiltert. Ein kurzes Stück
     // genau in Verlängerung gehört zur Spitze; geht es länger weiter, ist es wirklich ein Schatten.
     if (last && this.cur && this.refImg) {
-      const thr = Math.max(16, low * 1.5), st = w * 4, tol = this.opts.edgeTolerance;
+      const thr = Math.max(16, low * 1.5);
       const raw = (x, y) => {
         const xi = Math.round(x), yi = Math.round(y);
-        if (xi < 1 || yi < 1 || xi >= w - 1 || yi >= h - 1) return 0;
-        const i = (yi * w + xi) * 4, r = tolDev(this.cur, this.refImg, i, st, tol), g = tolDev(this.cur, this.refImg, i + 1, st, tol), l = tolDev(this.cur, this.refImg, i + 2, st, tol);
-        return ((r + g + l) / 3 + Math.max(r, g, l)) / 2;
+        return xi < 2 || yi < 2 || xi >= w - 2 || yi >= h - 2 ? 0 : rawDev((yi * w + xi) * 4);
       };
       const maxLen = 6 * this.pxPerMm;
       let end = last, miss = 0;
@@ -1226,7 +1378,8 @@ export class DartDetector {
         }
         return k ? c.map((v) => v / k) : null;
       };
-      const end = avg(this.cur, 0, -6, -2, 0), beyond = avg(this.refImg, 0, 2, 8, 1);
+      const R = this.rawImages();
+      const end = avg(R.cur, 0, -6, -2, 0), beyond = avg(R.ref, 0, 2, 8, 1);
       if (end && beyond) {
         const e = end.map((v, i) => Math.abs(v - beyond[i]));
         endContrast = ((e[0] + e[1] + e[2]) / 3 + Math.max(...e)) / 2;

@@ -210,6 +210,34 @@ function soften(img) {
   return out;
 }
 
+/**
+ * Störungen echter Handyvideos, die keine Verschiebung des ganzen Bilds sind: örtliche Verzerrung um
+ * Bruchteile eines Pixels (Rolling Shutter, Bildstabilisator) und schwankende Schärfe (Autofokus,
+ * Rauschminderung). st = { warp: px, sharp: ±Anteil }
+ */
+function disturbField(rng, st) {
+  const G = 5, fx = [], fy = [];
+  for (let k = 0; k < (G + 1) * (G + 1); k++) { fx.push((rng() - 0.5) * 2 * st.warp); fy.push((rng() - 0.5) * 2 * st.warp); }
+  return { G, fx, fy, k: (rng() - 0.5) * 2 * st.sharp }; // k > 0 schärfer, < 0 weicher
+}
+function disturb(img, f) {
+  const { width: w, height: h } = img, s = img.data, out = new ImageData(w, h), d = out.data;
+  const { G, fx, fy, k } = f;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = (y * w + x) * 4; d[i + 3] = 255;
+    if (x < 3 || y < 3 || x >= w - 4 || y >= h - 4) { d[i] = s[i]; d[i + 1] = s[i + 1]; d[i + 2] = s[i + 2]; continue; }
+    const gx = (x / w) * G, gy = (y / h) * G, x0 = gx | 0, y0 = gy | 0, u = gx - x0, v = gy - y0, q = y0 * (G + 1) + x0;
+    const lerp = (f) => (f[q] * (1 - u) + f[q + 1] * u) * (1 - v) + (f[q + G + 1] * (1 - u) + f[q + G + 2] * u) * v;
+    const px = x + lerp(fx), py = y + lerp(fy), ix = px | 0, iy = py | 0, a = px - ix, b = py - iy, j = (iy * w + ix) * 4, W4 = w * 4;
+    for (let c = 0; c < 3; c++) {
+      const val = (s[j + c] * (1 - a) + s[j + 4 + c] * a) * (1 - b) + (s[j + W4 + c] * (1 - a) + s[j + W4 + 4 + c] * a) * b;
+      const m = (s[j + c - 4] + s[j + c + 4] + s[j + c - W4] + s[j + c + W4]) / 4;
+      d[i + c] = val + k * (val - m);
+    }
+  }
+  return out;
+}
+
 const REAL_COLORS = { red: [205, 52, 48], green: [38, 205, 55], black: [44, 44, 48], cream: [212, 207, 192], surround: [40, 40, 46], wall: [62, 10, 34], wire: [190, 190, 188] };
 
 /** Zufällige Einstichstelle: gemischt aus Triple/Double/Single/Bull, gleichmäßig über die Scheibe */
@@ -232,7 +260,7 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
   const rng = mulberry32(seed * 7919 + Math.round(deg * 13 + tilt * 3));
   const cam = sideCamera(deg, w, h, { fill, tilt, roll });
   // echte Optik bildet Kanten weich ab (ohne Glättung wären verschobene Bilder unrealistisch verschieden)
-  const base = style.real ? soften(renderScene({ w, h, pts: cal.pointsFromH(cam.H), light, noise: 0, seed, ...(style.real ? { colors: REAL_COLORS, texture: 9, warm: false, light: 1 } : {}) }).img) : renderScene({ w, h, pts: cal.pointsFromH(cam.H), light, noise: 0, seed, ...(style.real ? { colors: REAL_COLORS, texture: 9, warm: false, light: 1 } : {}) }).img;
+  const base = style.real ? soften(renderScene({ w, h, pts: cal.pointsFromH(cam.H), light, noise: 0, seed, ...(style.real ? { colors: REAL_COLORS, texture: style.texture || 9, warm: false, light: 1 } : {}) }).img) : renderScene({ w, h, pts: cal.pointsFromH(cam.H), light, noise: 0, seed, ...(style.real ? { colors: REAL_COLORS, texture: style.texture || 9, warm: false, light: 1 } : {}) }).img;
   const bc = cal.boardCrop(cam.H);
   const crop = detectorOpts.boardCropOnly ? bc : dartCrop(cam.H, w, h);
   const detMaxW = Math.min(960, Math.round((640 * crop.w) / bc.w)); // wie im Spiel
@@ -243,13 +271,22 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
   const drawn = (darts) => { const key = darts.map((d) => d.x.toFixed(3) + d.y.toFixed(3) + d.dir.map((v) => v.toFixed(4)).join(',')).join('|'); if (key !== cacheKey) { cacheKey = key; cacheImg = darts.length ? drawDarts(base, cam, darts, { shadow }) : base; } return cacheImg; };
   // Wackeln pro Bild (style.jitter) und bleibendes Verrutschen nach Treffern/Ziehen (style.slip), in Vollbild-px
   let sx0 = 0, sy0 = 0;
-  const slip = () => { if (style.slip) { sx0 = (rng() - 0.5) * 2 * style.slip; sy0 = (rng() - 0.5) * 2 * style.slip; } };
-  const frame = (darts) => grabCrop(addNoiseFast(drawn(darts), noise, frameSeed++), crop, detMaxW, sx0 + (style.jitter ? gaussian(rng) * style.jitter : 0), sy0 + (style.jitter ? gaussian(rng) * style.jitter : 0));
+  const slip = () => { if (style.disturb) field = disturbField(rng, style.disturb); if (style.slip) { sx0 = (rng() - 0.5) * 2 * style.slip; sy0 = (rng() - 0.5) * 2 * style.slip; } };
+  const grab = (darts) => grabCrop(addNoiseFast(drawn(darts), style.noise || noise, frameSeed++), crop, detMaxW, sx0 + (style.jitter ? gaussian(rng) * style.jitter : 0), sy0 + (style.jitter ? gaussian(rng) * style.jitter : 0));
+  // die Störung ändert sich mit jedem Ereignis (Treffer, Ziehen), nicht mit jedem Bild
+  let field = style.disturb ? disturbField(rng, style.disturb) : null;
+  // Autofokus beim Start noch nicht fertig: erste Bilder weicher (mehrfach geglättet), danach scharf
+  let softStart = style.softStart || 0;
+  const focus = (img) => { let o = img; for (let k = 0; k < softStart; k++) o = soften(o); return o; };
+  const frame = (darts) => focus(field ? disturb(grab(darts), field) : grab(darts));
   const first = frame([]);
   det.setCalibration(Hc, first.width, first.height, detectorOpts.noView ? null : cropView(crop, first.width, first.height));
+  let startPhantom = 0;
   det.process(first);
   for (let k = 0; k < 6; k++) det.process(frame([]));
+  if (softStart) { softStart = 0; for (let k = 0; k < 24; k++) for (const ev of det.process(frame([]))) if (ev.type === 'dart') startPhantom++; }
   const res = { n: 0, correct: 0, auto: 0, askOk: 0, askWrong: 0, phantom: 0, missed: 0, lowConf: 0, errs: [], errsConf: [], wrongConfident: 0, wrong: [], along: [], perp: [] };
+  res.phantom += startPhantom;
   for (let v = 0; v < visits; v++) {
     const darts = [];
     // eng gruppiert: alle drei Pfeile um einen gemeinsamen Zielpunkt (Streuung style.cluster mm)
@@ -341,7 +378,7 @@ export const SCENARIOS = [
 ];
 // Bedingungen wie auf den echten Bildern des Nutzers (fast frontal, neutral weiße Felder, Wackeln)
 export const REAL = { real: true, preset: 'user', up: 20, jitter: 0.15, slip: 1.2, sameSet: true };
-export const REAL_SCENARIOS = [['echt: verteilt', REAL], ['echt: ohne Wackeln', { ...REAL, jitter: 0, slip: 0 }], ['echt: enge Gruppe', { ...REAL, cluster: 8, bump: true }], ['echt: starkes Wackeln', { ...REAL, jitter: 0.4, slip: 2 }]];
+export const REAL_SCENARIOS = [['echt: verteilt', REAL], ['echt: ohne Wackeln', { ...REAL, jitter: 0, slip: 0 }], ['echt: enge Gruppe', { ...REAL, cluster: 8, bump: true }], ['echt: starkes Wackeln', { ...REAL, jitter: 0.4, slip: 2 }], ['echt: unruhiges Bild', { ...REAL, texture: 18, noise: 7, disturb: { warp: 0.35, sharp: 0.5 } }], ['echt: Autofokus beim Start', { ...REAL, texture: 18, noise: 5, softStart: 5 }]];
 export const REAL_CAMERAS = [[-23, -8], [-20, 0], [25, -5], [-30, 5], [23, 8]];
 export const CAMERAS = [[30, 0], [-30, 0], [45, 0], [-45, 0], [55, 0], [-55, 0], [45, 15], [-45, -15]];
 
