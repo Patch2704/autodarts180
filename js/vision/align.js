@@ -32,7 +32,7 @@ export function transformSize(T, r) {
  * Schätzt T mit cur(p) ≈ ref(T(p)). idx: Pixelindizes der Auswertungsfläche; init: Startwert.
  * Lucas-Kanade mit Ausreißer-Dämpfung. ok = false, wenn zu wenig Struktur vorhanden ist.
  */
-export function estimateTransform(cur, ref, w, h, idx, init = null, maxSamples = 24000) {
+export function estimateTransform(cur, ref, w, h, idx, init = null, maxSamples = 8000) {
   const lc = luminance(cur), lr = luminance(ref);
   const cx = w / 2, cy = h / 2;
   const T = { a: 0, b: 0, tx: 0, ty: 0, cx, cy, ...(init ? { a: init.a || 0, b: init.b || 0, tx: init.tx || 0, ty: init.ty || 0 } : {}) };
@@ -106,16 +106,20 @@ export function warpRef(cur, ref, T, w, h, idx) {
   const flat = gains.every((g) => Math.abs(g - 1) < 0.006);
   if (flat && transformSize(T, Math.max(w, h) / 2) < 0.02) return ref;
   const out = new Uint8ClampedArray(ref.length);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const X = x - T.cx, Y = y - T.cy;
-      let rx = x + T.a * X - T.b * Y + T.tx, ry = y + T.b * X + T.a * Y + T.ty;
-      if (rx < 0) rx = 0; else if (rx > w - 1.001) rx = w - 1.001;
-      if (ry < 0) ry = 0; else if (ry > h - 1.001) ry = h - 1.001;
+  const [g0, g1, g2] = gains, s = w * 4, mx = w - 1.001, my = h - 1.001;
+  for (let y = 0, i = 0; y < h; y++) {
+    const Y = y - T.cy;
+    // entlang der Zeile ändert sich die Quellposition gleichmäßig
+    let sx = -T.a * T.cx - T.b * Y + T.tx, sy = y - T.b * T.cx + T.a * Y + T.ty;
+    const ax = 1 + T.a, bx = T.b;
+    for (let x = 0; x < w; x++, i += 4, sx += ax, sy += bx) {
+      const rx = sx < 0 ? 0 : sx > mx ? mx : sx, ry = sy < 0 ? 0 : sy > my ? my : sy;
       const x0 = rx | 0, y0 = ry | 0, fx = rx - x0, fy = ry - y0;
-      const q = (y0 * w + x0) * 4, i = (y * w + x) * 4, s = w * 4;
-      const w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
-      for (let c = 0; c < 3; c++) out[i + c] = (ref[q + c] * w00 + ref[q + 4 + c] * w10 + ref[q + s + c] * w01 + ref[q + s + 4 + c] * w11) * gains[c];
+      const q = (y0 * w + x0) * 4, q2 = q + s;
+      const w11 = fx * fy, w10 = fx - w11, w01 = fy - w11, w00 = 1 - fx - w01;
+      out[i] = (ref[q] * w00 + ref[q + 4] * w10 + ref[q2] * w01 + ref[q2 + 4] * w11) * g0;
+      out[i + 1] = (ref[q + 1] * w00 + ref[q + 5] * w10 + ref[q2 + 1] * w01 + ref[q2 + 5] * w11) * g1;
+      out[i + 2] = (ref[q + 2] * w00 + ref[q + 6] * w10 + ref[q2 + 2] * w01 + ref[q2 + 6] * w11) * g2;
       out[i + 3] = 255;
     }
   }

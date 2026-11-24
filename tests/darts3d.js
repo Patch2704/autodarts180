@@ -254,6 +254,7 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
     const darts = [];
     // eng gruppiert: alle drei Pfeile um einen gemeinsamen Zielpunkt (Streuung style.cluster mm)
     const center = style.cluster ? randomTarget(rng) : null;
+    const truths = [], found = [];
     for (let k = 0; k < 3; k++) {
       let t = randomTarget(rng);
       if (center) { t = { x: center.x + gaussian(rng) * style.cluster, y: center.y + gaussian(rng) * style.cluster }; if (Math.hypot(t.x, t.y) > 168) t = center; }
@@ -276,28 +277,42 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
       let evs = [];
       const still = frame(darts);
       for (let f = 0; f < 7; f++) evs = evs.concat(det.process(f % 2 ? still : frame(darts)));
-      const ev = evs.find((e) => e.type === 'dart');
-      res.phantom += Math.max(0, evs.filter((e) => e.type === 'dart').length - 1);
       const truth = scoreAt(t.x, t.y);
+      truths.push({ t, truth, k, dart: { ...darts[darts.length - 1] } });
       res.n++;
-      if (!ev) { res.missed++; res.wrong.push(`${truth.label}: nicht erkannt (${evs.map((e) => e.type).join(',') || 'kein Ereignis'})`); continue; }
-      const e = Math.hypot(ev.board.x - t.x, ev.board.y - t.y);
+      for (const ev of evs) {
+        if (ev.type !== 'dart') continue;
+        found.push(ev);
+        // wie im Spiel: Der Nutzer bestätigt einen richtigen Vorschlag, die Erkennung lernt daraus die Richtung
+        if (ev.conf < 0.6 && truths.some((q) => q.truth.label === ev.hit.label && Math.hypot(ev.board.x - q.t.x, ev.board.y - q.t.y) < 15)) det.learnDirection({ ...ev, conf: 1 });
+      }
+    }
+    // Zuordnung: jeweils das nächste Paar aus wahrem und erkanntem Pfeil
+    const pairs = [];
+    truths.forEach((q, i) => found.forEach((ev, j) => pairs.push({ i, j, d: Math.hypot(ev.board.x - q.t.x, ev.board.y - q.t.y) })));
+    pairs.sort((a, b) => a.d - b.d);
+    const ui = new Set(), uj = new Set();
+    for (const { i, j, d: e } of pairs) {
+      if (ui.has(i) || uj.has(j)) continue;
+      ui.add(i); uj.add(j);
+      const { t, truth, k, dart } = truths[i], ev = found[j];
       res.errs.push(e);
-      { // Abweichung im Bild entlang (+ = Richtung Flight) und quer zur Pfeilachse, in px
+      {
         const toC = (q) => ({ x: ((q.x / w - crop.x) / crop.w) * first.width, y: ((q.y / h - crop.y) / crop.h) * first.height });
-        const dt = darts[darts.length - 1];
-        const p0 = toC(cam.proj(t.x, t.y, 0)), p1 = toC(cam.proj(t.x + dt.dir[0] * 50, t.y + dt.dir[1] * 50, dt.dir[2] * 50));
+        const p0 = toC(cam.proj(t.x, t.y, 0)), p1 = toC(cam.proj(t.x + dart.dir[0] * 50, t.y + dart.dir[1] * 50, dart.dir[2] * 50));
         let ax = p1.x - p0.x, ay = p1.y - p0.y; const an = Math.hypot(ax, ay) || 1; ax /= an; ay /= an;
         const dx = ev.tip.x * first.width - p0.x, dy = ev.tip.y * first.height - p0.y;
         res.along.push(dx * ax + dy * ay); res.perp.push(dx * ay - dy * ax);
       }
+      const good = ev.hit.label === truth.label;
       if (ev.conf < 0.6) res.lowConf++; else res.errsConf.push(e);
-      if (ev.conf >= 0.6 && ev.hit.label !== truth.label) res.wrongConfident++;
-      { const good = ev.hit.label === truth.label; if (ev.conf >= 0.6) { if (good) res.auto++; } else if (good) res.askOk++; else res.askWrong++; }
-      if (ev.hit.label === truth.label) res.correct++;
+      if (ev.conf >= 0.6) { if (good) res.auto++; else res.wrongConfident++; } else if (good) res.askOk++; else res.askWrong++;
+      if (good) res.correct++;
       else res.wrong.push(`${truth.label} → ${ev.hit.label} (${e.toFixed(1)} mm, ${Math.round(ev.conf * 100)} %${ev.reasons.length ? ', ' + ev.reasons.join(', ') : ''})`);
       if (log) log({ v, k, t, ev, e, darts: darts.map((d) => ({ ...d })), cam, crop, detMaxW, det, base });
     }
+    truths.forEach((q, i) => { if (!ui.has(i)) { res.missed++; res.wrong.push(`${q.truth.label}: nicht erkannt`); } });
+    res.phantom += found.length - uj.size;
     // Pfeile ziehen
     slip();
     det.awaitTakeout();
