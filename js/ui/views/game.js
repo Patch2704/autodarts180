@@ -256,12 +256,25 @@ export async function render(root, params) {
         needReadjust = true;
       }
       setupCrop(cal);
-      camera.startLoop(onFrame, 10);
+      camera.startLoop(onFrame, 15);
     } catch (e) {
       toast(`Kamera nicht verfügbar: ${e.message}`, 'err');
       inputMode = 'manual';
       draw();
     }
+  }
+
+  // Gelerntes über die Pfeile (Richtung im Bild, Länge der Spitze) je Kalibrierung merken: Es soll nicht bei
+  // jedem Spiel neu gelernt werden müssen
+  const MODEL_KEY = 'autodarts180-pfeile';
+  function loadDartModel(cal) {
+    try {
+      const m = JSON.parse(localStorage.getItem(MODEL_KEY) || 'null');
+      if (m && m.cal === cal.createdAt) detector.setModel(m.model);
+    } catch { /* ohne Speicher wird neu gelernt */ }
+  }
+  function saveDartModel() {
+    try { localStorage.setItem(MODEL_KEY, JSON.stringify({ cal: calibration.current?.createdAt, model: detector.getModel() })); } catch { /* egal */ }
   }
 
   // Nur der Bildausschnitt um die Scheibe wird ausgewertet → mehr Pixel pro Millimeter
@@ -275,6 +288,7 @@ export async function render(root, params) {
     cropHm = cropH(cal.H, crop);
     const img = camera.grab({ crop, maxW: detMaxW });
     detector.setCalibration(cropHm, img.width, img.height, cropView(crop, img.width, img.height));
+    loadDartModel(cal);
     // Anzeige: quadratischer Ausschnitt um die Scheibe statt des ganzen Kamerabilds
     viewCrop = boardCrop(cal.H, 232);
     const { w, h: vh } = camera.resolution;
@@ -318,25 +332,31 @@ export async function render(root, params) {
         detLog.push({ before: detector.lastRawBefore || detector.lastRefBefore, after: img, mask: detector.mask.slice(), state: `Pfeile davor ${Math.max(0, detector.dartsOnBoard - 1)}, Ausrichtung ${detector.lastShift ? detector.lastShift.tx.toFixed(2) + '/' + detector.lastShift.ty.toFixed(2) + ' Maßstab ' + (detector.lastShift.a || 0).toFixed(5) : '–'}, Schärfe ${(detector.sharpRatio || 1).toFixed(2)}, Rauschen ${detector.noise}`, tip: { ...ev.tip }, far: ev.far ? { ...ev.far } : null, label: ev.hit.label, conf: ev.conf, reasons: ev.reasons, board: ev.board, at: Date.now() });
         if (detLog.length > 3) detLog.shift();
       }
+      if (ev.type === 'takeout') saveDartModel();
       if (ev.tip) ev.tip = uncropPoint(ev.tip, crop);
       handleDetection(ev);
     }
     detStatus = detector.status;
-    // Kontrolle nur bei leerer, freier Scheibe (keine Pfeile, niemand davor, keine Bewegung)
-    if (now - lastHealth > 4000 && detector.isClear(img)) {
+    // Kontrolle nur in ruhigen Momenten bei leerer, freier Scheibe – sie rechnet länger und darf das Spiel nicht
+    // aufhalten (nicht direkt nach dem Herausziehen): beim Start einmal, danach höchstens alle 20 s
+    const quiet = detector.stable > (trackedOnce ? 60 : 8);
+    if (quiet && now - lastHealth > (trackedOnce ? 20000 : 1500)) {
       lastHealth = now;
-      checkHealth(img);
+      if (detector.isClear(img)) checkHealth(img);
     }
     drawOverlay();
   }
 
   const warnStreak = {};
-  let trackFails = 0, trackedUntil = 0;
+  let trackFails = 0, trackedUntil = 0, trackedOnce = false;
   function checkHealth(img) {
     const cal = calibration.current;
     const refQ = cal.cropQuality ?? (cal.version >= 2 ? cal.quality : null);
     // Dauerhaft exakt: bei jeder freien Scheibe still um Bruchteile von Millimetern nachführen
-    const tracked = autoTrack(img, refQ);
+    // Die Erkennung gleicht kleine Verschiebungen selbst aus; nachkalibriert wird beim Start und erst wieder,
+    // wenn die Scheibe im Bild deutlich gewandert ist
+    const tracked = !trackedOnce || detector.drift() > 3 ? autoTrack(img, refQ) : false;
+    trackedOnce = true;
     const hc = healthCheck(img, cropHm, { quality: refQ, brightness: cal.version >= 2 ? cal.brightness : null });
     if (refQ != null && hc.quality < refQ - 0.03) {
       trackFails = tracked ? 0 : trackFails + 1;
@@ -368,8 +388,14 @@ export async function render(root, params) {
     const H = uncropH(Hn, crop);
     const updated = { ...cal, H, points: pointsFromH(H), trackedAt: Date.now() };
     calibration.save(updated);
-    setupCrop(updated);
-    detector.rebase(camera.grab({ crop, maxW: detMaxW }));
+    if (move < 8) {
+      // gleicher Bildausschnitt: nur die Lage nachführen
+      cropHm = Hn;
+      detector.updateCalibration(cropHm, img, cropView(crop, img.width, img.height));
+    } else {
+      setupCrop(updated);
+      detector.rebase(camera.grab({ crop, maxW: detMaxW }));
+    }
     camWarnings = []; drawWarnings();
     if (move >= 1) trackedUntil = performance.now() + 4000; // Hinweis nur bei spürbarer Korrektur
     return true;
