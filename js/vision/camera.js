@@ -32,12 +32,14 @@ class CameraService {
    * Geräte-IDs pro Sitzung neu – dann wird die Kamera über ihren Namen wiedergefunden.
    * this.fellBack = true, wenn die gewünschte Kamera nicht gefunden wurde.
    */
-  async start(deviceId, label) {
+  async start(deviceId, label, high = true) {
     if (!this.supported) throw new Error('Dieser Browser unterstützt keinen Kamerazugriff (HTTPS erforderlich).');
-    if (this.stream && this.track?.readyState === 'live' && (!deviceId || deviceId === this.deviceId)) return;
+    if (this.stream && this.track?.readyState === 'live' && (!deviceId || deviceId === this.deviceId) && this.high === high) return;
     this.stop();
     this.fellBack = false;
-    const size = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+    // Hohe Auflösung: Die Erkennung rechnet weiter mit einem verkleinerten Bild, die Spitze wird im feinen nachgemessen
+    this.high = high;
+    const size = high ? { width: { ideal: 3840 }, height: { ideal: 2160 }, frameRate: { ideal: 30 } } : { width: { ideal: 1920 }, height: { ideal: 1080 } };
     const open = (video) => navigator.mediaDevices.getUserMedia({ video: { ...video, ...size }, audio: false });
     if (!deviceId) {
       this.stream = await open({ facingMode: { ideal: 'environment' } });
@@ -75,6 +77,8 @@ class CameraService {
     if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
     this.stream = null;
     this.video.srcObject = null;
+    for (const f of [...(this.finePool || []), ...(this.steps || []).map((s) => ({ canvas: s.cv }))]) { f.canvas.width = f.canvas.height = 0; } // Speicher freigeben
+    this.finePool = []; this.steps = [];
   }
 
   async devices() {
@@ -133,22 +137,63 @@ class CameraService {
     // Erst das komplette Videobild zeichnen (5-Argument-Form ist auf allen Browsern
     // korrekt ausgerichtet; Quell-Rechtecke direkt aus dem Video werden auf iOS teils verzerrt),
     // dann aus dieser Kopie ausschneiden.
-    if (!this.full) {
-      this.full = document.createElement('canvas');
-      this.fullCtx = this.full.getContext('2d', { willReadFrequently: false });
-    }
-    if (this.full.width !== vw || this.full.height !== vh) { this.full.width = vw; this.full.height = vh; }
-    this.fullCtx.drawImage(this.video, 0, 0, vw, vh);
     const c = crop || { x: 0, y: 0, w: 1, h: 1 };
-    const sx = c.x * vw, sy = c.y * vh, sw = c.w * vw, sh = c.h * vh;
-    const scale = Math.min(1, maxW / sw);
-    const w = Math.max(1, Math.round(sw * scale)), h = Math.max(1, Math.round(sh * scale));
+    const scale = Math.min(1, maxW / (c.w * vw));
+    const fw = Math.max(1, Math.round(vw * scale)), fh = Math.max(1, Math.round(vh * scale));
+    // Stark verkleinern nur in Halbierungen (mittelt genau, sonst flimmern Drähte und Fasern)
+    let src = this.video, sw = vw, sh = vh, n = 0;
+    this.steps = this.steps || [];
+    const draw = (w, h, smooth) => {
+      const s = this.steps[n] || (this.steps[n] = (() => { const cv = document.createElement('canvas'); return { cv, g: cv.getContext('2d', { willReadFrequently: false }) }; })());
+      n++;
+      if (s.cv.width !== w || s.cv.height !== h) { s.cv.width = w; s.cv.height = h; }
+      s.g.imageSmoothingQuality = smooth;
+      s.g.drawImage(src, 0, 0, w, h);
+      src = s.cv; sw = w; sh = h;
+    };
+    while (sw > 1.9 * fw && sw % 2 === 0 && sh % 2 === 0) draw(sw / 2, sh / 2, 'medium');
+    if (sw !== fw || sh !== fh || src === this.video) draw(fw, fh, 'high');
+    const w = Math.max(1, Math.round(c.w * fw)), h = Math.max(1, Math.round(c.h * fh));
     if (this.canvas.width !== w || this.canvas.height !== h) { this.canvas.width = w; this.canvas.height = h; }
-    this.ctx.drawImage(this.full, sx, sy, sw, sh, 0, 0, w, h);
+    this.ctx.drawImage(src, c.x * fw, c.y * fh, c.w * fw, c.h * fh, 0, 0, w, h);
     return this.ctx.getImageData(0, 0, w, h);
   }
 
-  /** Unbearbeitetes Vollbild als JPEG-Blob (für Diagnose-Export) */
+  /**
+   * Ausschnitt so legen, dass er bei der Auswertebreite maxW genau auf Bildpunkten beginnt und endet (sonst würde beim
+   * Ausschneiden um Bruchteile eines Pixels verschoben). Liefert { crop, maxW }.
+   */
+  snapCrop(crop, maxW) {
+    const vw = this.video.videoWidth, vh = this.video.videoHeight;
+    if (!vw || !vh) return { crop, maxW };
+    const scale = Math.min(1, maxW / (crop.w * vw)), fw = Math.round(vw * scale), fh = Math.round(vh * scale);
+    const x0 = Math.round(crop.x * fw), y0 = Math.round(crop.y * fh), x1 = Math.min(fw, Math.round((crop.x + crop.w) * fw)), y1 = Math.min(fh, Math.round((crop.y + crop.h) * fh));
+    const c = { x: x0 / fw, y: y0 / fh, w: (x1 - x0) / fw, h: (y1 - y0) / fh };
+    return { crop: c, maxW: (c.w * vw * fw) / vw };
+  }
+
+  /**
+   * Der Ausschnitt in voller Kameraauflösung: nur gezeichnet (liegt als Leinwand bereit), gelesen werden später kleine
+   * Stücke. used: noch gebrauchte Bilder. Liefert { canvas, w, h } oder null.
+   */
+  grabFine(crop, used = [], maxW = 2400) {
+    if (!this.active) return null;
+    const vw = this.video.videoWidth, vh = this.video.videoHeight;
+    const s = Math.min(1, maxW / (crop.w * vw)), w = Math.round(crop.w * vw * s), h = Math.round(crop.h * vh * s);
+    this.finePool = this.finePool || [];
+    let f = this.finePool.find((q) => !used.includes(q));
+    if (!f) { f = { canvas: document.createElement('canvas') }; this.finePool.push(f); }
+    if (f.canvas.width !== w || f.canvas.height !== h) { f.canvas.width = w; f.canvas.height = h; }
+    f.w = w; f.h = h;
+    // ganzes Videobild mit Versatz zeichnen (5-Argument-Form, siehe grab)
+    const g = f.canvas.getContext('2d');
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(this.video, (-crop.x * w) / crop.w, (-crop.y * h) / crop.h, w / crop.w, h / crop.h);
+    return f;
+  }
+
+  /** Unbearbeitetes Vollbild als JPEG-Blob
+ (für Diagnose-Export) */
   async rawFrameBlob(quality = 0.92) {
     if (!this.active) return null;
     const vw = this.video.videoWidth, vh = this.video.videoHeight;

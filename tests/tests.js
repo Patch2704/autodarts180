@@ -647,6 +647,15 @@ const stressLog = [];
     const evs = []; for (let k = 0; k < 12; k++) evs.push(...go([]));
     ok(!evs.includes('dart'), 'Phantom nach der Entnahme');
   });
+  {
+    const opt = { deg: -23, tilt: -8, w: 1440, h: 2560, visits: 2, seed: 3 };
+    const on = d3.simulate({ ...opt, style: { ...d3.REAL, fine: true } }), off = d3.simulate({ ...opt, style: { ...d3.REAL, fine: true, fineOff: true } });
+    const mid = (l) => l.slice().sort((a, b) => a - b)[l.length >> 1];
+    stressLog.push('— Spitze im feinen Kamerabild —', `fein: ${on.auto}/${on.n} ohne Rückfrage richtig, Median ${mid(on.errs).toFixed(2)} mm · ohne feines Bild: ${off.auto}/${off.n}, Median ${mid(off.errs).toFixed(2)} mm`);
+    test('Feines Kamerabild: Spitze mindestens so genau wie ohne, kein falscher Treffer ohne Rückfrage', () => {
+      eq(on.wrongConfident, 0); eq(on.missed, off.missed); ok(mid(on.errs) <= mid(off.errs) + 0.05 && mid(on.errs) < 0.9, `Median ${mid(on.errs)} / ${mid(off.errs)}`);
+    });
+  }
   test('Drahtringe: verschobene Ringe werden im Leerbild gefunden und auf die Nennmaße umgerechnet', () => {
     const w = 700, h = 900, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), img = d3.realScene(cam, w, h);
     const Hp = (k) => { const M = cam.H; return [M[0] * w * k, M[1] * w * k, M[2] * w, M[3] * h * k, M[4] * h * k, M[5] * h, M[6] * k, M[7] * k, M[8]]; };

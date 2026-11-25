@@ -256,13 +256,16 @@ export async function render(root, params) {
     const cal = calibration.current;
     if (!cal) { inputMode = 'manual'; draw(); return; }
     try {
-      await camera.start(cal.deviceId || undefined, cal.label);
+      await camera.start(cal.deviceId || undefined, cal.label, settings.get('cameraHigh') !== false);
       if (camera.fellBack) toast('Die gespeicherte Kamera wurde nicht gefunden – bitte unter „Kamera“ neu kalibrieren.', 'err');
       if (cal.zoom && camera.zoomInfo()) await camera.setZoom(cal.zoom);
       camera.attach(camStage);
       // Anderes Bildformat als beim Kalibrieren (z. B. 4:3 statt 16:9) → Kalibrierung passt nicht mehr
       if (cal.aspect && Math.abs(camera.aspect - cal.aspect) > 0.02) {
         toast('Die Kamera liefert ein anderes Bildformat als beim Kalibrieren – es wird automatisch neu ausgerichtet.', 'err');
+        needReadjust = true;
+      } else if (cal.resolution?.w && camera.resolution.w && cal.resolution.w !== camera.resolution.w) {
+        // andere Auflösung: Der Bildausschnitt der Kamera kann sich leicht verschieben
         needReadjust = true;
       }
       setupCrop(cal);
@@ -295,6 +298,9 @@ export async function render(root, params) {
     const bc = boardCrop(cal.H);
     crop = res.w && res.h ? dartCrop(cal.H, res.w, res.h) : bc;
     detMaxW = Math.min(960, Math.round((640 * crop.w) / bc.w));
+    ({ crop, maxW: detMaxW } = camera.snapCrop(crop, detMaxW));
+    // Spitze im feinen Kamerabild nachmessen, wenn die Kamera mehr Bildpunkte liefert als ausgewertet werden
+    detector.fineGrab = res.w && crop.w * res.w > 1.15 * detMaxW ? (used) => camera.grabFine(crop, used) : null;
     cropHm = cropH(cal.H, crop);
     const img = camera.grab({ crop, maxW: detMaxW });
     detector.setCalibration(cropHm, img.width, img.height, cropView(crop, img.width, img.height));
@@ -322,8 +328,10 @@ export async function render(root, params) {
     // nach der Aufwärmphase Schärfe und Weißabgleich festhalten (wo der Browser das erlaubt)
     if (settingsLocked === null) { settingsLocked = false; camera.lockSettings().then((ok) => { settingsLocked = ok; }); }
     if (needReadjust) { needReadjust = false; readjust(); return; }
+    const tGrab = performance.now();
     const img = camera.grab({ crop, maxW: detMaxW });
     lastImg = img;
+    checkSpeed(performance.now() - tGrab);
     // Erst anfangen, wenn der Autofokus zur Ruhe gekommen ist: Ein unscharfes Leerbild als Referenz würde
     // später überall Kantenreste ergeben
     if (!focusReady) {
@@ -339,7 +347,7 @@ export async function render(root, params) {
     for (const ev of events) {
       // für „Erkennung speichern“: Bild vorher/nachher der letzten Pfeile (bleibt nur im Speicher)
       if (ev.type === 'dart' && detector.lastRefBefore) {
-        detLog.push({ before: detector.lastRawBefore || detector.lastRefBefore, after: img, mask: detector.mask.slice(), state: `Pfeile davor ${Math.max(0, detector.dartsOnBoard - 1)}, Ausrichtung ${detector.lastShift ? detector.lastShift.tx.toFixed(2) + '/' + detector.lastShift.ty.toFixed(2) + ' Maßstab ' + (detector.lastShift.a || 0).toFixed(5) : '–'}, Schärfe ${(detector.sharpRatio || 1).toFixed(2)}, Rauschen ${detector.noise}`, tip: { ...ev.tip }, far: ev.far ? { ...ev.far } : null, label: ev.hit.label, conf: ev.conf, reasons: ev.reasons, board: ev.board, at: Date.now() });
+        detLog.push({ fine: cutFine(ev, img), before: detector.lastRawBefore || detector.lastRefBefore, after: img, mask: detector.mask.slice(), state: `Pfeile davor ${Math.max(0, detector.dartsOnBoard - 1)}, ${ev.axis.fine ? `fein Stärke ${ev.axis.fine.strength.toFixed(1)} Spitze ${ev.axis.fine.m.toFixed(1)} mm verschoben ${ev.axis.fine.move.toFixed(1)} mm${ev.axis.fineUsed ? '' : ' (nicht übernommen)'}, ` : ''}Ausrichtung ${detector.lastShift ? detector.lastShift.tx.toFixed(2) + '/' + detector.lastShift.ty.toFixed(2) + ' Maßstab ' + (detector.lastShift.a || 0).toFixed(5) : '–'}, Schärfe ${(detector.sharpRatio || 1).toFixed(2)}, Rauschen ${detector.noise}`, tip: { ...ev.tip }, far: ev.far ? { ...ev.far } : null, label: ev.hit.label, conf: ev.conf, reasons: ev.reasons, board: ev.board, at: Date.now() });
         if (detLog.length > 3) detLog.shift();
       }
       if (ev.type === 'takeout') saveDartModel();
@@ -357,7 +365,31 @@ export async function render(root, params) {
     drawOverlay();
   }
 
+  // Kommt das Gerät mit der hohen Auflösung nicht mit, auf die normale umstellen (nur in den ersten Sekunden geprüft)
+  let grabMs = 0, grabN = 0;
+  function checkSpeed(ms) {
+    grabN++; grabMs += (ms - grabMs) / Math.min(grabN, 20);
+    if (grabN !== 60 || grabMs < 60 || !camera.high || camera.resolution.w * camera.resolution.h < 4e6) return;
+    settings.set('cameraHigh', false);
+    toast('Das Gerät ist für die hohe Kameraauflösung zu langsam – es wird auf die normale umgestellt (Einstellungen → „Hohe Kameraauflösung“).', 'err');
+    startCamera();
+  }
+
+  /** Ausschnitt um den Pfeil in Kameraauflösung
+ (davor und danach) für „Erkennung speichern“ */
+  const FINE = 672;
+  function cutFine(ev, img, before = detector.lastFineBefore, after = detector.curFine) {
+    if (!before || !after) return null;
+    try {
+      const k = after.w / img.width, cx = ev ? ((ev.tip.x * img.width + ev.far.x) / 2) * k : after.w / 2, cy = ev ? ((ev.tip.y * img.height + ev.far.y) / 2) * k : after.h / 2;
+      const s = Math.min(FINE, after.w, after.h), x = Math.max(0, Math.min(after.w - s, Math.round(cx - s / 2))), y = Math.max(0, Math.min(after.h - s, Math.round(cy - s / 2)));
+      const cut = (f) => f.canvas.getContext('2d').getImageData(x, y, s, s);
+      return { k, s, x, y, before: cut(before), after: cut(after) };
+    } catch { return null; }
+  }
+
   const warnStreak = {};
+
   let trackFails = 0, trackedUntil = 0, trackedOnce = false;
   function checkHealth(img) {
     const cal = calibration.current;
@@ -426,7 +458,7 @@ export async function render(root, params) {
       if (q < 0.85) { toast(`Nachjustieren hat nicht gereicht (${Math.round(q * 100)} %) – bitte unter „Kamera“ neu kalibrieren.`, 'err'); return; }
       const c = boardCrop(r.H);
       const cropImg = camera.grab({ crop: c, maxW: 640 });
-      const updated = { ...cal, H: r.H, points: r.points, aspect: camera.aspect, quality: q, cropQuality: calibrationQuality(cropImg, cropH(r.H, c)).score, brightness: frameMetrics(cropImg).brightness, createdAt: Date.now(), version: 3 };
+      const updated = { ...cal, H: r.H, points: r.points, aspect: camera.aspect, resolution: camera.resolution, quality: q, cropQuality: calibrationQuality(cropImg, cropH(r.H, c)).score, brightness: frameMetrics(cropImg).brightness, createdAt: Date.now(), version: 3 };
       await calibration.save(updated);
       setupCrop(updated);
       detector.rebase(camera.grab({ crop, maxW: detMaxW }));
@@ -483,6 +515,19 @@ export async function render(root, params) {
   }
 
   // ---------- Darstellung ----------
+  /** Was als Nächstes zu treffen ist (für die freien Dart-Felder): ab 170 Rest der beste Weg zum Finish */
+  function targetPlan(st) {
+    const p = st.currentPlayer;
+    if (match.status !== 'running' || p == null || isBot(p)) return [];
+    if (!st.current.isIn[p]) return [{ label: 'D', note: 'Einstieg' }];
+    const rem = st.current.rem[p], left = 3 - st.dartsInVisit;
+    if (rem > 180 || left < 1) return [];
+    const info = checkoutInfo(rem, left, match.settings);
+    if (info.possible) return info.routes[0].darts.map((d, i, l) => ({ label: d.label, note: i === l.length - 1 ? 'Finish' : null }));
+    // mit den restlichen Darts nicht zu beenden: Feld, das einen guten Rest stehen lässt
+    return rem <= 170 && info.setup ? [{ label: info.setup.dart.label, note: `lässt ${info.setup.leave}` }] : [];
+  }
+
   function draw() {
     if (destroyed) return;
     const st = replay(match);
@@ -522,42 +567,26 @@ export async function render(root, params) {
     const ov = st.openVisit;
     const li = match.legs.length - 1;
     const vi = ov ? match.legs[li].visits.length - 1 : -1;
+    // geworfene Darts; in den freien Feldern steht der Weg zum Finish (nach jedem Wurf neu berechnet)
+    const plan = targetPlan(st);
+    const thrown = ov?.darts.length || 0;
     for (let k = 0; k < 3; k++) {
-      const d = ov?.darts[k];
+      const d = ov?.darts[k], t = plan[k - thrown];
       if (d) {
         visitEl.append(h('div', { class: `dslot pop ${d.bust ? 'bust' : ''}`, title: 'Antippen zum Korrigieren', onclick: () => editDart(li, vi, k) },
           d.source === 'camera' ? icon('camera', 'cam') : null, d.label, h('small', {}, d.points)));
+      } else if (t) {
+        visitEl.append(h('div', { class: 'dslot empty target', title: 'Vorgeschlagenes Feld' }, t.label, h('small', {}, t.note || `Dart ${k + 1} · Ziel`)));
       } else {
         visitEl.append(h('div', { class: 'dslot empty' }, '–', h('small', {}, `Dart ${k + 1}`)));
       }
     }
     visitEl.append(h('div', { class: 'vsum' }, ov ? ov.scored : 0, h('small', {}, 'Aufnahme')));
 
-    // Checkout
+    // Match beendet
     clear(checkoutEl);
     if (match.status === 'finished') {
       checkoutEl.append(h('div', { class: 'checkout' }, h('span', { class: 'lbl' }, 'Match beendet'), h('span', { class: 'route' }, `${match.players[match.winner].name} gewinnt`)));
-    } else if (p != null) {
-      const rem = cur.rem[p];
-      const dartsLeft = 3 - st.dartsInVisit;
-      if (!cur.isIn[p]) {
-        checkoutEl.append(h('div', { class: 'checkout none' }, h('span', { class: 'lbl' }, 'Double-In'), h('span', { class: 'route' }, 'Doppel zum Einstieg treffen')));
-      } else if (rem <= 180) {
-        const info = checkoutInfo(rem, dartsLeft, s);
-        if (info.possible) {
-          const [best, ...alts] = info.routes;
-          checkoutEl.append(h('div', { class: 'checkout' },
-            h('span', { class: 'lbl' }, `Checkout ${rem}`),
-            h('span', { class: 'route' }, best.darts.map((d) => d.label).join(' → ')),
-            alts.length ? h('div', { class: 'alts' }, 'Alternativen: ', alts.map((r) => r.darts.map((d) => d.label).join(' → ')).join('  ·  ')) : null));
-        } else {
-          checkoutEl.append(h('div', { class: 'checkout none' },
-            h('span', { class: 'lbl' }, `Rest ${rem}`),
-            h('span', { class: 'route', style: { fontSize: '17px' } }, `Kein Checkout mit ${dartsLeft} Dart${dartsLeft > 1 ? 's' : ''}${info.setup ? ` – Vorschlag: ${info.setup.dart.label} (Rest ${info.setup.leave})` : ''}`)));
-        }
-      } else {
-        checkoutEl.append(h('div', { class: 'checkout none' }, h('span', { class: 'lbl' }, `${match.players[p].name} ist dran`), h('span', { class: 'route', style: { fontSize: '17px' } }, `Noch ${rem - 170} Punkte bis zum Finish-Bereich`)));
-      }
     }
 
     drawPending();
@@ -590,13 +619,12 @@ export async function render(root, params) {
     drawOverlay();
   }
 
-  // Diagnosebilder der letzten (bis zu 3) erkannten Pfeile und des aktuellen Zustands, je ein Bild (höchstens
-  // 1024 px, damit nichts verkleinert wird): Ausschnitte in voller Auflösung ohne eingezeichnete Linien, darunter
-  // die Übersicht. Bleibt lokal, bis du es selbst weitergibst.
+  // Diagnosebilder der letzten (bis zu 3) erkannten Pfeile und des aktuellen Zustands, je ein Bild (2048 px breit):
+  // Ausschnitte in Kameraauflösung ohne eingezeichnete Linien, darunter die Übersicht. Bleibt lokal, bis du es selbst weitergibst.
   async function exportDetections() {
     const now = lastImg && detector.diagnose(lastImg);
     const rows = detLog.slice();
-    if (now) rows.push({ before: now.empty, after: lastImg, mask: now.mask, state: now.text, now: true });
+    if (now) rows.push({ before: now.empty, after: lastImg, mask: now.mask, state: now.text, now: true, fine: detector.fineGrab && detector.emptyFine ? cutFine(null, lastImg, detector.emptyFine, camera.grabFine(crop, [detector.refFine, detector.emptyFine])) : null });
     if (!rows.length) { toast('Noch kein Bild vorhanden'); return; }
     const version = (await globalThis.caches?.keys?.().catch(() => []) || []).filter((k) => k.startsWith('autodarts180')).join(' ');
     const toCanvas = (data, w, hh) => { const c = document.createElement('canvas'); c.width = w; c.height = hh; c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(data), w, hh), 0, 0); return c; };
@@ -607,23 +635,36 @@ export async function render(root, params) {
       const m = new Uint8ClampedArray(e.after.data);
       for (let p = 0; p < e.mask.length; p++) if (e.mask[p]) { m[p * 4] = 255; m[p * 4 + 1] = 0; m[p * 4 + 2] = 255; }
       const mask = toCanvas(m, w, hh);
-      const S = 336, head = 64, ov = 504, oh = Math.round((ov * hh) / w), c = document.createElement('canvas');
-      c.width = 1024; c.height = Math.min(1024, head + S + 8 + oh);
+      // oben: Ausschnitte um den Pfeil (bzw. die Scheibenmitte) in Kameraauflösung, sonst in Auswerteauflösung
+      const S = 672, head = 64, ov = 1016, oh = Math.round((ov * hh) / w), c = document.createElement('canvas');
+      c.width = 2048; c.height = head + S + 16 + oh;
       const g = c.getContext('2d');
       g.fillStyle = '#111'; g.fillRect(0, 0, c.width, c.height);
-      // oben: 1:1-Ausschnitte um den Pfeil (bzw. die Scheibenmitte)
       const cx = e.tip ? (e.tip.x * w + (e.far ? e.far.x : e.tip.x * w)) / 2 : w / 2, cy = e.tip ? (e.tip.y * hh + (e.far ? e.far.y : e.tip.y * hh)) / 2 : hh / 2;
-      const x0 = Math.max(0, Math.min(w - S, Math.round(cx - S / 2))), y0 = Math.max(0, Math.min(hh - S, Math.round(cy - S / 2)));
-      [before, after, mask].forEach((img, k) => g.drawImage(img, x0, y0, S, S, k * (S + 8), head, S, S));
+      let x0, y0, s, k = 1; // Ausschnitt in Auswertepixeln
+      g.imageSmoothingEnabled = false;
+      if (e.fine) {
+        k = e.fine.k; s = e.fine.s / k; x0 = e.fine.x / k; y0 = e.fine.y / k;
+        const b = toCanvas(e.fine.before.data, e.fine.s, e.fine.s), f = toCanvas(e.fine.after.data, e.fine.s, e.fine.s);
+        [b, f, f].forEach((img, n) => g.drawImage(img, 0, 0, e.fine.s, e.fine.s, n * (S + 16), head, S, S));
+      } else {
+        s = 336; x0 = Math.max(0, Math.min(w - s, Math.round(cx - s / 2))); y0 = Math.max(0, Math.min(hh - s, Math.round(cy - s / 2)));
+        [before, after, after].forEach((img, n) => g.drawImage(img, x0, y0, s, s, n * (S + 16), head, S, S));
+      }
+      // rechts die erkannte Veränderung darübergelegt
+      const only = new Uint8ClampedArray(w * hh * 4);
+      for (let p = 0; p < e.mask.length; p++) if (e.mask[p]) { only[p * 4] = 255; only[p * 4 + 2] = 255; only[p * 4 + 3] = 150; }
+      g.drawImage(toCanvas(only, w, hh), x0, y0, s, s, 2 * (S + 16), head, S, S);
+      g.imageSmoothingEnabled = true;
       // unten: Übersicht, die Spitze nur hier eingezeichnet
-      g.drawImage(after, 0, 0, w, hh, 0, head + S + 8, ov, oh);
-      g.drawImage(mask, 0, 0, w, hh, ov + 8, head + S + 8, ov, oh);
-      if (e.tip) { const tx = e.tip.x * ov, ty = head + S + 8 + e.tip.y * oh; g.strokeStyle = '#00e5ff'; g.lineWidth = 1.5; g.beginPath(); g.arc(tx, ty, 8, 0, 2 * Math.PI); g.stroke(); }
-      g.fillStyle = '#fff'; g.font = 'bold 15px system-ui, sans-serif';
-      g.fillText(e.now ? `Jetzt (links: leere Scheibe) · ${version}` : `${i + 1}. erkannt: ${e.label} (${Math.round(e.conf * 100)} %)  x ${e.board.x.toFixed(1)} / y ${e.board.y.toFixed(1)} mm · Spitze im Ausschnitt ${Math.round(e.tip.x * w - x0)}, ${Math.round(e.tip.y * hh - y0)} · ${version}`, 6, 18, 1012);
-      g.font = '12px system-ui, sans-serif';
-      if (!e.now) g.fillText(e.reasons.join(', ') || 'keine Auffälligkeiten', 6, 38, 1012);
-      g.fillText(`${w}×${hh} · ${e.state || ''}`, 6, 56, 1012);
+      g.drawImage(after, 0, 0, w, hh, 0, head + S + 16, ov, oh);
+      g.drawImage(mask, 0, 0, w, hh, ov + 16, head + S + 16, ov, oh);
+      if (e.tip) { const tx = e.tip.x * ov, ty = head + S + 16 + e.tip.y * oh; g.strokeStyle = '#00e5ff'; g.lineWidth = 2; g.beginPath(); g.arc(tx, ty, 16, 0, 2 * Math.PI); g.stroke(); }
+      g.fillStyle = '#fff'; g.font = 'bold 20px system-ui, sans-serif';
+      g.fillText(e.now ? `Jetzt (links: leere Scheibe) · ${version}` : `${i + 1}. erkannt: ${e.label} (${Math.round(e.conf * 100)} %)  x ${e.board.x.toFixed(1)} / y ${e.board.y.toFixed(1)} mm · Spitze im Ausschnitt ${Math.round(((e.tip.x * w - x0) * S) / s)}, ${Math.round(((e.tip.y * hh - y0) * S) / s)} · ${version}`, 8, 20, 2032);
+      g.font = '15px system-ui, sans-serif';
+      if (!e.now) g.fillText(e.reasons.join(', ') || 'keine Auffälligkeiten', 8, 40, 2032);
+      g.fillText(`${w}×${hh} · Kamera ${camera.resolution.w}×${camera.resolution.h}, Bild holen ${Math.round(grabMs)} ms · Ausschnitt ab ${x0.toFixed(1)}, ${y0.toFixed(1)}, ${(S / s).toFixed(2)}× · ${e.state || ''}`, 8, 59, 2032);
       const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.95));
       if (blob) files.push(new File([blob], `autodarts180-${stamp}-${e.now ? 'jetzt' : i + 1}.jpg`, { type: 'image/jpeg' }));
     }

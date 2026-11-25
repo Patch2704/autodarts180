@@ -7,11 +7,11 @@
   const seeds = (new URLSearchParams(location.search).get('seeds') || '101').split(',').map(Number);
   const lines = [];
   window.__rows = [];
-  const real = new URLSearchParams(location.search).get('real');
+  const real = new URLSearchParams(location.search).get('real'), fine = new URLSearchParams(location.search).get('fine'); // fine=1: Kamerabild 1440x2560, Spitze im feinen Bild; fine=0: gleiches Bild ohne feines Nachmessen
   for (const seed of seeds) await benchmark(seed, (r) => {
     window.__rows.push(r);
     lines.push(`[${seed}] ${r.label}: n ${r.n} | ohne Rückfrage richtig ${r.auto} | Rückfrage richtig/falsch ${r.askOk}/${r.askWrong} | FALSCH OHNE RÜCKFRAGE ${r.wrongConfident} | verpasst ${r.missed} | Phantom ${r.phantom} | Takeout fehlt ${r.noTakeout} | Ø ${r.mean.toFixed(2)} mm`, ...r.bad.map((b) => '      ' + b));
     out.textContent = lines.join('\n');
-  }, real ? { scenarios: REAL_SCENARIOS.filter((_, i) => real === 'all' || real.includes(String(i))), cameras: REAL_CAMERAS } : { scenarios: SCENARIOS, cameras: CAMERAS });
+  }, real ? { scenarios: REAL_SCENARIOS.filter((_, i) => real === 'all' || real.includes(String(i))).map(([l, st]) => (fine === null ? [l, st] : [l, { ...st, fine: true, fineOff: fine === '0' }])), cameras: REAL_CAMERAS, ...(fine === null ? {} : { size: { w: 1440, h: 2560 } }) } : { scenarios: SCENARIOS, cameras: CAMERAS });
   window.__done = true; lines.push('FERTIG'); out.textContent = lines.join('\n');
 </script></body></html>

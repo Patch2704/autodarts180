@@ -272,13 +272,33 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
   // Wackeln pro Bild (style.jitter) und bleibendes Verrutschen nach Treffern/Ziehen (style.slip), in Vollbild-px
   let sx0 = 0, sy0 = 0;
   const slip = () => { if (style.disturb) field = disturbField(rng, style.disturb); if (style.slip) { sx0 = (rng() - 0.5) * 2 * style.slip; sy0 = (rng() - 0.5) * 2 * style.slip; } };
-  const grab = (darts) => grabCrop(addNoiseFast(drawn(darts), style.noise || noise, frameSeed++), crop, detMaxW, sx0 + (style.jitter ? gaussian(rng) * style.jitter : 0), sy0 + (style.jitter ? gaussian(rng) * style.jitter : 0));
+  let fineNow = null;
+  const grab = (darts) => {
+    const img = addNoiseFast(drawn(darts), style.noise || noise, frameSeed++), z = style.fine ? w / 720 : 1; // Wackeln in px des Standardbilds
+    const ox = (sx0 + (style.jitter ? gaussian(rng) * style.jitter : 0)) * z, oy = (sy0 + (style.jitter ? gaussian(rng) * style.jitter : 0)) * z;
+    if (style.fine) fineNow = () => grabCrop(img, crop, 1e9, ox, oy);
+    return grabCrop(img, crop, detMaxW, ox, oy);
+  };
+
   // die Störung ändert sich mit jedem Ereignis (Treffer, Ziehen), nicht mit jedem Bild
   let field = style.disturb ? disturbField(rng, style.disturb) : null;
   // Autofokus beim Start noch nicht fertig: erste Bilder weicher (mehrfach geglättet), danach scharf
   let softStart = style.softStart || 0;
   const focus = (img) => { let o = img; for (let k = 0; k < softStart; k++) o = soften(o); return o; };
   const frame = (darts) => focus(field ? disturb(grab(darts), field) : grab(darts));
+  // feines Bild wie im Spiel (volle Kameraauflösung), nur wenn das Bild größer ist als die Auswertung
+  const finePool = [];
+  if (style.fine && !style.fineOff) {
+    det.fineGrab = (used) => {
+      if (!fineNow) return null;
+      let c = finePool.find((q) => !used.includes(q));
+      if (!c) finePool.push((c = { canvas: document.createElement('canvas') }));
+      const g = fineNow();
+      c.w = c.canvas.width = g.width; c.h = c.canvas.height = g.height;
+      c.canvas.getContext('2d', { willReadFrequently: true }).putImageData(g, 0, 0);
+      return c;
+    };
+  }
   const first = frame([]);
   det.setCalibration(Hc, first.width, first.height, detectorOpts.noView ? null : cropView(crop, first.width, first.height));
   let startPhantom = 0;
@@ -382,13 +402,13 @@ export const REAL_SCENARIOS = [['echt: verteilt', REAL], ['echt: ohne Wackeln', 
 export const REAL_CAMERAS = [[-23, -8], [-20, 0], [25, -5], [-30, 5], [23, 8]];
 export const CAMERAS = [[30, 0], [-30, 0], [45, 0], [-45, 0], [55, 0], [-55, 0], [45, 15], [-45, -15]];
 
-export async function benchmark(seed, onRow = () => {}, { scenarios = SCENARIOS, cameras = CAMERAS, visits = 4 } = {}) {
+export async function benchmark(seed, onRow = () => {}, { scenarios = SCENARIOS, cameras = CAMERAS, visits = 4, size = null } = {}) {
   const rows = [];
   for (const [label, style] of scenarios) {
     const r = { label, seed, n: 0, auto: 0, askOk: 0, askWrong: 0, wrongConfident: 0, missed: 0, phantom: 0, noTakeout: 0, errs: [], bad: [] };
     for (const [deg, tilt] of cameras) {
       await new Promise((res) => { const c = new MessageChannel(); c.port1.onmessage = res; c.port2.postMessage(0); });
-      const s = simulate({ deg, tilt, visits, seed, style, log: ({ t, ev, e, k }) => { if (ev.conf >= 0.6 && ev.hit.label !== scoreAt(t.x, t.y).label) r.bad.push(`${deg}/${tilt} P${k + 1} ${scoreAt(t.x, t.y).label}→${ev.hit.label} e=${e.toFixed(1)} c${Math.round(ev.conf * 100)} [${ev.reasons}]`); } });
+      const s = simulate({ deg, tilt, visits, seed, style, ...(size || {}), log: ({ t, ev, e, k }) => { if (ev.conf >= 0.6 && ev.hit.label !== scoreAt(t.x, t.y).label) r.bad.push(`${deg}/${tilt} P${k + 1} ${scoreAt(t.x, t.y).label}→${ev.hit.label} e=${e.toFixed(1)} c${Math.round(ev.conf * 100)} [${ev.reasons}]`); } });
       for (const key of ['n', 'auto', 'askOk', 'askWrong', 'wrongConfident', 'missed', 'phantom']) r[key] += s[key];
       r.noTakeout += s.noTakeout || 0; r.errs.push(...s.errsConf);
     }

@@ -11,6 +11,7 @@ const DEFAULTS = {
   theme: 'dark',
   accent: 'green',
   keepAwake: true,
+  cameraHigh: true,
   confThreshold: 0.6,
   collectSamples: false,
   mainPlayer: null,

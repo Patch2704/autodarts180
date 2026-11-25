@@ -1,7 +1,7 @@
 // Kamera: Kalibrierung (Homographie per 4 Punkten, Auto-Erkennung, Feinjustierung, Qualität) und Erkennungstest
 import { h, icon, clear, toast, segControl } from '../dom.js';
 import { camera } from '../../vision/camera.js';
-import { calibration } from '../../state.js';
+import { calibration, settings } from '../../state.js';
 import {
   CAL_LABELS, homographyFromPoints, pointsFromH, rotateH, scaleH, autoCalibrate, refineOrAuto,
   calibrationQuality, boardVisibility, frameMetrics, boardCrop, cropH, uncropPoint, trackFrame, sharpness, edgeRefine,
@@ -100,8 +100,9 @@ export async function render(root) {
 
   async function start(deviceId) {
     try {
-      if (deviceId) await camera.start(deviceId);
-      else await camera.start(calibration.current?.deviceId || undefined, calibration.current?.label);
+      const high = settings.get('cameraHigh') !== false;
+      if (deviceId) await camera.start(deviceId, null, high);
+      else await camera.start(calibration.current?.deviceId || undefined, calibration.current?.label, high);
     } catch (e) {
       toast(`Kamera konnte nicht gestartet werden: ${e.message}`, 'err');
       return;

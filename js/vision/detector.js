@@ -4,6 +4,7 @@
 // Homographie auf Scheibenebene → Segment. Unsichere Ergebnisse werden als solche gemeldet.
 import { applyH, invertH } from './homography.js';
 import { estimateTransform, warpRef, applyT, luminance, IDENTITY } from './align.js';
+import { fineTip } from './finetip.js';
 import { scoreAt, R } from '../core/board.js';
 
 const DEFAULTS = {
@@ -424,7 +425,7 @@ export class DartDetector {
   }
 
   reset() {
-    this.ref = null; this.emptyRef = null; this.prev = null;
+    this.ref = null; this.emptyRef = null; this.prev = null; this.refFine = null; this.emptyFine = null; this.lastFineBefore = null;
     this.stable = 0; this.hadMotion = false;
     this.dartsOnBoard = 0; this.awaitingTakeout = false;
     this.checkNow = false; this.bigMotion = false; this.calm = 0; this.goneFrames = 0; this.needClear = 0; this.round = this.round || 0; // round zählt die Entnahmen (läuft weiter)
@@ -470,8 +471,9 @@ export class DartDetector {
   /** Aktuelles Bild wird neue Referenz (z. B. "Pfeile entfernt" manuell bestätigt) */
   rebase(img) {
     const raw = img.data.slice(), c = softImage(raw, this.w, this.h);
+    this.takeFine();
     this.setEmpty(c);
-    this.ref = c; this.refRaw = raw; this.prev = raw;
+    this.ref = c; this.refRaw = raw; this.prev = raw; this.refFine = this.curFine;
     this.round = (this.round || 0) + 1; this.bigMotion = false;
     this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.stable = 0; this.clearOcc(); this.needClear = 0;
     this.lastRefBefore = null;
@@ -484,7 +486,7 @@ export class DartDetector {
       const T = estimateTransform(c, this.calibRef, this.w, this.h, this.planeIdx, this.T0);
       if (T.ok) this.T0 = T;
     }
-    this.emptyRef = c;
+    this.emptyRef = c; this.emptyFine = this.curFine;
     // Drahtringe nachmessen (nur solange das Bild noch genau auf der Kalibrierung liegt)
     if (!this.rings || this.drift() < 0.7) {
       const rings = measureRings(rawOf.get(c) || c, this.w, this.h, this.Hpx), found = (l) => l.filter((q) => q[1] !== 0).length;
@@ -492,7 +494,15 @@ export class DartDetector {
     }
   }
 
+  /** Feines Bild zum aktuellen Bild holen (volle Kameraauflösung; nur gezeichnet, gelesen wird später ein kleiner Ausschnitt) */
+  takeFine() {
+    this.curFine = null;
+    if (!this.fineGrab) return;
+    try { this.curFine = this.fineGrab([this.refFine, this.emptyFine].filter(Boolean)); } catch { this.curFine = null; }
+  }
+
   /** Referenz passend zum aktuellen Bild ausrichten: { img, T } */
+
   alignTo(data, ref) {
     const s = this.estimateShift(data, ref);
     const T = estimateTransform(data, ref, this.w, this.h, this.planeIdx, { tx: s.dx, ty: s.dy });
@@ -539,7 +549,7 @@ export class DartDetector {
         if (++this.goneFrames >= 1) {
           const soft = softImage(data.slice(), this.w, this.h), E = this.alignTo(soft, this.emptyRef);
           if (E.ok && this.matchShare(soft, E.img) > 0.7 && this.allGone(soft, E, 0.85)) {
-            this.ref = this.emptyRef; this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.clearOcc();
+            this.ref = this.emptyRef; this.refFine = this.emptyFine; this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.clearOcc();
             this.lastRefBefore = null; this.status = 'bereit'; this.round++; this.bigMotion = false;
             this.calm = 0; this.goneFrames = 0; this.stable = 0; this.hadMotion = true; this.lastEval = null;
             this.needClear = 2; // die Hand kann noch im Bild sein: neue Pfeile erst nach Bestätigung durch ein zweites Bild
@@ -710,7 +720,7 @@ export class DartDetector {
     const manual = !fast && this.awaitingTakeout && !this.dartMem.length && this.bigMotion && frac < 0.02;
     if (!empty && !gone && !manual) return null;
     const done = empty || manual;
-    if (done) { this.setEmpty(data); this.ref = data; this.refRaw = raw; } else this.ref = this.emptyRef;
+    if (done) { this.takeFine(); this.setEmpty(data); this.ref = data; this.refRaw = raw; this.refFine = this.curFine; } else { this.ref = this.emptyRef; this.refFine = this.emptyFine; }
     this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.clearOcc();
     this.lastRefBefore = null;
     this.status = 'bereit';
@@ -737,7 +747,7 @@ export class DartDetector {
     if (!this.dartsOnBoard && !events.length && this.ref !== this.emptyRef) {
       const m = this.matchSharpness(data, E.img);
       this.buildMask(m.a, m.b, null);
-      if (this.looksEmpty()) { this.setEmpty(data); this.ref = data; this.refRaw = raw; this.status = 'bereit'; return events; }
+      if (this.looksEmpty()) { this.takeFine(); this.setEmpty(data); this.ref = data; this.refRaw = raw; this.refFine = this.curFine; this.status = 'bereit'; return events; }
     }
     // Referenz auf Bruchteile eines Pixels ausrichten (Stativ wackelt, Scheibe verrutscht minimal)
     const A = this.ref === this.emptyRef ? E : this.alignTo(data, this.ref);
@@ -752,7 +762,8 @@ export class DartDetector {
       this.status = 'bereit'; this.needClear = 0;
       // minimale Drift (Licht, leichtes Verrutschen) in die Referenz übernehmen
       const wasEmptyRef = this.ref === this.emptyRef; // sonst kann ein nicht erkannter Pfeil im Bild sein
-      this.ref = data; this.refRaw = raw;
+      this.takeFine();
+      this.ref = data; this.refRaw = raw; this.refFine = this.curFine;
       if (!this.dartsOnBoard && wasEmptyRef) this.setEmpty(data);
       return events;
     }
@@ -762,7 +773,8 @@ export class DartDetector {
       if (this.largeChangeCount >= 3) {
         // dauerhafte Veränderung ohne Pfeil (Licht, verschobene Kamera) → neue Referenz
         this.largeChangeCount = 0;
-        this.ref = data; this.refRaw = raw;
+        this.takeFine();
+        this.ref = data; this.refRaw = raw; this.refFine = this.curFine;
         if (this.dartsOnBoard === 0) this.setEmpty(data);
         return [...events, { type: 'lighting' }];
       }
@@ -782,8 +794,10 @@ export class DartDetector {
       return [...events, { type: 'moving' }];
     }
     this.movingCount = 0;
-    this.lastRefBefore = this.ref; this.lastRawBefore = this.refRaw;
-    this.ref = data; this.refRaw = raw;
+    this.takeFine();
+    for (const det of dets) this.refineFine(det);
+    this.lastRefBefore = this.ref; this.lastRawBefore = this.refRaw; this.lastFineBefore = this.refFine;
+    this.ref = data; this.refRaw = raw; this.refFine = this.curFine;
     this.status = 'bereit';
     if (!dets.length) {
       return [...events, { type: 'unclear' }];
@@ -803,7 +817,39 @@ export class DartDetector {
     return events;
   }
 
-  /** War die Veränderung im Bild davor schon genauso da? (Referenz oder jetziges Bild – woran ist es näher?) */
+  /** Bildpunkt (grobe px) → Scheibe (mm), Verrutschen und Drahtringe eingerechnet */
+  boardAt(p) { const c = this.toCalib(p.x, p.y), q = applyH(this.Hinv, c.x + 0.5, c.y + 0.5); return ringAdjust(this.rings, q.x, q.y); }
+
+  /** Spitze im feinen Bild nachmessen */
+  refineFine(det) {
+    const a = det.axis;
+    if (!this.curFine || !this.refFine || this.curFine === this.refFine || !a.fineOk) return;
+    const r = fineTip({ cur: this.curFine, ref: this.refFine, w: this.w, T: this.pair.T, tip: det.tipPx, dir: a.dir, L: Math.hypot(det.tipPx.x - det.far.x, det.tipPx.y - det.far.y), pxPerMm: this.pxPerMm });
+    if (!r) return;
+    const mm = Math.hypot(r.tip.x - det.tipPx.x, r.tip.y - det.tipPx.y) / this.pxPerMm;
+    r.board = this.boardAt(r.tip); r.move = mm;
+    a.fine = r;
+    // Nur eine klar sichtbare Spitze vor einem klar sichtbaren Barrel zählt; große Sprünge nur bei sehr klarem Signal
+    if (r.strength < 8 || r.m < 2.5 || r.Wb < 4 || r.Wb > 10.5 || mm > (r.strength > 15 ? 9 : 5)) return;
+    const b = r.board;
+    if (!Number.isFinite(b.x)) return;
+    const hit = scoreAt(b.x, b.y);
+    const p = this.fieldProbability(r.tip, b, hit, a.dir.x, a.dir.y, 1, { sure: true, sigma: (r.strength > 15 ? 0.6 : 1) * this.pxPerMm, tail: 0, tailWeight: 0, toBoard: (q) => this.boardAt(q) });
+    const f0 = Math.max(1e-3, a.pField) ** 1.6, ringF = (h) => (h.r > 170 ? 0.55 : 1);
+    det.conf = Math.max(0, Math.min(1, (det.conf / f0 / (a.lift || 1) ** (r.strength > 15 && r.m > 3.5 ? 1 : 0.5) / ringF(det.hit)) * p.p ** 1.6 * ringF(hit)));
+    det.reasons = det.reasons.filter((t) => !/Draht|Spitze kaum|kontrastarmes|knapp außerhalb|außerhalb der Wertung|Form wenig|nicht unterscheidbar|nur teilweise|nur ein kurzes/.test(t));
+    if (p.p < 0.93) det.reasons.push(p.p < 0.75 ? 'direkt am Draht' : 'nahe am Draht');
+    if (hit.r > 170) det.reasons.push(hit.r < 190 ? 'knapp außerhalb des Doppels' : 'außerhalb der Wertungsfläche');
+    if (det.reasons.some((t) => /mehrere neue|zwei Pfeile/.test(t))) det.conf = Math.min(det.conf, 0.55);
+    det.tipPx = { x: r.tip.x, y: r.tip.y };
+    det.tip = { x: (r.tip.x + 0.5) / this.w, y: (r.tip.y + 0.5) / this.h };
+    det.board = { x: b.x, y: b.y };
+    det.hit = { seg: hit.seg, mult: hit.mult, score: hit.score, label: hit.label, wireDist: hit.wireDist, r: hit.r };
+    a.fineUsed = true;
+  }
+
+  /** War die Veränderung im Bild davor
+ schon genauso da? (Referenz oder jetziges Bild – woran ist es näher?) */
   settled(px) {
     const { w, h, cur, refImg } = this, p = this.prevFrame, W = w * 4;
     // Versatz zum Bild davor (Stativ schwingt): ganze Pixel an der Scheibe
@@ -1268,7 +1314,7 @@ export class DartDetector {
       // In der Gruppe ist der neue Pfeil oft nur teilweise sichtbar: kürzer als ein ganzer Pfeil
       // oder kontrastarmes Spitzenende → eher nachfragen
       if (det.axis.expLen > 12 && det.axis.length < 1.5 * det.axis.expLen) { det.conf *= det.axis.soft(0.6); det.reasons.push('in der Gruppe nur teilweise sichtbar'); }
-      if (det.axis.endContrast < 45) det.conf *= det.axis.soft(0.75);
+      if (det.axis.endContrast < 45) { det.conf *= det.axis.soft(0.75); det.axis.lift *= det.axis.soft(0.75); }
     }
     // kleine Veränderung: nur als Pfeil werten, wenn sie deutlich länglich ist
     if (pixels.length < this.opts.smallDartFraction * this.roi.length) {
@@ -1277,7 +1323,7 @@ export class DartDetector {
         if (fresh < this.opts.smallDartFraction * this.roi.length || !(Math.hypot(det.board.x, det.board.y) < 200)) return null;
         det.conf = Math.min(det.conf, 0.4);
       }
-      det.conf *= 0.6; det.reasons.push('nur teilweise sichtbar');
+      det.conf *= 0.6; det.axis.lift *= 0.7; det.reasons.push('nur teilweise sichtbar');
     }
     return det;
   }
@@ -1700,7 +1746,7 @@ export class DartDetector {
     // Einstichstelle aus Barrelende + Länge der Stahlspitze (gemessen, wo sie zu sehen ist, sonst gelernt)
     const tm = geoStrong && front && !axisFromModel ? this.tipModel(tipPx, front.dx, front.dy, altPx) : null;
     if (tm) tipPx = tm.tip;
-    const toBoard = (p) => { const c = this.toCalib(p.x, p.y), q = applyH(this.Hinv, c.x + 0.5, c.y + 0.5); return ringAdjust(this.rings, q.x, q.y); };
+    const toBoard = (p) => this.boardAt(p);
     let tipB = toBoard(tipPx), altB = toBoard(altPx);
     let usedAlt = false;
     const rTip = Math.hypot(tipB.x, tipB.y), rAlt = Math.hypot(altB.x, altB.y);
@@ -1720,6 +1766,7 @@ export class DartDetector {
     // Konfidenz aus nachvollziehbaren Faktoren
     const reasons = [];
     let conf = 1;
+    let lift = 1; // Abzüge, die nur von der schlecht sichtbaren Spitze kommen (entfallen, wenn das feine Bild sie zeigt)
     if (geoStrong) {
       // Richtung aus Geometrie; Form nur als Zusatzkontrolle
       if (elong < 2.5 && !axisFromModel) conf *= 0.85;
@@ -1730,9 +1777,9 @@ export class DartDetector {
       if (thinIsMin !== tipAtMin && widthRatio < 0.6) { conf *= 0.85; reasons.push('Form widerspricht Pfeilrichtung'); }
       if (dirConflict) { conf *= 0.6; reasons.push('Pfeilrichtung unklar'); }
       // beide Enden gleich breit und die Neigung nicht deutlich verschieden → evtl. nur Flight oder nur Barrel zu sehen
-      if (widthRatio > 0.8 && !axisFromModel && tOther - tBest < 35 && !(tm && agree)) { conf *= 0.55; reasons.push('Spitze/Flight nicht unterscheidbar'); }
+      if (widthRatio > 0.8 && !axisFromModel && tOther - tBest < 35 && !(tm && agree)) { conf *= 0.55; lift *= 0.55; reasons.push('Spitze/Flight nicht unterscheidbar'); }
       // kurzes Stück ohne klar breites Ende: Die Neigung allein entscheidet dann nicht sicher, wo die Spitze ist
-      else if (widthRatio > 0.5 && visRatio < 0.9 && !axisFromModel && !priorDecided && tOther - tBest < 30) { conf *= 0.55; reasons.push('Spitze/Flight nicht unterscheidbar'); }
+      else if (widthRatio > 0.5 && visRatio < 0.9 && !axisFromModel && !priorDecided && tOther - tBest < 30) { conf *= 0.55; lift *= 0.7; reasons.push('Spitze/Flight nicht unterscheidbar'); }
       if (!geoDecided && !axisFromModel && !agree) conf *= 0.92; // nur über die Senkrecht-Annahme entschieden
     } else {
       // weder Geometrie noch gelernte Richtung entscheiden, welches Ende die Spitze ist
@@ -1744,15 +1791,15 @@ export class DartDetector {
     }
     if (usedAlt) { conf *= 0.6; reasons.push('Spitze am breiteren Ende angenommen'); }
     if (estimated) { conf *= 0.3; reasons.push('Spitze kaum sichtbar – Lage über Pfeillänge geschätzt'); }
-    else if (partial) { conf *= 0.5; reasons.push('Pfeil nur teilweise sichtbar'); }
-    else if (bridged > 2) { conf *= 0.65; reasons.push('Spitze über kontrastarmes Stück verfolgt'); }
+    else if (partial) { conf *= 0.5; lift *= 0.6; reasons.push('Pfeil nur teilweise sichtbar'); }
+    else if (bridged > 2) { conf *= 0.65; lift *= 0.65; reasons.push('Spitze über kontrastarmes Stück verfolgt'); }
     // Achse nur aus der längsten Geraden: ohne klares Barrel mit Spitze nicht ohne Rückfrage
-    if (lineAxis && !(tm && tm.clear) && !((tipAtMin ? 1 : -1) * massSkew > 0.08 && (L > 1.6 * exp.len || (tm && visRatio > 1.02 && (tipAtMin ? 1 : -1) * massSkew > 0.12)))) { conf *= 0.55; reasons.push('Form wenig länglich'); }
-    else if (lineAxis && visRatio < 0.9) { conf *= 0.7; reasons.push('Form wenig länglich'); }
+    if (lineAxis && !(tm && tm.clear) && !((tipAtMin ? 1 : -1) * massSkew > 0.08 && (L > 1.6 * exp.len || (tm && visRatio > 1.02 && (tipAtMin ? 1 : -1) * massSkew > 0.12)))) { conf *= 0.55; lift *= 0.55; reasons.push('Form wenig länglich'); }
+    else if (lineAxis && visRatio < 0.9) { conf *= 0.7; lift *= 0.7; reasons.push('Form wenig länglich'); }
     // Veränderung deutlich länger als ein ganzer Pfeil sein kann → Teile anderer Pfeile mit erfasst
     if (L > 1.15 * this.maxDartLen(mx, my)) { conf *= 0.5; reasons.push('Veränderung länger als ein Pfeil'); }
     // nur ein kurzes Stück sichtbar (weniger als gut die Hälfte eines Pfeils) → Richtung und Spitze unsicher
-    if (exp && exp.len > 12 && L < 0.95 * exp.len) { conf *= 0.6; reasons.push('nur ein kurzes Stück des Pfeils sichtbar'); }
+    if (exp && exp.len > 12 && L < 0.95 * exp.len) { conf *= 0.6; lift *= 0.7; reasons.push('nur ein kurzes Stück des Pfeils sichtbar'); }
     if (hit.r > 170 && hit.r < 190) { conf *= 0.55; reasons.push('knapp außerhalb des Doppels'); }
     // ein „Fehlwurf“ weit draußen ist selten; oft fehlt nur der vordere Pfeilteil → nachfragen
     else if (hit.r >= 190) { conf *= 0.55; reasons.push('außerhalb der Wertungsfläche'); }
@@ -1812,7 +1859,7 @@ export class DartDetector {
     conf *= pField.p ** 1.6;
     if (pField.p < 0.93) reasons.push(pField.byTail || (tm && tm.sigma > 4) ? 'Spitze kaum vom Untergrund zu unterscheiden' : pField.p < 0.75 ? 'direkt am Draht' : 'nahe am Draht');
     // kein Kontrast am Ende und der Pfeil ist kürzer als üblich oder gedrungen: vorderer Teil vermutlich unsichtbar
-    if (geoStrong && !usedAlt && !tm && endContrast < 35 && (visRatio < 0.9 || elong < 2.5)) { conf *= soft(0.6); if (pField.p >= 0.93 || !pField.byTail) reasons.push('Spitze kaum vom Untergrund zu unterscheiden'); }
+    if (geoStrong && !usedAlt && !tm && endContrast < 35 && (visRatio < 0.9 || elong < 2.5)) { conf *= soft(0.6); lift *= soft(0.6); if (pField.p >= 0.93 || !pField.byTail) reasons.push('Spitze kaum vom Untergrund zu unterscheiden'); }
     // Spitze hinter einem bereits steckenden Pfeil? Dann ist der sichtbare Teil deutlich kürzer
     // als ein ganzer Pfeil und endet direkt an dessen Pixeln → Spitze liegt weiter vorne, unsicher.
     let occTouch = false;
@@ -1841,7 +1888,7 @@ export class DartDetector {
       conf: Math.max(0, Math.min(1, conf)),
       reasons,
       bbox,
-      axis: { elong, widthRatio, length: L, expLen: exp ? exp.len : 0, occTouch, visRatio, bridged, estimated, endContrast, tilt: dartTilt, tiltOther: tOther, tm: usedAlt ? null : tm, skew: (tipAtMin ? 1 : -1) * massSkew, pWide, soft, fresh },
+      axis: { elong, widthRatio, length: L, expLen: exp ? exp.len : 0, occTouch, visRatio, bridged, estimated, endContrast, tilt: dartTilt, tiltOther: tOther, tm: usedAlt ? null : tm, skew: (tipAtMin ? 1 : -1) * massSkew, dir: { x: ux * tdir, y: uy * tdir }, fineOk: geoStrong && !usedAlt && !axisFromModel && Math.hypot(b.x, b.y) < 200, pWide, soft, fresh, lift, pField: pField.p },
       pixels: pixels.length,
       pixelList: pixels,
     };

@@ -216,11 +216,14 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 14px; }
 }
 .dslot small { font-size: 11px; font-weight: 600; color: var(--muted); }
 .dslot.empty { color: var(--surface-3); cursor: default; }
+.dslot.target { color: var(--accent); border: 1px dashed var(--accent); background: var(--accent-soft); }
+.dslot.target small { color: var(--accent); }
 .dslot.pending { border-color: var(--warn); background: var(--warn-soft); color: var(--warn); }
 .dslot.bust { color: var(--red); }
 .dslot .cam { position: absolute; top: 4px; right: 6px; width: 12px; height: 12px; color: var(--muted); }
 .vsum { min-width: 84px; background: var(--surface-2); border-radius: var(--radius-sm); display: flex; flex-direction: column; align-items: center; justify-content: center; font-weight: 900; font-size: 26px; font-variant-numeric: tabular-nums; }
 .vsum small { font-size: 11px; color: var(--muted); font-weight: 600; }
+.game .stack > div:empty { display: none; }
 
 .checkout { border-radius: var(--radius-sm); padding: 10px 14px; background: var(--accent-soft); border: 1px solid var(--accent); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-height: 52px; }
 .checkout .lbl { font-size: 12px; font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: 0.05em; }

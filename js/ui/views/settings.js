@@ -49,6 +49,7 @@ export async function render(root) {
   delay.oninput = () => { delayLbl.textContent = `${(delay.value / 1000).toFixed(2)} s`; };
   delay.onchange = () => settings.set('botDelay', Number(delay.value));
   root.append(h('div', { class: 'card' }, h('h3', {}, 'Spiel und Erkennung'),
+    toggle('cameraHigh', 'Hohe Kameraauflösung', 'Die Spitze der Pfeile wird im vollen Kamerabild nachgemessen. Ausschalten, wenn das Handy zu warm wird oder ruckelt (gilt ab dem nächsten Start der Kamera).'),
     toggle('keepAwake', 'Display eingeschaltet lassen', 'Während eines Matches geht der Bildschirm nicht aus (wenn vom Browser unterstützt)'),
     h('div', { class: 'switch-row' }, h('div', {}, h('div', { class: 't' }, 'Sicherheitsschwelle der Erkennung ', confLbl), h('div', { class: 'd' }, 'Darunter muss ein erkannter Pfeil bestätigt werden, bevor er zählt.')), h('div', { style: { width: '40%' } }, conf)),
     h('div', { class: 'switch-row' }, h('div', {}, h('div', { class: 't' }, 'Bot-Wurftempo ', delayLbl)), h('div', { style: { width: '40%' } }, delay)),
