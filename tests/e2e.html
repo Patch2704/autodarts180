@@ -23,12 +23,12 @@
   const doSlip = () => { sx0 = (Math.random() - 0.5) * 2 * slip; sy0 = (Math.random() - 0.5) * 2 * slip; };
   const cv = document.createElement('canvas'); cv.width = W; cv.height = H; document.body.append(cv);
   const g = cv.getContext('2d');
-  let frames = [], hand = false, fi = 0;
+  let frames = [], hand = false, handX = 0, fi = 0;
   const setScene = (darts) => { const img = darts.length ? D.drawDarts(base, cam, darts, { shadow: q.get('shadow') ? [0.2, 0.7, 1] : null }) : base; frames = [1, 2, 3].map((s) => D.addNoiseFast(img, 4, s + fi)); };
   setScene([]);
   const buf = document.createElement('canvas'); buf.width = W; buf.height = H; const bg = buf.getContext('2d');
   const swayNow = (k) => { if (!sway) return 0; const t = (performance.now() - swayAt) / 1000; return sway * Math.exp(-t / 1.5) * Math.sin(t * (k ? 7 : 5) + k); };
-  const paint = () => { bg.putImageData(frames[fi++ % frames.length], 0, 0); g.drawImage(buf, sx0 + (Math.random() - 0.5) * 2 * jit + swayNow(1), sy0 + (Math.random() - 0.5) * 2 * jit + swayNow(0)); if (hand) { g.fillStyle = '#c89678'; g.beginPath(); g.ellipse(W * 0.5 + Math.sin(fi) * 60, H * 0.55, W * 0.22, H * 0.2, 0.4, 0, 7); g.fill(); } };
+  const paint = () => { bg.putImageData(frames[fi++ % frames.length], 0, 0); g.drawImage(buf, sx0 + (Math.random() - 0.5) * 2 * jit + swayNow(1), sy0 + (Math.random() - 0.5) * 2 * jit + swayNow(0)); if (hand) { g.fillStyle = '#c89678'; g.beginPath(); g.ellipse(W * (0.5 + handX) + Math.sin(fi) * 60, H * 0.55, W * 0.22, H * 0.2, 0.4, 0, 7); g.fill(); } };
   paint(); setInterval(paint, 66);
   const stream = cv.captureStream(15);
   const fr = document.getElementById('app');
@@ -42,7 +42,7 @@
   Object.defineProperty(w.navigator, 'canShare', { value: () => false, configurable: true });
   const st = await imp('js/state.js'), repo = await imp('js/data/repo.js'), x01 = await imp('js/core/x01.js'), det = await imp('js/vision/detector.js');
   const times = [], evTimes = [];
-  const stamps = [], blocks = [];
+  const stamps = [], blocks = [], markLog = [];
   const op = det.DartDetector.prototype.process; const evLog = [];
   det.DartDetector.prototype.process = function (img) { const t = performance.now(); const r = op.call(this, img); times.push(performance.now() - t); window.__size = `${img.width}×${img.height}`; for (const e of r) { evLog.push(e.type); stamps.push([e.type, performance.now()]); } return r; };
   const osc = det.DartDetector.prototype.setCalibration; det.DartDetector.prototype.setCalibration = function (...a) { window.__cal = (window.__cal || 0) + 1; return osc.apply(this, a); };
@@ -89,7 +89,9 @@
       const b = btn('Erkennung speichern');
       if (b && !b.disabled) { b.click(); await sleep(1500); if (exported) { const im = new Image(); await new Promise((r) => { im.onload = r; im.onerror = r; exported.blob.then((bl) => { im.src = URL.createObjectURL(bl); }); }); log(`Erkennung speichern: ${exported.name} ${im.naturalWidth}×${im.naturalHeight}`); im.style.width = '500px'; document.body.append(im); } else log('Erkennung speichern: KEIN BILD'); } else log('Erkennung speichern: Knopf fehlt/gesperrt');
     }
-    hand = true; await sleep(1500); doSlip(); setScene([]); await sleep(300); hand = false; if (q.get("sway")) { sway = Number(q.get("sway")); swayAt = performance.now(); } const tFree = performance.now(); let worst = 0, last = tFree; const iv = setInterval(() => { const n = performance.now(); worst = Math.max(worst, n - last); last = n; }, 20); await sleep(Number(q.get('pause') || 2500)); clearInterval(iv); const tk = stamps.find(([t, at]) => t === 'takeout' && at > tFree); blocks.push(`${tk ? Math.round(tk[1] - tFree) : '–'}/${Math.round(worst)}`);
+    const marks = () => { const c = doc.querySelector('.game-cam canvas'); if (!c || !c.width) return '?'; const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 0; i < d.length; i += 4) if (d[i + 3] > 250 && ((Math.abs(d[i] - 61) < 12 && Math.abs(d[i + 1] - 220) < 12) || (Math.abs(d[i] - 245) < 12 && Math.abs(d[i + 1] - 184) < 12))) n++; return n; };
+    const m0 = marks();
+    hand = true; await sleep(1500); doSlip(); setScene([]); await sleep(300); for (let k = 0; k < Number(q.get('slow') || 0); k++) { handX += 0.06; await sleep(100); } hand = false; handX = 0; if (q.get("sway")) { sway = Number(q.get("sway")); swayAt = performance.now(); } const tFree = performance.now(); let worst = 0, last = tFree; const iv = setInterval(() => { const n = performance.now(); worst = Math.max(worst, n - last); last = n; }, 20); await sleep(Number(q.get('pause') || 2500)); clearInterval(iv); const tk = stamps.find(([t, at]) => t === 'takeout' && at > tFree); markLog.push(`${m0}→${marks()}`); blocks.push(`${tk ? Math.round(tk[1] - tFree) : '–'}/${Math.round(worst)}`);
     if (mode) {
       for (let c; (c = btn('Bestätigen'));) { asked.push('spät'); c.click(); await sleep(300); }
       // fehlende Pfeile der Aufnahme von Hand eintragen (Scheibe ist schon leer)
@@ -104,6 +106,7 @@
   const s = (a) => a.length ? `Ø ${(a.reduce((x, y) => x + y, 0) / a.length).toFixed(1)} ms, max ${Math.max(...a).toFixed(0)} ms` : '-';
   log(`Bildgröße Auswertung ${window.__size}; pro Bild ${s(times)}; Auswertung ${s(evTimes)}; Bilder ${times.length}`);
   log(`Hand weg → Entnahme erkannt / längste Blockade (ms): ${blocks.join(', ')}; Neukalibrierungen ${window.__cal || 0}`);
+  log(`Markierte Bildpunkte vor/nach dem Herausziehen: ${markLog.join(', ')}`);
   log('Hinweise: ' + [...doc.querySelectorAll('.notice')].map((n) => n.textContent).join(' | '));
   w.location.hash = '#/dashboard'; await sleep(300);
   if (q.get('thr')) st.settings.set('confThreshold', oldThr);

@@ -4,7 +4,7 @@
 // Homographie auf Scheibenebene → Segment. Unsichere Ergebnisse werden als solche gemeldet.
 import { applyH, invertH } from './homography.js';
 import { estimateTransform, warpRef, applyT, luminance, IDENTITY } from './align.js';
-import { scoreAt } from '../core/board.js';
+import { scoreAt, R } from '../core/board.js';
 
 const DEFAULTS = {
   diffThreshold: 28, // mittlere RGB-Differenz pro Pixel (nach 3x3-Glättung), Obergrenze
@@ -278,6 +278,84 @@ function tolDev(a, ref, i, s, tol) {
   const d = v - x - (v - m) * tol;
   return d > 0 ? d : 0;
 }
+/**
+ * Wo liegen die Drahtringe wirklich? Nennmaße gelten für die Drahtinnenkante, jede Scheibe und jede Linse weicht etwas
+ * ab (gemessen: Triple 98,2–107,3 mm statt 99–107). Der helle Draht zwischen dunklen Flächen ist im Bild der leeren
+ * Scheibe als Grat zu sehen; seine Lage wird über alle dunklen Felder gemittelt. Liefert je Ring [Nennmaß, a, b, c]:
+ * Abweichung a + b·cos + c·sin der Richtung (mm); ohne klaren Grat 0.
+ */
+export function measureRings(data, w, h, Hpx) {
+  const lum = (x, y) => {
+    x -= 0.5; y -= 0.5;
+    const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+    if (x0 < 0 || y0 < 0 || x0 + 1 >= w || y0 + 1 >= h) return null;
+    const Y = (xx, yy) => { const i = (yy * w + xx) * 4; return 0.3 * data[i] + 0.59 * data[i + 1] + 0.11 * data[i + 2]; };
+    return (Y(x0, y0) * (1 - fx) + Y(x0 + 1, y0) * fx) * (1 - fy) + (Y(x0, y0 + 1) * (1 - fx) + Y(x0 + 1, y0 + 1) * fx) * fy;
+  };
+  const N = 33, dr = (j) => -4 + j * 0.25;
+  /** Gratlage (mm) eines gemittelten Profils oder null */
+  const ridge = (prof) => {
+    let m = -1;
+    for (let j = 4; j < N - 4; j++) if (prof[j] > prof[j - 1] && prof[j] >= prof[j + 1]) {
+      let lo = Infinity, hi = Infinity;
+      for (let i = j - 1; i >= Math.max(0, j - 12); i--) { if (prof[i] > prof[j]) break; lo = Math.min(lo, prof[i]); }
+      for (let i = j + 1; i <= Math.min(N - 1, j + 12); i++) { if (prof[i] > prof[j]) break; hi = Math.min(hi, prof[i]); }
+      const prom = prof[j] - Math.max(lo, hi);
+      if (prom >= 6 && (m < 0 || prom > ridge.prom)) { m = j; ridge.prom = prom; }
+    }
+    if (m < 0) return null;
+    const thr = prof[m] - ridge.prom / 2;
+    let s = 0, sw = 0;
+    for (const st of [-1, 1]) for (let i = st < 0 ? m : m + 1; i >= 0 && i < N && prof[i] > thr; i += st) { const v = prof[i] - thr; s += v * dr(i); sw += v; }
+    return sw ? s / sw : null;
+  };
+  const out = [];
+  for (const R0 of [R.DBULL, R.SBULL, R.TRIPLE_IN, R.TRIPLE_OUT, R.DOUBLE_IN, R.DOUBLE_OUT]) {
+    const small = R0 < 20, sectors = [];
+    for (let k = 0; k < 10; k++) {
+      const prof = new Float64Array(N), cnt = new Float64Array(N);
+      for (let a = small ? -18 : -6; a <= (small ? 18 : 6); a += 1.5) {
+        const t = ((90 - k * 36 + a) * Math.PI) / 180, ct = Math.cos(t), st = Math.sin(t);
+        for (let j = 0; j < N; j++) { const r = R0 + dr(j), p = applyH(Hpx, r * ct, r * st), v = lum(p.x, p.y); if (v !== null) { prof[j] += v; cnt[j]++; } }
+      }
+      if (cnt.some((c) => c < 5)) continue;
+      sectors.push({ t: ((90 - k * 36) * Math.PI) / 180, prof: prof.map((v, j) => v / cnt[j]) });
+    }
+    if (sectors.length < 6) { out.push([R0, 0, 0, 0]); continue; }
+    const mean = new Float64Array(N); for (const s of sectors) for (let j = 0; j < N; j++) mean[j] += s.prof[j] / sectors.length;
+    const a0 = ridge(mean);
+    if (a0 === null || Math.abs(a0) > (small ? 1.3 : 3)) { out.push([R0, 0, 0, 0]); continue; }
+    // die hellere Seite zieht den Grat bis ca. 0,25 mm zu sich
+    const shift = Math.sign(a0) * Math.max(0, Math.abs(a0) - 0.25);
+    out.push([R0, shift, 0, 0]);
+    if (small) continue;
+    // Richtungsabhängig (Linse, Drähte stehen vor der Scheibe): Ausgleich über die Felder mit klarem Grat
+    let pts = sectors.map((s) => ({ t: s.t, v: ridge(s.prof) })).filter((p) => p.v !== null && Math.abs(p.v - a0) < 1.6);
+    if (pts.length < 7) continue;
+    let b = 0, c = 0, sum = 0;
+    for (const p of pts) sum += p.v;
+    const m = sum / pts.length;
+    for (const p of pts) { b += (2 / pts.length) * (p.v - m) * Math.cos(p.t); c += (2 / pts.length) * (p.v - m) * Math.sin(p.t); }
+    const l = Math.hypot(b, c), lim = l > 0.4 ? Math.min(1, l - 0.4) / l : 0; // kleine Schwankungen sind Messfehler
+    out[out.length - 1] = [R0, shift, b * lim, c * lim];
+  }
+  return out;
+}
+
+/** Scheibenpunkt so verschieben, dass die gemessenen Drahtringe auf ihren Nennmaßen liegen */
+export function ringAdjust(rings, x, y) {
+  const r = Math.hypot(x, y);
+  if (!rings || !(r > 1e-6) || !Number.isFinite(r)) return { x, y };
+  const c = x / r, s = y / r;
+  let pn = 0, pm = 0;
+  for (const [n, a, b, d] of rings) {
+    const m = n + a + b * c + d * s; // gemessene Lage
+    if (r <= m && m > pm) { const q = pn + ((r - pm) * (n - pn)) / (m - pm); return { x: c * q, y: s * q }; }
+    pn = n; pm = m;
+  }
+  const q = r + pn - pm;
+  return { x: c * q, y: s * q };
+}
 const SH_X = [0, -1, 1, 0, 0, -1, 1, -1, 1], SH_Y = [0, 0, 0, -1, 1, -1, -1, 1, 1];
 
 export class DartDetector {
@@ -316,7 +394,7 @@ export class DartDetector {
     // Bewegungskontrolle nur auf der Scheibe selbst (Personen, Monitore daneben stören nicht)
     this.boardIdx = Int32Array.from(roi.filter((p, k) => { if (k % 3) return false; const b = applyH(this.Hinv, p % w, (p / w) | 0); return Number.isFinite(b.x) && b.x * b.x + b.y * b.y <= 230 * 230; }));
     { const q0 = applyH(this.Hpx, 0, 0), qx = applyH(this.Hpx, 10, 0), qy = applyH(this.Hpx, 0, 10); this.pxPerMm = Math.max(Math.hypot(qx.x - q0.x, qx.y - q0.y), Math.hypot(qy.x - q0.x, qy.y - q0.y)) / 10; }
-    this.lastEval = null; this.calibRef = null; this.T0 = null; this.Tcur = null; this.dirPrior = null; this.tipRho = null;
+    this.lastEval = null; this.calibRef = null; this.T0 = null; this.Tcur = null; this.dirPrior = null; this.tipRho = null; this.rings = null;
     this.diff = new Uint8Array(w * h);
     this.mask = new Uint8Array(w * h);
     this.reset();
@@ -332,7 +410,7 @@ export class DartDetector {
     this.Hinv = invertH(this.Hpx);
     const v = view || { cx: w / 2, cy: h / 2, size: Math.max(w, h) };
     this.cam = estimateCamera(this.Hpx, v.cx, v.cy, v.size);
-    this.calibRef = null; this.T0 = null; this.Tcur = null;
+    this.calibRef = null; this.T0 = null; this.Tcur = null; this.rings = null;
     const round = this.round;
     this.rebase(img);
     this.round = round;
@@ -349,7 +427,7 @@ export class DartDetector {
     this.ref = null; this.emptyRef = null; this.prev = null;
     this.stable = 0; this.hadMotion = false;
     this.dartsOnBoard = 0; this.awaitingTakeout = false;
-    this.checkNow = false; this.bigMotion = false; this.calm = 0; this.round = this.round || 0; // round zählt die Entnahmen (läuft weiter)
+    this.checkNow = false; this.bigMotion = false; this.calm = 0; this.goneFrames = 0; this.needClear = 0; this.round = this.round || 0; // round zählt die Entnahmen (läuft weiter)
     this.regions = []; this.largeChangeCount = 0; this.clearOcc();
     this.lastRefBefore = null;
     this.status = 'init';
@@ -395,7 +473,7 @@ export class DartDetector {
     this.setEmpty(c);
     this.ref = c; this.refRaw = raw; this.prev = raw;
     this.round = (this.round || 0) + 1; this.bigMotion = false;
-    this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.stable = 0; this.clearOcc();
+    this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.stable = 0; this.clearOcc(); this.needClear = 0;
     this.lastRefBefore = null;
     this.status = 'bereit';
   }
@@ -407,6 +485,11 @@ export class DartDetector {
       if (T.ok) this.T0 = T;
     }
     this.emptyRef = c;
+    // Drahtringe nachmessen (nur solange das Bild noch genau auf der Kalibrierung liegt)
+    if (!this.rings || this.drift() < 0.7) {
+      const rings = measureRings(rawOf.get(c) || c, this.w, this.h, this.Hpx), found = (l) => l.filter((q) => q[1] !== 0).length;
+      if (!this.rings || found(rings) >= found(this.rings)) this.rings = rings;
+    }
   }
 
   /** Referenz passend zum aktuellen Bild ausrichten: { img, T } */
@@ -438,7 +521,9 @@ export class DartDetector {
       const s = this.quickShift(data, this.prev);
       if (s) motion = this.motionFraction(data, this.prev, s.dy * this.w + s.dx);
     }
+    const before = this.prev;
     this.prev = data.slice();
+    this.prevFrame = before;
     if (motion > 0.02) this.bigMotion = true; // Hand oder Person vor der Scheibe
     // Nach dem Herausziehen nicht warten, bis das Stativ ganz ruhig steht: schon nach zwei halbwegs ruhigen
     // Bildern prüfen, ob die Pfeile weg sind
@@ -449,7 +534,21 @@ export class DartDetector {
         const took = this.checkTakeout(soft, raw, this.alignTo(soft, this.emptyRef), true);
         if (took) { this.calm = 0; this.stable = 0; this.hadMotion = true; this.lastEval = null; return [took.event]; }
       }
-    } else this.calm = 0;
+      // … oder schon, während die Hand noch zurückgeht: an allen Pfeilstellen ist wieder die leere Scheibe zu sehen
+      if (this.calm < 2 && this.dartMem.length && this.vanishedNow(data)) {
+        if (++this.goneFrames >= 1) {
+          const soft = softImage(data.slice(), this.w, this.h), E = this.alignTo(soft, this.emptyRef);
+          if (E.ok && this.matchShare(soft, E.img) > 0.7 && this.allGone(soft, E, 0.85)) {
+            this.ref = this.emptyRef; this.dartsOnBoard = 0; this.awaitingTakeout = false; this.regions = []; this.clearOcc();
+            this.lastRefBefore = null; this.status = 'bereit'; this.round++; this.bigMotion = false;
+            this.calm = 0; this.goneFrames = 0; this.stable = 0; this.hadMotion = true; this.lastEval = null;
+            this.needClear = 2; // die Hand kann noch im Bild sein: neue Pfeile erst nach Bestätigung durch ein zweites Bild
+            return [{ type: 'takeout', round: this.round, early: true }];
+          }
+          this.goneFrames = -2;
+        }
+      } else this.goneFrames = 0;
+    } else { this.calm = 0; this.goneFrames = 0; }
     if (motion > this.opts.motionFraction) {
       this.stable = 0; this.hadMotion = true;
       if (this.status !== 'warte auf Entfernen') this.status = 'Bewegung';
@@ -650,7 +749,7 @@ export class DartDetector {
     const count = this.buildMask(M.a, M.b, this.dartsOnBoard > 0 ? E.img : null);
     const frac = count / roiN;
     if (frac < this.opts.minDartFraction || this.looksEmpty()) {
-      this.status = 'bereit';
+      this.status = 'bereit'; this.needClear = 0;
       // minimale Drift (Licht, leichtes Verrutschen) in die Referenz übernehmen
       const wasEmptyRef = this.ref === this.emptyRef; // sonst kann ein nicht erkannter Pfeil im Bild sein
       this.ref = data; this.refRaw = raw;
@@ -671,6 +770,18 @@ export class DartDetector {
     }
     this.largeChangeCount = 0;
     const dets = this.analyse(Math.max(1, 3 - this.dartsOnBoard));
+    // Steckt es wirklich? Ein Pfeil im Flug (oder eine Hand) ist im Bild davor noch nicht an derselben Stelle.
+    if (dets.length && this.prevFrame && (this.movingCount || 0) < 3 && !dets.every((d) => this.settled(d.pixelList))) {
+      this.movingCount = (this.movingCount || 0) + 1;
+      this.status = 'Bewegung'; this.stable = 0; this.checkNow = true; this.lastEval = null;
+      return [...events, { type: 'moving' }];
+    }
+    if (dets.length && this.needClear > 0) {
+      this.needClear--;
+      this.status = 'bereit'; this.stable = 0; this.checkNow = true; this.lastEval = null;
+      return [...events, { type: 'moving' }];
+    }
+    this.movingCount = 0;
     this.lastRefBefore = this.ref; this.lastRawBefore = this.refRaw;
     this.ref = data; this.refRaw = raw;
     this.status = 'bereit';
@@ -690,6 +801,26 @@ export class DartDetector {
       events.push({ type: 'dart', ...det });
     }
     return events;
+  }
+
+  /** War die Veränderung im Bild davor schon genauso da? (Referenz oder jetziges Bild – woran ist es näher?) */
+  settled(px) {
+    const { w, h, cur, refImg } = this, p = this.prevFrame, W = w * 4;
+    // Versatz zum Bild davor (Stativ schwingt): ganze Pixel an der Scheibe
+    const s = this.quickShift(rawOf.get(cur) || cur, p) || { dx: 0, dy: 0 }, off = (s.dy * w + s.dx) * 4;
+    let old = 0, all = 0;
+    for (let k = 0; k < px.length; k += 2) {
+      const i = px[k] * 4, j = i + off, y = (px[k] / w) | 0;
+      if (y < 5 || y >= h - 5 || j < W || j + W >= p.length) continue;
+      let d = 0, dn = 0, dv = 0;
+      for (let c = 0; c < 3; c++) {
+        const v = (4 * p[j + c] + p[j + c - 4] + p[j + c + 4] + p[j + c - W] + p[j + c + W]) / 8;
+        d += Math.abs(cur[i + c] - refImg[i + c]); dn += Math.abs(v - cur[i + c]); dv += Math.abs(v - refImg[i + c]);
+      }
+      if (d < 40) continue;
+      all += d; if (dv < dn) old += d;
+    }
+    return all < 300 || old < 0.4 * all;
   }
 
   /**
@@ -732,7 +863,7 @@ export class DartDetector {
   }
 
   /** Sind alle bekannten Pfeile verschwunden? Je Pixel: Ist das Bild jetzt näher an „vorher“ oder an „mit Pfeil“? */
-  allGone(data, E) {
+  allGone(data, E, need = 0.75) {
     const T = E.T;
     if (!this.dartMem.length) return false;
     let total = 0, gone = 0, any = false;
@@ -751,13 +882,49 @@ export class DartDetector {
         all += d; if (Math.min(db, de) < 0.6 * da) back += d;
       }
       if (all < 400) continue;
-      const isGone = back > 0.75 * all;
+      const isGone = back > need * all;
       m.gone = all ? back / all : 0;
       // jeder sichere Pfeil muss weg sein; unsichere Meldungen (evtl. gar kein Pfeil) blockieren nicht allein
       if (!isGone && m.conf >= 0.5) return false;
       total += all; if (isGone) { gone += all; any = true; }
     }
     return any && gone >= 0.8 * total;
+  }
+
+  /** Anteil der Scheibe, der wie das ausgerichtete Leerbild aussieht (eine Hand verdeckt nur einen Teil) */
+  matchShare(a, b) {
+    const { boardIdx, w } = this, s = w * 4, tol = 1;
+    let n = 0, same = 0;
+    for (let k = 0; k < boardIdx.length; k += 4) {
+      const i = boardIdx[k] * 4; n++;
+      if (Math.max(tolDev(a, b, i, s, tol), tolDev(a, b, i + 1, s, tol), tolDev(a, b, i + 2, s, tol)) < 24) same++;
+    }
+    return n ? same / n : 0;
+  }
+
+  /** Grobe Vorprüfung ohne Ausrichten: Sehen die meisten Pfeilpixel jedes sicheren Pfeils aus wie ohne Pfeil (±3 px)? */
+  vanishedNow(data) {
+    for (const m of this.dartMem) {
+      if (m.conf < 0.5 && this.dartMem.length > 1) continue;
+      let back = 0, all = 0;
+      const step = Math.max(1, Math.floor(m.px.length / 250));
+      for (let k = 0; k < m.px.length; k += step) {
+        let d = 0, best = Infinity, da = 0;
+        for (let c = 0; c < 3; c++) d += Math.abs(m.after[k * 3 + c] - m.before[k * 3 + c]);
+        if (d < 60) continue;
+        const i0 = m.px[k] * 4;
+        for (let dy = -2; dy <= 2; dy += 2) for (let dx = -2; dx <= 2; dx += 2) {
+          const i = i0 + (dy * this.w + dx) * 4;
+          if (i < 0 || i + 2 >= data.length) continue;
+          let e = 0; for (let c = 0; c < 3; c++) e += Math.abs(data[i + c] - m.before[k * 3 + c]);
+          if (e < best) best = e;
+        }
+        for (let c = 0; c < 3; c++) da += Math.abs(data[i0 + c] - m.after[k * 3 + c]);
+        all++; if (best < 0.6 * da) back++;
+      }
+      if (all >= 20 && back < 0.6 * all) return false;
+    }
+    return true;
   }
 
   /** Schnelle Vorprüfung: Sieht mindestens ein Drittel der bekannten Pfeilpixel wieder aus wie die leere Scheibe? */
@@ -779,7 +946,10 @@ export class DartDetector {
     if (tm && tm.clear && det.conf >= 0.6 && tm.ratio > 0.04 && tm.ratio < 0.28) {
       const r = this.tipRho || (this.tipRho = { v: 0.08, n: 0 });
       const k = r.n < 3 ? 1 / (r.n + 1.5) : 0.2;
-      r.v += k * (tm.ratio - r.v);
+      // Median statt Mittel: Einzelne Messungen laufen an Fasern oder Drähten zu weit
+      r.list = [...(r.list || []), tm.ratio].slice(-15);
+      const l = [...r.list, 0.08, 0.08].sort((p, q) => p - q);
+      r.v = l.length % 2 ? l[l.length >> 1] : (l[l.length / 2 - 1] + l[l.length / 2]) / 2;
       r.lum = r.lum == null ? tm.lum : r.lum + k * (tm.lum - r.lum);
       r.w = r.w == null ? tm.Wb : r.w + k * (tm.Wb - r.w);
       r.n++;
@@ -792,7 +962,11 @@ export class DartDetector {
   }
 
   getModel() { return { dir: this.dirPrior ? { ...this.dirPrior } : null, rho: this.tipRho ? { ...this.tipRho } : null }; }
-  setModel(m) { if (m && m.rho && m.rho.v > 0.04 && m.rho.v < 0.28) this.tipRho = { ...m.rho, n: Math.min(m.rho.n, 10) }; if (m && m.dir && m.dir.n >= 2) this.dirPrior = { ...m.dir, n: Math.min(m.dir.n, 10) }; }
+  setModel(m) {
+    // bis v22 wurde die Spitzenlänge als Mittel gelernt (eher zu lang): nur das Aussehen des Barrels übernehmen
+    if (m && m.rho && m.rho.v > 0.04 && m.rho.v < 0.28) this.tipRho = m.rho.list ? { ...m.rho, list: [...m.rho.list], n: Math.min(m.rho.n, 10) } : { v: 0.08, n: 2, lum: m.rho.lum, w: m.rho.w };
+    if (m && m.dir && m.dir.n >= 2) this.dirPrior = { ...m.dir, n: Math.min(m.dir.n, 10) };
+  }
 
   /** Gelernte Pfeilrichtung (Spitze → Flight) oder null */
   priorDir() {
@@ -1090,11 +1264,11 @@ export class DartDetector {
     const det = this.locateTip(pixels, bb, extra);
     if (det && !cluster && det.axis.elong < 2 && det.reasons.includes('Veränderung länger als ein Pfeil')) return null;
     if (det && cluster) {
-      det.conf *= 0.6; det.reasons.push('aus einer Pfeilgruppe herausgelöst');
+      det.conf *= det.axis.soft(0.6); det.reasons.push('aus einer Pfeilgruppe herausgelöst');
       // In der Gruppe ist der neue Pfeil oft nur teilweise sichtbar: kürzer als ein ganzer Pfeil
       // oder kontrastarmes Spitzenende → eher nachfragen
-      if (det.axis.expLen > 12 && det.axis.length < 1.5 * det.axis.expLen) { det.conf *= 0.6; det.reasons.push('in der Gruppe nur teilweise sichtbar'); }
-      if (det.axis.endContrast < 45) det.conf *= 0.75;
+      if (det.axis.expLen > 12 && det.axis.length < 1.5 * det.axis.expLen) { det.conf *= det.axis.soft(0.6); det.reasons.push('in der Gruppe nur teilweise sichtbar'); }
+      if (det.axis.endContrast < 45) det.conf *= det.axis.soft(0.75);
     }
     // kleine Veränderung: nur als Pfeil werten, wenn sie deutlich länglich ist
     if (pixels.length < this.opts.smallDartFraction * this.roi.length) {
@@ -1223,9 +1397,10 @@ export class DartDetector {
     bl /= bn || 1; gl /= bn || 1;
     const known = rho.n >= 2 && rho.lum != null && Math.abs(bl - rho.lum) < 32 && Math.abs(Wb - rho.w) <= 0.25 * rho.w + 1;
     let sm;
-    if (m >= 0.04 * Lb && med >= 34) sm = 1.6;
+    const seen = m >= 0.04 * Lb && med >= 34;
+    if (seen) sm = 1.2;
     else if (!known) return null; // Schaft oder Barrel? Ohne sichtbare Spitze nur bei bekanntem Barrel
-    else if (m >= 0.04 * Lb && med >= 22) sm = 0.03 * Lb;
+    else if (m >= 0.04 * Lb && med >= 22) sm = (med >= 28 ? 0.018 : 0.03) * Lb;
     else {
       // keine Spitze zu sehen: auf dunklem Grund normal, auf hellem müsste eine dunkle Spitze auffallen
       let lum = 0, n = 0;
@@ -1246,7 +1421,7 @@ export class DartDetector {
     }
     else { const wa = 1 / (sm * sm), wb = 1 / (s0 * s0); mm = (m * wa + mu * wb) / (wa + wb); sigma = 1 / Math.sqrt(wa + wb); }
     const t = P(qb - mm, off * 0.7);
-    return { tip: t, sigma, m, mu, qb, Lb, med, Wb, lum: bl, clear: sm === 1.6 && m <= mu + 2 * Math.hypot(sm, s0), ratio: m / Lb };
+    return { tip: t, sigma, m, mu, qb, Lb, med, Wb, lum: bl, clear: seen && m <= mu + 2 * Math.hypot(sm, s0), ratio: m / Lb };
   }
 
   /**
@@ -1525,7 +1700,7 @@ export class DartDetector {
     // Einstichstelle aus Barrelende + Länge der Stahlspitze (gemessen, wo sie zu sehen ist, sonst gelernt)
     const tm = geoStrong && front && !axisFromModel ? this.tipModel(tipPx, front.dx, front.dy, altPx) : null;
     if (tm) tipPx = tm.tip;
-    const toBoard = (p) => { const c = this.toCalib(p.x, p.y); return applyH(this.Hinv, c.x + 0.5, c.y + 0.5); };
+    const toBoard = (p) => { const c = this.toCalib(p.x, p.y), q = applyH(this.Hinv, c.x + 0.5, c.y + 0.5); return ringAdjust(this.rings, q.x, q.y); };
     let tipB = toBoard(tipPx), altB = toBoard(altPx);
     let usedAlt = false;
     const rTip = Math.hypot(tipB.x, tipB.y), rAlt = Math.hypot(altB.x, altB.y);
@@ -1549,12 +1724,16 @@ export class DartDetector {
       // Richtung aus Geometrie; Form nur als Zusatzkontrolle
       if (elong < 2.5 && !axisFromModel) conf *= 0.85;
       if (axisFromModel) { conf *= spreadOk ? 0.7 : 0.5; reasons.push('Pfeil zeigt fast zur Kamera'); }
-      if (!geoDecided && Math.abs(dot) < 0.7) { conf *= 0.92; reasons.push('Pfeil stark schräg'); }
+      // die gelernte Richtung und die Lage des Flights stimmen überein: schräg ist dann nicht unsicher
+      const agree = priorDecided && !dirConflict && (tipAtMin ? 1 : -1) * massSkew > -0.05;
+      if (!geoDecided && Math.abs(dot) < 0.7 && !agree) { conf *= 0.92; reasons.push('Pfeil stark schräg'); }
       if (thinIsMin !== tipAtMin && widthRatio < 0.6) { conf *= 0.85; reasons.push('Form widerspricht Pfeilrichtung'); }
       if (dirConflict) { conf *= 0.6; reasons.push('Pfeilrichtung unklar'); }
       // beide Enden gleich breit und die Neigung nicht deutlich verschieden → evtl. nur Flight oder nur Barrel zu sehen
-      if (widthRatio > 0.8 && !axisFromModel && tOther - tBest < 35) { conf *= 0.55; reasons.push('Spitze/Flight nicht unterscheidbar'); }
-      if (!geoDecided && !axisFromModel) conf *= 0.92; // nur über die Senkrecht-Annahme entschieden
+      if (widthRatio > 0.8 && !axisFromModel && tOther - tBest < 35 && !(tm && agree)) { conf *= 0.55; reasons.push('Spitze/Flight nicht unterscheidbar'); }
+      // kurzes Stück ohne klar breites Ende: Die Neigung allein entscheidet dann nicht sicher, wo die Spitze ist
+      else if (widthRatio > 0.5 && visRatio < 0.9 && !axisFromModel && !priorDecided && tOther - tBest < 30) { conf *= 0.55; reasons.push('Spitze/Flight nicht unterscheidbar'); }
+      if (!geoDecided && !axisFromModel && !agree) conf *= 0.92; // nur über die Senkrecht-Annahme entschieden
     } else {
       // weder Geometrie noch gelernte Richtung entscheiden, welches Ende die Spitze ist
       conf *= 0.55; reasons.push('Pfeilrichtung nicht eindeutig');
@@ -1568,7 +1747,8 @@ export class DartDetector {
     else if (partial) { conf *= 0.5; reasons.push('Pfeil nur teilweise sichtbar'); }
     else if (bridged > 2) { conf *= 0.65; reasons.push('Spitze über kontrastarmes Stück verfolgt'); }
     // Achse nur aus der längsten Geraden: ohne klares Barrel mit Spitze nicht ohne Rückfrage
-    if (lineAxis && !(tm && tm.clear) && !((tipAtMin ? 1 : -1) * massSkew > 0.08 && L > 1.6 * exp.len)) { conf *= 0.55; reasons.push('Form wenig länglich'); }
+    if (lineAxis && !(tm && tm.clear) && !((tipAtMin ? 1 : -1) * massSkew > 0.08 && (L > 1.6 * exp.len || (tm && visRatio > 1.02 && (tipAtMin ? 1 : -1) * massSkew > 0.12)))) { conf *= 0.55; reasons.push('Form wenig länglich'); }
+    else if (lineAxis && visRatio < 0.9) { conf *= 0.7; reasons.push('Form wenig länglich'); }
     // Veränderung deutlich länger als ein ganzer Pfeil sein kann → Teile anderer Pfeile mit erfasst
     if (L > 1.15 * this.maxDartLen(mx, my)) { conf *= 0.5; reasons.push('Veränderung länger als ein Pfeil'); }
     // nur ein kurzes Stück sichtbar (weniger als gut die Hälfte eines Pfeils) → Richtung und Spitze unsicher
@@ -1578,13 +1758,26 @@ export class DartDetector {
     else if (hit.r >= 190) { conf *= 0.55; reasons.push('außerhalb der Wertungsfläche'); }
     // Liegt die Spitze direkt auf/an einem schon steckenden Pfeil? (Nur Überschneidung der
     // Umrisse reicht nicht – in einer engen Gruppe überschneiden sich die Umrisse fast immer.)
-    if (this.isOcc(tip)) { conf *= 0.75; reasons.push('Spitze liegt an einem anderen Pfeil'); }
+    // Verdeckte oder schlecht sichtbare Spitze: Es zählt nur, ob das Feld auch dann stimmt, wenn sie deutlich weiter
+    // vorne oder seitlich liegt. Mitten in einem großen Feld ist das unkritisch (soft dämpft dann die Abzüge).
+    const tdir = tipAtMin !== usedAlt ? -1 : 1;
+    let wideSame = 0, wideAll = 0;
+    for (let al = -0.05; al <= (tm ? 0.1001 : 0.2001); al += 0.05) for (const ac of [-2.5, 0, 2.5]) { const q = toBoard({ x: tip.x + ux * tdir * al * L - uy * tdir * ac, y: tip.y + uy * tdir * al * L + ux * tdir * ac }); wideAll++; if (Number.isFinite(q.x) && scoreAt(q.x, q.y).label === hit.label) wideSame++; }
+    const pWide = wideSame / wideAll, kWide = geoStrong && !axisFromModel && (visRatio > (tm ? 1.25 : 1.4) || (tm && tm.clear)) ? 0.75 * Math.max(0, Math.min(1, (pWide - 0.8) / 0.15)) : 0;
+    const soft = (f) => 1 - (1 - f) * (1 - kWide);
+    if (this.isOcc(tip)) { conf *= soft(0.75); reasons.push('Spitze liegt an einem anderen Pfeil'); }
+    let fresh = 1;
+    if (this.occ && this.dartsOnBoard > 0) { let f = 0; for (const p of pixels) if (!this.occ[p]) f++; fresh = f / n; }
     // Liegt die Spitze mitten am Körper eines steckenden Pfeils, kann es auch dieser Pfeil selbst sein,
     // der angestoßen wurde (nahe seiner Spitze bewegt er sich nicht, weiter hinten schon)
     for (const s of this.segs || []) {
       const sx = s.far.x - s.tip.x, sy = s.far.y - s.tip.y, sl = Math.hypot(sx, sy) || 1;
       const al = ((tip.x - s.tip.x) * sx + (tip.y - s.tip.y) * sy) / sl, pe = Math.abs((tip.x - s.tip.x) * sy - (tip.y - s.tip.y) * sx) / sl;
-      if (al > 14 && al < sl && pe < 4 + 0.16 * al) { conf *= 0.55; reasons.push('evtl. nur ein angestoßener Pfeil'); break; }
+      if (al > 14 && al < sl && pe < 4 + 0.16 * al) {
+        // ein angestoßener Pfeil verändert vor allem seine alte Stelle; liegt fast alles neu daneben, ist es ein neuer
+        if (fresh > 0.75 && geoStrong && visRatio > 1.1) conf *= soft(0.8); else { conf *= 0.55; reasons.push('evtl. nur ein angestoßener Pfeil'); }
+        break;
+      }
     }
     // stecken schon Pfeile, deuten weitere Veränderungen auf angestoßene Pfeile hin → nachfragen
     if (otherBlobs > 2) { conf *= this.dartsOnBoard > 0 ? 0.55 : 0.8; reasons.push('weitere Bildveränderungen'); }
@@ -1615,11 +1808,11 @@ export class DartDetector {
     // Wie wahrscheinlich stimmt das Feld? Messfehler der Spitze (wächst mit den mm pro Bildpunkt) und,
     // bei wenig Kontrast am Ende, eine Spitze, die unsichtbar bis zu 20 mm weitergeht.
     const pField = this.fieldProbability(tip, b, hit, ux, uy, tipAtMin !== usedAlt ? -1 : 1, {
-      sure: geoStrong && !axisFromModel, sigma: tm && !usedAlt ? (tm.clear ? 0.65 : 1) * tm.sigma : 0, tail: 0.15 * L, tailWeight: !geoStrong || usedAlt || tm ? 0 : endContrast < 15 ? 0.45 : endContrast < 35 ? 0.25 : 0.05, toBoard });
+      sure: geoStrong && !axisFromModel, sigma: tm && !usedAlt ? (tm.clear ? Math.max(0.8, 0.65 * tm.sigma) : tm.sigma) : 0, tail: 0.15 * L, tailWeight: !geoStrong || usedAlt || tm ? 0 : endContrast < 15 ? 0.45 : endContrast < 35 ? 0.25 : 0.05, toBoard });
     conf *= pField.p ** 1.6;
     if (pField.p < 0.93) reasons.push(pField.byTail || (tm && tm.sigma > 4) ? 'Spitze kaum vom Untergrund zu unterscheiden' : pField.p < 0.75 ? 'direkt am Draht' : 'nahe am Draht');
     // kein Kontrast am Ende und der Pfeil ist kürzer als üblich oder gedrungen: vorderer Teil vermutlich unsichtbar
-    if (geoStrong && !usedAlt && !tm && endContrast < 35 && (visRatio < 0.9 || elong < 2.5)) { conf *= 0.6; if (pField.p >= 0.93 || !pField.byTail) reasons.push('Spitze kaum vom Untergrund zu unterscheiden'); }
+    if (geoStrong && !usedAlt && !tm && endContrast < 35 && (visRatio < 0.9 || elong < 2.5)) { conf *= soft(0.6); if (pField.p >= 0.93 || !pField.byTail) reasons.push('Spitze kaum vom Untergrund zu unterscheiden'); }
     // Spitze hinter einem bereits steckenden Pfeil? Dann ist der sichtbare Teil deutlich kürzer
     // als ein ganzer Pfeil und endet direkt an dessen Pixeln → Spitze liegt weiter vorne, unsicher.
     let occTouch = false;
@@ -1636,8 +1829,8 @@ export class DartDetector {
       }
       occTouch = touches;
       // ein ganzer Pfeil ist im Bild ca. 1,5–1,8 × so lang wie 100 mm senkrecht zur Scheibe
-      if (touches && L < 1.3 * exp.len) { conf *= 0.4; reasons.push('Spitze evtl. von anderem Pfeil verdeckt'); }
-      else if (touches) { conf *= 0.65; reasons.push('Spitze grenzt an anderen Pfeil (evtl. verdeckt)'); }
+      if (touches && L < 1.3 * exp.len) { conf *= soft(0.4); reasons.push('Spitze evtl. von anderem Pfeil verdeckt'); }
+      else if (touches) { conf *= soft(0.65); reasons.push('Spitze grenzt an anderen Pfeil (evtl. verdeckt)'); }
     }
 
     return {
@@ -1648,7 +1841,7 @@ export class DartDetector {
       conf: Math.max(0, Math.min(1, conf)),
       reasons,
       bbox,
-      axis: { elong, widthRatio, length: L, expLen: exp ? exp.len : 0, occTouch, visRatio, bridged, estimated, endContrast, tilt: dartTilt, tiltOther: tOther, tm: usedAlt ? null : tm, skew: (tipAtMin ? 1 : -1) * massSkew },
+      axis: { elong, widthRatio, length: L, expLen: exp ? exp.len : 0, occTouch, visRatio, bridged, estimated, endContrast, tilt: dartTilt, tiltOther: tOther, tm: usedAlt ? null : tm, skew: (tipAtMin ? 1 : -1) * massSkew, pWide, soft, fresh },
       pixels: pixels.length,
       pixelList: pixels,
     };

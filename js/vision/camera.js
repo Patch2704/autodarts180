@@ -167,17 +167,46 @@ class CameraService {
     return c.toDataURL('image/jpeg', quality);
   }
 
-  /** Ruft fn() periodisch auf, solange die Kamera läuft */
+  /**
+   * Zählt neue Videobilder (wo der Browser das meldet). Ohne das würde dasselbe Bild mehrfach ausgewertet, wenn die
+   * Kamera stockt – ein Pfeil im Flug sähe dann aus, als stünde er still.
+   */
+  watchFrames() {
+    const v = this.video;
+    if (!v.requestVideoFrameCallback) return;
+    const run = (this.watchRun = (this.watchRun || 0) + 1); // jeder Start zählt neu, alte Rückrufe laufen aus
+    const cb = () => { if (run !== this.watchRun || !this.loopOn) return; this.frameNo = (this.frameNo || 0) + 1; this.frameAt = performance.now(); v.requestVideoFrameCallback(cb); };
+    v.requestVideoFrameCallback(cb);
+  }
+
+  /** Neues Bild seit dem letzten Aufruf? (meldet der Browser keine Bilder: immer ja) */
+  nextFrame() {
+    const now = performance.now();
+    if (!this.frameAt || now - this.frameAt > 700) return true;
+    if (this.frameNo === this.usedNo) return false;
+    this.usedNo = this.frameNo;
+    return true;
+  }
+
+  /** Ruft fn() periodisch auf, solange die Kamera läuft; die Rechenzeit zählt zum Takt */
   startLoop(fn, fps = 10) {
     this.stopLoop();
+    this.loopOn = true; this.frameAt = 0;
+    this.watchFrames();
     const tick = () => {
-      if (this.active) { try { fn(); } catch (e) { console.error(e); } }
-      this.loopTimer = setTimeout(tick, 1000 / fps);
+      const t0 = performance.now();
+      let wait = 15;
+      if (this.active && this.nextFrame()) {
+        try { fn(); } catch (e) { console.error(e); }
+        wait = Math.max(10, 1000 / fps - (performance.now() - t0));
+      }
+      if (this.loopOn) this.loopTimer = setTimeout(tick, wait);
     };
     tick();
   }
 
   stopLoop() {
+    this.loopOn = false;
     clearTimeout(this.loopTimer);
     this.loopTimer = null;
   }

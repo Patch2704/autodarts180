@@ -354,8 +354,8 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
     slip();
     det.awaitTakeout();
     const hand = frame([]); const hd = hand.data; for (let i = 0; i < hd.length; i += 4 * 5) hd[i] = 0;
-    det.process(hand);
-    let tk = [];
+    // die Entnahme darf schon erkannt werden, während noch Bewegung im Bild ist
+    let tk = det.process(hand);
     for (let f = 0; f < 8; f++) tk = tk.concat(det.process(frame([])));
     res.phantom += tk.filter((e) => e.type === 'dart').length;
     if (!tk.some((e) => e.type === 'takeout')) res.noTakeout = (res.noTakeout || 0) + 1;

@@ -300,7 +300,7 @@ function drawScene(darts = []) {
   }
   return g.getImageData(0, 0, W, HH);
 }
-const { DartDetector } = await import('../js/vision/detector.js');
+const { DartDetector, measureRings, ringAdjust } = await import('../js/vision/detector.js');
 const cal = await import('../js/vision/calibration.js');
 test('Vision: Kalibrierqualität auf korrekt kalibrierter Szene > 90 %', () => {
   const q = cal.calibrationQuality(drawScene(), Hnorm).score;
@@ -585,7 +585,7 @@ const stressLog = [];
     const frame = (darts, hand) => { const img = d3.addNoiseFast(darts.length ? d3.drawDarts(base, cam, darts) : base, 4, seed++); if (hand) for (let y = 400; y < 760; y++) for (let x = 120; x < 330; x++) { const i = (y * w + x) * 4; img.data[i] = 200; img.data[i + 1] = 150; img.data[i + 2] = 120; } return img; };
     det.setCalibration(cam.H, w, h);
     const run = (darts, n = 10) => { const ev = []; for (let k = 0; k < n; k++) ev.push(...det.process(frame(darts))); return ev.map((e) => e.type); };
-    const hand = () => { for (let k = 0; k < 3; k++) det.process(frame([], k % 2 === 0)); };
+    const hand = () => { const ev = []; for (let k = 0; k < 3; k++) ev.push(...det.process(frame([], k % 2 === 0))); return ev.map((e) => e.type); }; // die Entnahme kann schon hier erkannt werden
     const rng = (() => { let s = 7; return () => (s = (s * 16807) % 2147483647) / 2147483647; })();
     const dart = (x, y) => d3.randomDart(rng, x, y, { preset: 'user', up: 20 });
     run([]);
@@ -601,18 +601,61 @@ const stressLog = [];
     const { det, run, hand, dart } = flow(), a = dart(40, 40), b = dart(46, 44), c = dart(36, 48);
     run([a]); run([a, b]); run([a, b, c]); ok(det.dartsOnBoard >= 2, `nur ${det.dartsOnBoard} erkannt`);
     det.awaitTakeout(); ok(!run([a, b, c], 30).includes('takeout'), 'Entnahme gemeldet, obwohl Pfeile stecken');
-    hand(); ok(run([]).includes('takeout'), 'Entnahme nicht erkannt'); eq(det.dartsOnBoard, 0);
+    ok([...hand(), ...run([])].includes('takeout'), 'Entnahme nicht erkannt'); eq(det.dartsOnBoard, 0);
   });
   test('Spielablauf: verworfener Pfeil („Kein Pfeil“) erzeugt beim Ziehen keinen neuen Treffer', () => {
     const { det, run, hand, dart } = flow(), a = dart(-50, 30);
     run([a]); det.forget(null); eq(det.dartsOnBoard, 0);
-    hand(); ok(!run([]).includes('dart'), 'Herausziehen als Treffer gemeldet');
+    ok(![...hand(), ...run([])].includes('dart'), 'Herausziehen als Treffer gemeldet');
     ok(run([dart(60, -40)]).includes('dart'), 'nächster Pfeil nicht erkannt');
   });
   test('Spielablauf: Rückgängig hebt das Warten auf das Herausziehen auf', () => {
     const { det, run, dart } = flow(), a = dart(20, 90);
     run([a]); det.awaitTakeout(); det.cancelWait(); eq(det.awaitingTakeout, false);
     ok(run([a, dart(-60, -30)]).includes('dart'), 'Pfeil nach Rückgängig nicht erkannt');
+  });
+  test('Spielablauf: Pfeil im Flug neben der Scheibe ist kein Treffer, der gesteckte danach schon', () => {
+    const w = 540, h = 960, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), base = d3.realScene(cam, w, h), det = new DartDetector();
+    let seed = 1; det.setCalibration(cam.H, w, h);
+    const frame = (darts, streak) => {
+      const img = d3.addNoiseFast(darts.length ? d3.drawDarts(base, cam, darts) : base, 4, seed++);
+      // verwischter Pfeil vor der Wand (rechts oben neben der Scheibe)
+      const p = applyH(cam.H, 130, 190), x0 = p.x * w, y0 = p.y * h;
+      if (streak) for (let t = 0; t < 90; t += 0.5) for (let o = -5; o <= 5; o += 0.5) { const x = Math.round(x0 + t * 0.7 - o * 0.7), y = Math.round(y0 - t * 0.7 - o * 0.7); if (x > 0 && y > 0 && x < w && y < h) { const i = (y * w + x) * 4; img.data[i] = 130; img.data[i + 1] = 110; img.data[i + 2] = 130; } }
+      return img;
+    };
+    const rng = (() => { let s = 7; return () => (s = (s * 16807) % 2147483647) / 2147483647; })(), a = d3.randomDart(rng, 30, 60, { preset: 'user', up: 20 });
+    for (let k = 0; k < 8; k++) det.process(frame([]));
+    det.checkNow = true; // das Flugbild trifft genau auf eine Auswertung
+    let evs = det.process(frame([], true)).map((e) => e.type);
+    ok(!evs.includes('dart'), 'Pfeil im Flug gezählt');
+    evs = []; for (let k = 0; k < 10; k++) evs.push(...det.process(frame([a])).map((e) => e.type));
+    eq(evs.filter((e) => e === 'dart').length, 1, 'gesteckter Pfeil');
+  });
+  test('Spielablauf: Hand vor der Scheibe bei steckenden Pfeilen ist keine Entnahme, nach dem Ziehen sofort', () => {
+    const { det, dart } = flow(), a = dart(40, 40), b = dart(-70, 60);
+    const w = 540, h = 960, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), base = d3.realScene(cam, w, h);
+    let seed = 50;
+    const frame = (darts, hx) => { const img = d3.addNoiseFast(darts.length ? d3.drawDarts(base, cam, darts) : base, 4, seed++); if (hx != null) for (let y = 380; y < 760; y++) for (let x = Math.max(0, hx); x < Math.min(w, hx + 170); x++) { const i = (y * w + x) * 4; img.data[i] = 200; img.data[i + 1] = 150; img.data[i + 2] = 120; } return img; };
+    const go = (darts, hx) => det.process(frame(darts, hx)).map((e) => e.type);
+    for (let k = 0; k < 10; k++) go([a]); for (let k = 0; k < 10; k++) go([a, b]);
+    eq(det.dartsOnBoard, 2); det.awaitTakeout();
+    for (let k = 0; k < 14; k++) ok(!go([a, b], 40 + k * 30).includes('takeout'), 'Entnahme gemeldet, obwohl Pfeile stecken');
+    for (let k = 0; k < 6; k++) ok(!go([a], 150 + (k % 2) * 40).includes('takeout'), 'Entnahme gemeldet, obwohl ein Pfeil steckt');
+    let n = 0, done = false; for (; n < 12 && !done; n++) done = go([], 260 + n * 30).includes('takeout');
+    ok(done, 'Entnahme nicht erkannt, während die Hand zurückgeht'); eq(det.dartsOnBoard, 0);
+    const evs = []; for (let k = 0; k < 12; k++) evs.push(...go([]));
+    ok(!evs.includes('dart'), 'Phantom nach der Entnahme');
+  });
+  test('Drahtringe: verschobene Ringe werden im Leerbild gefunden und auf die Nennmaße umgerechnet', () => {
+    const w = 700, h = 900, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), img = d3.realScene(cam, w, h);
+    const Hp = (k) => { const M = cam.H; return [M[0] * w * k, M[1] * w * k, M[2] * w, M[3] * h * k, M[4] * h * k, M[5] * h, M[6] * k, M[7] * k, M[8]]; };
+    for (const r of measureRings(img.data, w, h, Hp(1))) ok(Math.abs(r[1]) < 0.35, `Ring ${r[0]} ohne Verschiebung: ${r[1]}`);
+    // Maßstab 1 % größer angenommen: Ringe erscheinen weiter innen
+    const R = measureRings(img.data, w, h, Hp(1.01)), q = ringAdjust(R, 106.6, 0);
+    ok(R.find((r) => r[0] === 107)[1] < -0.4 && R.find((r) => r[0] === 162)[1] < -0.8, R.map((r) => r.join('/')).join(' '));
+    ok(q.x > 106.9, `umgerechnet ${q.x}`);
+    ok(Math.abs(ringAdjust(null, 30, 40).x - 30) < 1e-9);
   });
   test('Pfeilerkennung: „Kein Pfeil“ vergisst die Meldung vollständig', () => {
     const det = new DartDetector();

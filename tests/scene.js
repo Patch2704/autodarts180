@@ -30,7 +30,7 @@ export function renderScene({ w = 960, h = 540, pts, darts = [], seed = 1, light
       const r = Math.hypot(b.x, b.y);
       let c;
       if (r > 225) c = PAL.wall;
-      else if (r > R.DOUBLE_OUT) c = PAL.surround;
+      else if (r >= R.DOUBLE_OUT + 0.6) c = PAL.surround; // der äußere Doppeldraht liegt beidseits der Grenze
       else if (r <= R.DBULL) c = PAL.red;
       else if (r <= R.SBULL) c = PAL.green;
       else {

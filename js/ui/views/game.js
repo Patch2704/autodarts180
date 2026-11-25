@@ -89,6 +89,14 @@ export async function render(root, params) {
   // ---------- Wurf verbuchen ----------
   // Entnahme-Runde, in der die Pfeile der offenen Aufnahme stecken (detector.round zählt die Entnahmen)
   let visitRound = 0;
+  // Herausgezogene Pfeile werden nicht mehr eingezeichnet: hidden = { key: Aufnahme, n: so viele Darts davon }
+  let hidden = { key: '', n: 0 };
+  const shownVisit = (st) => st.openVisit || st.current.visits[st.current.visits.length - 1];
+  const visitKey = (st, v) => `${match.legs.length}/${st.current.visits.indexOf(v)}`;
+  function hideMarkers() {
+    const st = replay(match), v = shownVisit(st);
+    hidden = v ? { key: visitKey(st, v), n: v.darts.length } : { key: '', n: 0 };
+  }
   function commit(dart, round = detector.round) {
     if (paused || match.status !== 'running') return;
     const before = replay(match);
@@ -96,6 +104,8 @@ export async function render(root, params) {
     let res;
     try { res = addDart(match, dart); } catch (e) { toast(e.message, 'err'); return; }
     save();
+    // spät bestätigt: der Pfeil ist schon herausgezogen
+    if (inputMode === 'camera' && round < detector.round) hideMarkers();
     feedback(res, dart, p);
     draw();
     visitRound = before.openVisit ? Math.max(visitRound, round) : round;
@@ -431,6 +441,7 @@ export async function render(root, params) {
     const st = replay(match);
     const p = st.currentPlayer;
     if (ev.type === 'takeout') {
+      hideMarkers();
       if (st.openVisit && p != null && !isBot(p) && st.openVisit.dartCount < 3) {
         toast(`Pfeile entfernt, aber nur ${st.openVisit.dartCount} Dart(s) erkannt – fehlenden Dart eintragen oder „Aufnahme beenden“.`, 'err');
       } else toast(pending.length ? `Pfeile entfernt – noch ${pending.length} Treffer bestätigen` : 'Pfeile entfernt – bereit');
@@ -460,13 +471,14 @@ export async function render(root, params) {
     const ctx = sizeCanvas(camCanvas, camStage);
     drawBoard(ctx, cal.H, rect, { color: 'rgba(61,220,132,0.35)', numbers: false });
     const st = replay(match);
-    const v = st.openVisit || st.current.visits[st.current.visits.length - 1];
-    for (const d of v?.darts || []) {
-      if (!Number.isFinite(d.x)) continue;
+    const v = shownVisit(st);
+    const skip = v && visitKey(st, v) === hidden.key ? hidden.n : 0;
+    for (const [i, d] of (v?.darts || []).entries()) {
+      if (i < skip || !Number.isFinite(d.x)) continue;
       const q = applyH(cal.H, d.x, d.y);
       drawMarker(ctx, rect, q.x, q.y, `${d.label} – ${d.score}`);
     }
-    for (const pd of pending) drawMarker(ctx, rect, pd.ev.tip.x, pd.ev.tip.y, `${pd.dart.label}?`, '#f5b83d');
+    for (const pd of pending) if (pd.round === undefined || pd.round === detector.round) drawMarker(ctx, rect, pd.ev.tip.x, pd.ev.tip.y, `${pd.dart.label}?`, '#f5b83d');
     camStatus.textContent = `Erkennung: ${detStatus || '…'}${performance.now() < trackedUntil ? ' · Kalibrierung nachgeführt' : ''}${settingsLocked ? ' · Fokus fixiert' : ''}`;
   }
 
@@ -636,7 +648,7 @@ export async function render(root, params) {
       toast('Es scheinen noch Pfeile zu stecken – bitte zuerst herausziehen. Nochmal drücken übernimmt das Bild trotzdem.', 'err');
       return;
     }
-    detector.rebase(lastImg); pending = [];
+    detector.rebase(lastImg); pending = []; hideMarkers();
     toast('Referenzbild neu gesetzt'); draw();
   }
 
