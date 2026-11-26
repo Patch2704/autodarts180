@@ -7,6 +7,13 @@ import { mulberry32, gaussian } from './rng.js';
 
 export const BOT_AVERAGES = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120];
 
+// Wurftempo: dart = Abstand zwischen zwei Darts (ms), hold = so lange bleibt die fertige Aufnahme sichtbar
+export const BOT_SPEEDS = {
+  slow: { label: 'Langsam', dart: 1500, hold: 3500 },
+  normal: { label: 'Normal', dart: 900, hold: 2500 },
+  fast: { label: 'Schnell', dart: 400, hold: 1500 },
+};
+
 // score/dbl: relative Streuung beim Scoring bzw. auf Doppel; jitter: Schwankung von Aufnahme zu Aufnahme
 export const PERSONALITIES = {
   beginner: { label: 'Anfänger', score: 1.0, dbl: 1.25, jitter: 0.35, desc: 'Viele Fehlwürfe, unregelmäßige Aufnahmen, schwache Checkout-Quote.' },

@@ -911,6 +911,29 @@ export class DartDetector {
     return { px, before, after, conf, T };
   }
 
+  /** Anteil der veränderten Pixel auf schon steckenden Pfeilen, an denen wieder das Bild von vor diesem Pfeil zu sehen ist */
+  revealedShare(pixels) {
+    const set = new Uint8Array(this.w * this.h), cur = this.cur;
+    for (const p of pixels) set[p] = 1;
+    let back = 0, all = 0;
+    for (const m of this.dartMem) for (let k = 0; k < m.px.length; k++) {
+      const p = m.px[k];
+      if (!set[p]) continue;
+      let d = 0; for (let c = 0; c < 3; c++) d += Math.abs(m.after[k * 3 + c] - m.before[k * 3 + c]);
+      if (d < 60) continue;
+      let best = Infinity, da = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const i = (p + dy * this.w + dx) * 4;
+        if (i < 0 || i + 2 >= cur.length) continue;
+        let e = 0; for (let c = 0; c < 3; c++) e += Math.abs(cur[i + c] - m.before[k * 3 + c]);
+        if (e < best) best = e;
+      }
+      for (let c = 0; c < 3; c++) da += Math.abs(cur[p * 4 + c] - m.after[k * 3 + c]);
+      all++; if (best < 0.6 * da) back++;
+    }
+    return { share: all >= 15 ? back / all : 0, n: back };
+  }
+
   /** Sind alle bekannten Pfeile verschwunden? Je Pixel: Ist das Bild jetzt näher an „vorher“ oder an „mit Pfeil“? */
   allGone(data, E, need = 0.75) {
     const T = E.T;
@@ -1887,15 +1910,21 @@ export class DartDetector {
       else if (touches) { conf *= tm ? soft(0.65) : 0.65; reasons.push('Spitze grenzt an anderen Pfeil (evtl. verdeckt)'); }
     }
 
+    // Abpraller: Ein Pfeil prallt ab und stößt dabei einen steckenden Pfeil an. Die Veränderung liegt dann fast ganz auf
+    // diesem Pfeil, und an seiner alten Stelle ist wieder das Bild von vorher zu sehen → als Fehlwurf vorschlagen (nachfragen)
+    const rv = this.dartMem && this.dartMem.length && fresh < 0.3 ? this.revealedShare(pixels) : { share: 0, n: 0 }, revealed = rv.share;
+    const bounce = revealed > 0.25 && rv.n > 0.15 * n;
+    if (bounce) { conf = Math.min(conf, 0.3); reasons.push('vermutlich Abpraller: nur ein steckender Pfeil hat sich bewegt'); }
+
     return {
       tip: { x: (tip.x + 0.5) / this.w, y: (tip.y + 0.5) / this.h },
       far: { x: altPx.x, y: altPx.y }, tipPx: { x: tip.x, y: tip.y },
       board: { x: b.x, y: b.y },
-      hit: { seg: hit.seg, mult: hit.mult, score: hit.score, label: hit.label, wireDist: hit.wireDist, r: hit.r },
+      hit: bounce ? { seg: 0, mult: 0, score: 0, label: 'Miss', wireDist: 99, r: hit.r, bounce: true } : { seg: hit.seg, mult: hit.mult, score: hit.score, label: hit.label, wireDist: hit.wireDist, r: hit.r },
       conf: Math.max(0, Math.min(1, conf)),
       reasons,
       bbox,
-      axis: { elong, widthRatio, length: L, expLen: exp ? exp.len : 0, occTouch, visRatio, bridged, estimated, endContrast, tilt: dartTilt, tiltOther: tOther, tm: usedAlt ? null : tm, skew: (tipAtMin ? 1 : -1) * massSkew, dir: { x: ux * tdir, y: uy * tdir }, fineOk: geoStrong && !usedAlt && !axisFromModel && Math.hypot(b.x, b.y) < 200, pWide, soft, fresh, lift, pField: pField.p },
+      axis: { elong, widthRatio, length: L, expLen: exp ? exp.len : 0, occTouch, visRatio, bridged, estimated, endContrast, tilt: dartTilt, tiltOther: tOther, tm: usedAlt ? null : tm, skew: (tipAtMin ? 1 : -1) * massSkew, dir: { x: ux * tdir, y: uy * tdir }, fineOk: geoStrong && !bounce && !usedAlt && !axisFromModel && Math.hypot(b.x, b.y) < 200, pWide, soft, fresh, revealed, revealedN: rv.n / n, lift, pField: pField.p },
       pixels: pixels.length,
       pixelList: pixels,
     };

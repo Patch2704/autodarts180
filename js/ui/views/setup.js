@@ -2,7 +2,7 @@ import { h, icon, avatar, segControl, toast, clear } from '../dom.js';
 import { players as P, matches as M } from '../../data/repo.js';
 import { createMatch } from '../../core/x01.js';
 import { careerStats } from '../../core/stats.js';
-import { BOT_AVERAGES, PERSONALITIES } from '../../core/bot.js';
+import { BOT_AVERAGES, PERSONALITIES, BOT_SPEEDS } from '../../core/bot.js';
 import { settings, calibration } from '../../state.js';
 import { uid } from '../../core/rng.js';
 
@@ -22,6 +22,7 @@ export async function render(root) {
     legsToWin: last.legsToWin || 3,
     setsToWin: last.setsToWin || 1,
     inputMode: last.inputMode === 'camera' && calibration.current ? 'camera' : 'manual',
+    botSpeed: BOT_SPEEDS[last.botSpeed] ? last.botSpeed : 'normal',
     start: 'first',
   };
   // Teilnehmer: zuletzt gewählte Spieler, sofern noch vorhanden
@@ -131,7 +132,9 @@ export async function render(root) {
       h('div', { class: 'grid grid-2 stack-sm', style: { marginTop: '8px' } },
         h('label', { class: 'field' }, 'Persönlichkeit', persSel),
         h('label', { class: 'row', style: { fontWeight: 600, alignSelf: 'end', minHeight: '44px' } }, adaptBox, 'Adaptiv (an meine letzten 5 Matches anpassen)')),
-      h('button', { class: 'btn', style: { marginTop: '10px' }, onclick: addBot }, icon('plus'), 'Bot hinzufügen')),
+      h('button', { class: 'btn', style: { marginTop: '10px' }, onclick: addBot }, icon('plus'), 'Bot hinzufügen'),
+      h('label', { class: 'field', style: { marginTop: '12px' } }, 'Wurftempo des Bots',
+        segControl(Object.entries(BOT_SPEEDS).map(([value, v]) => ({ value, label: v.label })), cfg.botSpeed, (v) => { cfg.botSpeed = v; }))),
     h('label', { class: 'field', style: { marginTop: '12px' } }, 'Startspieler', startSel)));
   drawParts();
 
@@ -149,7 +152,7 @@ export async function render(root) {
     let startPlayer = 0;
     if (cfg.start === 'random') startPlayer = Math.floor(Math.random() * parts.length);
     else if (cfg.start !== 'first') startPlayer = Number(cfg.start) || 0;
-    const s = { startScore: cfg.startScore, inMode: cfg.inMode, outMode: cfg.outMode, bullIsDouble: cfg.bullIsDouble, legsToWin: cfg.legsToWin, setsToWin: cfg.setsToWin, startPlayer };
+    const s = { startScore: cfg.startScore, inMode: cfg.inMode, outMode: cfg.outMode, bullIsDouble: cfg.bullIsDouble, legsToWin: cfg.legsToWin, setsToWin: cfg.setsToWin, startPlayer, botSpeed: cfg.botSpeed };
     const m = createMatch({ settings: s, players: parts });
     m.inputMode = cfg.inputMode;
     await M.save(m);

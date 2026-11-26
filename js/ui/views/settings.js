@@ -44,15 +44,10 @@ export async function render(root) {
   const confLbl = h('b', { class: 'num' }, `${conf.value} %`);
   conf.oninput = () => { confLbl.textContent = `${conf.value} %`; };
   conf.onchange = () => settings.set('confThreshold', Number(conf.value) / 100);
-  const delay = h('input', { type: 'range', min: 300, max: 2000, step: 50, value: settings.get('botDelay') });
-  const delayLbl = h('b', { class: 'num' }, `${(delay.value / 1000).toFixed(2)} s`);
-  delay.oninput = () => { delayLbl.textContent = `${(delay.value / 1000).toFixed(2)} s`; };
-  delay.onchange = () => settings.set('botDelay', Number(delay.value));
   root.append(h('div', { class: 'card' }, h('h3', {}, 'Spiel und Erkennung'),
     toggle('cameraHigh', 'Hohe Kameraauflösung', 'Die Spitze der Pfeile wird im vollen Kamerabild nachgemessen. Ausschalten, wenn das Handy zu warm wird oder ruckelt (gilt ab dem nächsten Start der Kamera).'),
     toggle('keepAwake', 'Display eingeschaltet lassen', 'Während eines Matches geht der Bildschirm nicht aus (wenn vom Browser unterstützt)'),
     h('div', { class: 'switch-row' }, h('div', {}, h('div', { class: 't' }, 'Sicherheitsschwelle der Erkennung ', confLbl), h('div', { class: 'd' }, 'Darunter muss ein erkannter Pfeil bestätigt werden, bevor er zählt.')), h('div', { style: { width: '40%' } }, conf)),
-    h('div', { class: 'switch-row' }, h('div', {}, h('div', { class: 't' }, 'Bot-Wurftempo ', delayLbl)), h('div', { style: { width: '40%' } }, delay)),
     h('div', { class: 'switch-row' }, h('div', {}, h('div', { class: 't' }, 'Kamerakalibrierung'), h('div', { class: 'd' }, calibration.current ? `Gespeichert am ${fmt.dateTime(calibration.current.createdAt)}` : 'Nicht kalibriert')),
       h('div', { class: 'row' }, h('a', { class: 'btn sm', href: '#/camera' }, 'Öffnen'),
         calibration.current ? h('button', { class: 'btn sm danger', onclick: async () => { await calibration.clear(); toast('Kalibrierung gelöscht'); location.reload(); } }, 'Löschen') : null))));

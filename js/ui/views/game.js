@@ -7,7 +7,7 @@ import { replay, addDart, endVisit, undoDart, undoVisit, clearOpenVisit, replace
 import { matchStats } from '../../core/stats.js';
 import { checkoutInfo } from '../../core/checkout.js';
 import { makeDart } from '../../core/board.js';
-import { Bot } from '../../core/bot.js';
+import { Bot, BOT_SPEEDS } from '../../core/bot.js';
 import { settings, calibration } from '../../state.js';
 import { sfx, say } from '../../audio/sound.js';
 import { camera } from '../../vision/camera.js';
@@ -97,6 +97,28 @@ export async function render(root, params) {
     const st = replay(match), v = shownVisit(st);
     hidden = v ? { key: visitKey(st, v), n: v.darts.length } : { key: '', n: 0 };
   }
+  // Eine fertige Aufnahme bleibt in der Anzeige (Darts und aktiver Spieler), bis ihre Pfeile gezogen sind
+  // bzw. beim Bot noch eine kurze Pause lang. Erst dann wird auf den nächsten Spieler umgeschaltet.
+  let held = null, heldTimer = null;
+  const botSpeed = () => BOT_SPEEDS[match.settings.botSpeed] || { ...BOT_SPEEDS.normal, dart: settings.get('botDelay') || BOT_SPEEDS.normal.dart };
+  function heldVisit(st) {
+    if (!held || st.openVisit || match.status !== 'running') return null;
+    const v = st.current.visits[st.current.visits.length - 1];
+    return v && visitKey(st, v) === held ? v : null;
+  }
+  function holdVisit(ms) {
+    const st = replay(match);
+    const v = !st.openVisit && st.current.visits[st.current.visits.length - 1];
+    clearTimeout(heldTimer);
+    held = v && match.status === 'running' ? visitKey(st, v) : null;
+    if (held && ms) heldTimer = setTimeout(releaseHold, ms);
+  }
+  function releaseHold() {
+    clearTimeout(heldTimer);
+    if (!held) return;
+    held = null;
+    draw(); scheduleBot();
+  }
   // Kamera-Treffer, die erst gezählt werden, wenn wieder ein Mensch dran ist (der Bot wirft gerade)
   let deferred = [];
   function flushDeferred() {
@@ -123,6 +145,7 @@ export async function render(root, params) {
 
   function commit(dart, round = detector.round) {
     if (paused || match.status !== 'running') return;
+    held = null; clearTimeout(heldTimer);
     const before = replay(match);
     const p = before.currentPlayer;
     let res;
@@ -135,6 +158,7 @@ export async function render(root, params) {
     visitRound = before.openVisit ? Math.max(visitRound, round) : round;
     // Nur warten, wenn die Pfeile dieser Aufnahme noch nicht herausgezogen wurden (spät bestätigte Treffer)
     if (res.visit?.closed && !isBot(p) && inputMode === 'camera' && detector.round === visitRound) detector.awaitTakeout();
+    if (res.visit?.closed) { holdVisit(isBot(p) ? botSpeed().hold : inputMode === 'camera' && detector.awaitingTakeout ? 0 : 1500); draw(); }
     if (match.status === 'finished') { onFinished(); return; }
     scheduleBot();
     announceTurn(res, p);
@@ -190,8 +214,8 @@ export async function render(root, params) {
     const st = replay(match);
     const p = st.currentPlayer;
     if (p == null || !isBot(p)) { flushDeferred(); return; }
-    if (botWaits()) { draw(); return; }
-    const delay = settings.get('botDelay') || 750;
+    if (heldVisit(st) || botWaits()) { draw(); return; }
+    const delay = botSpeed().dart;
     botTimer = setTimeout(() => {
       if (paused || destroyed) return;
       const s2 = replay(match);
@@ -205,6 +229,7 @@ export async function render(root, params) {
   // ---------- Aktionen ----------
   function undo() {
     clearTimeout(botTimer);
+    held = null; clearTimeout(heldTimer);
     pending = [];
     detector.cancelWait();
     if (!hasHuman) undoDart(match);
@@ -283,7 +308,7 @@ export async function render(root, params) {
     const cal = calibration.current;
     if (!cal) { inputMode = 'manual'; draw(); return; }
     try {
-      await camera.start(cal.deviceId || undefined, cal.label, settings.get('cameraHigh') !== false);
+      await camera.start(cal.deviceId || undefined, cal.label, settings.get('cameraHigh') !== false && !highOff);
       if (camera.fellBack) toast('Die gespeicherte Kamera wurde nicht gefunden – bitte unter „Kamera“ neu kalibrieren.', 'err');
       if (cal.zoom && camera.zoomInfo()) await camera.setZoom(cal.zoom);
       camera.attach(camStage);
@@ -392,13 +417,20 @@ export async function render(root, params) {
     drawOverlay();
   }
 
-  // Kommt das Gerät mit der hohen Auflösung nicht mit, auf die normale umstellen (nur in den ersten Sekunden geprüft)
-  let grabMs = 0, grabN = 0;
+  // Kommt das Gerät mit der hohen Auflösung nicht mit, auf die normale umstellen. Die ersten Bilder nach dem Start sind oft langsam (Fokus, Speicher anlegen): erst danach messen, und zwar den
+  // Median über viele Bilder, damit einzelne Ausreißer nicht umschalten. Umgestellt wird nur für diese Sitzung.
+  let grabN = 0, grabMs = 0, highOff = false;
+  const grabList = [];
   function checkSpeed(ms) {
     grabN++; grabMs += (ms - grabMs) / Math.min(grabN, 20);
-    if (grabN !== 60 || grabMs < 60 || !camera.high || camera.resolution.w * camera.resolution.h < 4e6) return;
-    settings.set('cameraHigh', false);
-    toast('Das Gerät ist für die hohe Kameraauflösung zu langsam – es wird auf die normale umgestellt (Einstellungen → „Hohe Kameraauflösung“).', 'err');
+    if (grabN <= 60 || grabList.length >= 90) return;
+    grabList.push(ms);
+    if (grabList.length < 90 || !camera.high || camera.resolution.w * camera.resolution.h < 4e6) return;
+    const med = [...grabList].sort((a, b) => a - b)[45];
+    camera.grabMedian = med;
+    if (med < 80) return;
+    highOff = true;
+    toast(`Hohe Kameraauflösung für dieses Spiel ausgeschaltet: ein Bild zu holen dauerte ${Math.round(med)} ms. Die Erkennung läuft mit normaler Auflösung weiter.`);
     startCamera();
   }
 
@@ -501,6 +533,7 @@ export async function render(root, params) {
     const p = st.currentPlayer;
     if (ev.type === 'takeout') {
       hideMarkers();
+      held = null; clearTimeout(heldTimer);
       if (st.openVisit && p != null && !isBot(p) && st.openVisit.dartCount < 3) {
         toast(`Pfeile entfernt, aber nur ${st.openVisit.dartCount} Dart(s) erkannt – fehlenden Dart eintragen oder „Aufnahme beenden“.`, 'err');
       } else toast(pending.length ? `Pfeile entfernt – noch ${pending.length} Treffer bestätigen` : 'Pfeile entfernt – bereit');
@@ -564,6 +597,8 @@ export async function render(root, params) {
     const s = match.settings;
     const cur = st.current;
     const p = st.currentPlayer;
+    const hv = heldVisit(st); // fertige Aufnahme, die noch angezeigt wird
+    const shownP = hv ? hv.p : p;
 
     // Kopfzeile
     clear(top);
@@ -580,7 +615,7 @@ export async function render(root, params) {
       const ps = ms.players[i];
       const lastV = [...cur.visits].reverse().find((v) => v.p === i && v.closed);
       const legsTxt = s.setsToWin > 1 ? `S ${st.setsWon[i]} · L ${st.legsInSet[i]}` : `Legs ${st.legsInSet[i]}`;
-      playersEl.append(h('div', { class: `pcard ${i === p ? 'active' : ''}` },
+      playersEl.append(h('div', { class: `pcard ${i === shownP ? 'active' : ''}` },
         h('div', { class: 'name' }, pl.isBot ? icon('bot') : null, pl.name, cur.starter === i ? h('span', { class: 'badge', title: 'Hat das Leg begonnen' }, '●') : null),
         h('div', { class: 'legs' }, legsTxt),
         h('div', { class: 'rem' }, cur.rem[i]),
@@ -593,14 +628,14 @@ export async function render(root, params) {
 
     // Aktuelle Aufnahme
     clear(visitEl);
-    const ov = st.openVisit;
+    const ov = st.openVisit, sv = ov || hv;
     const li = match.legs.length - 1;
-    const vi = ov ? match.legs[li].visits.length - 1 : -1;
+    const vi = sv ? match.legs[li].visits.length - 1 : -1;
     // geworfene Darts; in den freien Feldern steht der Weg zum Finish (nach jedem Wurf neu berechnet)
-    const plan = targetPlan(st);
-    const thrown = ov?.darts.length || 0;
+    const plan = hv ? [] : targetPlan(st);
+    const thrown = sv?.darts.length || 0;
     for (let k = 0; k < 3; k++) {
-      const d = ov?.darts[k], t = plan[k - thrown];
+      const d = sv?.darts[k], t = plan[k - thrown];
       if (d) {
         visitEl.append(h('div', { class: `dslot pop ${d.bust ? 'bust' : ''}`, title: 'Antippen zum Korrigieren', onclick: () => editDart(li, vi, k) },
           d.source === 'camera' ? icon('camera', 'cam') : null, d.label, h('small', {}, d.points)));
@@ -610,7 +645,7 @@ export async function render(root, params) {
         visitEl.append(h('div', { class: 'dslot empty' }, '–', h('small', {}, `Dart ${k + 1}`)));
       }
     }
-    visitEl.append(h('div', { class: 'vsum' }, ov ? ov.scored : 0, h('small', {}, 'Aufnahme')));
+    visitEl.append(h('div', { class: 'vsum' }, sv ? (sv.bust ? 'Bust' : sv.scored) : 0, h('small', {}, hv ? `Aufnahme ${match.players[hv.p].name}` : 'Aufnahme')));
 
     // Match beendet
     clear(checkoutEl);
@@ -631,10 +666,10 @@ export async function render(root, params) {
     const waitingTakeout = inputMode === 'camera' && detector.awaitingTakeout;
     actionsEl.append(...[
       h('button', { class: 'btn', onclick: undo, disabled: paused }, icon('undo'), 'Rückgängig'),
-      h('button', { class: 'btn', disabled: !ov || !ov.dartCount || botTurn || paused, onclick: () => { endVisit(match); if (inputMode === 'camera') detector.awaitTakeout(); save(); draw(); scheduleBot(); } }, icon('check'), 'Aufnahme beenden'),
+      h('button', { class: 'btn', disabled: !ov || !ov.dartCount || botTurn || paused, onclick: () => { endVisit(match); if (inputMode === 'camera') { detector.awaitTakeout(); holdVisit(0); } save(); draw(); scheduleBot(); } }, icon('check'), 'Aufnahme beenden'),
       h('button', { class: 'btn', disabled: !ov || botTurn || paused, onclick: () => { clearOpenVisit(match); pending = []; detector.cancelWait(); save(); draw(); } }, icon('refresh'), 'Aufnahme wiederholen'),
       h('button', { class: 'btn', disabled: botTurn || paused, onclick: async () => { if (!(await confirmDialog('Die komplette letzte Aufnahme entfernen?'))) return; clearTimeout(botTimer); undoVisit(match); pending = []; detector.cancelWait(); save(); draw(); scheduleBot(); } }, icon('undo'), 'Aufnahme löschen'),
-      calibration.current ? h('button', { class: 'btn', onclick: () => { inputMode = inputMode === 'camera' ? 'manual' : 'camera'; match.inputMode = inputMode; save(); if (inputMode === 'camera') startCamera(); else stopCamera(); draw(); } }, icon(inputMode === 'camera' ? 'hand' : 'camera'), inputMode === 'camera' ? 'Nur Tastenfeld' : 'Kamera an') : null,
+      calibration.current ? h('button', { class: 'btn', onclick: () => { held = null; inputMode = inputMode === 'camera' ? 'manual' : 'camera'; match.inputMode = inputMode; save(); if (inputMode === 'camera') startCamera(); else stopCamera(); draw(); } }, icon(inputMode === 'camera' ? 'hand' : 'camera'), inputMode === 'camera' ? 'Nur Tastenfeld' : 'Kamera an') : null,
       inputMode === 'camera' ? h('button', { class: `btn ${waitingTakeout ? 'primary' : ''}`, onclick: resetReference }, icon('hand'), waitingTakeout ? 'Pfeile entfernt' : 'Referenz neu') : null,
       inputMode === 'camera' ? h('button', { class: 'btn', disabled: !lastImg || botTurn, onclick: redetect }, icon('refresh'), 'Erneut erkennen') : null,
       inputMode === 'camera' ? h('button', { class: 'btn', onclick: exportDetections, title: 'Bilder der letzten erkannten Pfeile (vorher/nachher mit erkannter Spitze) speichern, z. B. zur Fehleranalyse' }, icon('download'), 'Erkennung speichern') : null,
@@ -737,7 +772,7 @@ export async function render(root, params) {
       toast('Es scheinen noch Pfeile zu stecken – bitte zuerst herausziehen. Nochmal drücken übernimmt das Bild trotzdem.', 'err');
       return;
     }
-    detector.rebase(lastImg); pending = []; hideMarkers();
+    detector.rebase(lastImg); pending = []; hideMarkers(); held = null; clearTimeout(heldTimer);
     toast('Referenzbild neu gesetzt'); draw(); scheduleBot();
   }
 

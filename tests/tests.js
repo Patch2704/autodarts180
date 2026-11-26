@@ -7,7 +7,10 @@ import { solveHomography, applyH, invertH } from '../js/vision/homography.js';
 import { createMatch as _cm } from '../js/core/x01.js';
 
 const results = [];
+// ?only=Text: nur Tests, deren Name den Text enthält (zum schnellen Prüfen einzelner Tests)
+const ONLY = typeof location !== "undefined" ? new URLSearchParams(location.search).get("only") : null;
 function test(name, fn) {
+  if (ONLY && !name.includes(ONLY)) return;
   try { fn(); results.push({ name, ok: true }); }
   catch (e) { results.push({ name, ok: false, err: e.message }); }
 }
@@ -613,6 +616,22 @@ const stressLog = [];
     const { det, run, dart } = flow(), a = dart(20, 90);
     run([a]); det.awaitTakeout(); det.cancelWait(); eq(det.awaitingTakeout, false);
     ok(run([a, dart(-60, -30)]).includes('dart'), 'Pfeil nach Rückgängig nicht erkannt');
+  });
+  test('Abpraller: ein angestoßener steckender Pfeil zählt nie ohne Rückfrage, ein neuer Pfeil daneben gilt nicht als Abpraller', () => {
+    for (const [ax, ay] of [[40, 60], [-60, -90]]) {
+      const { det, run, dart } = flow(), a = dart(ax, ay);
+      run([a]); eq(det.dartsOnBoard, 1);
+      // angestoßen: Spitze bleibt stecken, der Pfeil kippt etwas zur Seite und nach oben
+      const t = 0.05, d = a.dir, b = { ...a, dir: [d[0] * Math.cos(t) + d[2] * Math.sin(t), d[1] + 0.04, d[2] * Math.cos(t) - d[0] * Math.sin(t)] };
+      const evs = []; const w = 540, h = 960, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), base = d3.realScene(cam, w, h);
+      for (let k = 0; k < 10; k++) evs.push(...det.process(d3.addNoiseFast(d3.drawDarts(base, cam, [b]), 4, 900 + k)).filter((e) => e.type === 'dart'));
+      for (const e of evs) ok(e.conf < 0.6, `angestoßener Pfeil als ${e.hit.label} ${Math.round(e.conf * 100)} % fr ${e.axis.fresh?.toFixed(2)} rv ${e.axis.revealed?.toFixed(2)}/${e.axis.revealedN?.toFixed(2)} (${e.reasons})`);
+    }
+    const { det, run, dart } = flow(), a = dart(40, 60), c = dart(52, 66);
+    run([a]);
+    const evs = []; const w = 540, h = 960, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), base = d3.realScene(cam, w, h);
+    for (let k = 0; k < 10; k++) evs.push(...det.process(d3.addNoiseFast(d3.drawDarts(base, cam, [a, c]), 4, 950 + k)).filter((e) => e.type === 'dart'));
+    eq(evs.length, 1, 'neuer Pfeil'); ok(!evs[0].hit.bounce, `neuer Pfeil als Abpraller (${evs[0].reasons})`);
   });
   test('Spielablauf: Pfeil im Flug neben der Scheibe ist kein Treffer, der gesteckte danach schon', () => {
     const w = 540, h = 960, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), base = d3.realScene(cam, w, h), det = new DartDetector();
