@@ -617,6 +617,19 @@ const stressLog = [];
     run([a]); det.awaitTakeout(); det.cancelWait(); eq(det.awaitingTakeout, false);
     ok(run([a, dart(-60, -30)]).includes('dart'), 'Pfeil nach Rückgängig nicht erkannt');
   });
+  // Nur seitlich versetzte Paare: Liegt der zweite Pfeil im Bild genau auf der Achse des ersten, wird er bisher oft
+  // nicht erkannt (bekannte Lücke, siehe STATUS.md)
+  test('Zwei Pfeile auf einmal, seitlich versetzt und gleich gerichtet: beide gemeldet, mit Rückfrage', () => {
+    const w = 540, h = 960, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), base = d3.realScene(cam, w, h);
+    const bad = [];
+    for (const [x, y, ox, oy] of [[-15, 124, -10, 15], [-15, 124, 14, 8], [40, 60, -10, 15], [40, 60, 14, 8]]) {
+      const { det, dart } = flow(), a = dart(x, y), b = { ...a, x: x + ox, y: y + oy };
+      const evs = []; for (let k = 0; k < 10; k++) evs.push(...det.process(d3.addNoiseFast(d3.drawDarts(base, cam, [a, b]), 4, 700 + k)).filter((e) => e.type === 'dart'));
+      const want = [scoreAt(a.x, a.y).label, scoreAt(b.x, b.y).label].sort().join('+'), got = evs.map((e) => e.hit.label).sort().join('+');
+      if (evs.length !== 2 || evs.some((e) => e.conf >= 0.6) || got !== want) bad.push(`(${x}, ${y}) +${ox}/${oy}: ${evs.map((e) => `${e.hit.label} ${Math.round(e.conf * 100)} %`).join(', ') || 'nichts'} statt ${want}`);
+    }
+    ok(!bad.length, bad.join(' · '));
+  });
   test('Abpraller: ein angestoßener steckender Pfeil zählt nie ohne Rückfrage, ein neuer Pfeil daneben gilt nicht als Abpraller', () => {
     for (const [ax, ay] of [[40, 60], [-60, -90]]) {
       const { det, run, dart } = flow(), a = dart(ax, ay);

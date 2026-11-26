@@ -832,7 +832,8 @@ export class DartDetector {
     // Nur eine klar sichtbare Spitze vor einem klar sichtbaren Barrel zählt; große Sprünge nur bei sehr klarem Signal
     const expMm = a.tm ? a.tm.mu / this.pxPerMm : ((this.tipRho && this.tipRho.v) || 0.08) * Math.hypot(det.tipPx.x - det.far.x, det.tipPx.y - det.far.y) / this.pxPerMm;
     r.expMm = expMm;
-    if (r.m > 1.5 * expMm + 2) return;
+    // (eine längere Spitze als erwartet zählt nur, wenn sie die grobe Spitze bestätigt statt sie zu verschieben)
+    if (r.m > 1.5 * expMm + 2 && mm > 1.5) return;
     if (r.strength < 8 || r.m < 2.5 || r.Wb < 4 || r.Wb > 10.5 || mm > (r.strength > 15 ? 9 : 5)) return;
     const b = r.board;
     if (!Number.isFinite(b.x)) return;
@@ -1233,11 +1234,24 @@ export class DartDetector {
       const bins = new Map();
       for (const [, al, pe] of front) { const k = Math.round(al / 2); const b = bins.get(k) || [Infinity, -Infinity]; b[0] = Math.min(b[0], pe); b[1] = Math.max(b[1], pe); bins.set(k, b); }
       for (const b of bins.values()) widths.push(b[1] - b[0]);
-      widths.sort((x, y) => x - y);
-      if (widths.length < 10 * s || widths[Math.floor(widths.length * 0.5)] < 12.5 * s) return null;
-      const ps = front.map(([, , pe]) => pe).sort((x, y) => x - y), p5 = ps[Math.floor(ps.length * 0.05)], p95 = ps[Math.floor(ps.length * 0.95)];
-      const cut = p95 > -p5 ? p95 / 2 : p5 / 2;
-      best = front.filter(([, , pe]) => (p95 > -p5 ? pe > cut : pe < cut)).map(([p]) => p);
+      const sorted = widths.slice().sort((x, y) => x - y);
+      if (sorted.length < 10 * s) return null;
+      if (sorted[Math.floor(sorted.length * 0.5)] >= 12.5 * s) {
+        const ps = front.map(([, , pe]) => pe).sort((x, y) => x - y), p5 = ps[Math.floor(ps.length * 0.05)], p95 = ps[Math.floor(ps.length * 0.95)];
+        const cut = p95 > -p5 ? p95 / 2 : p5 / 2;
+        best = front.filter(([, , pe]) => (p95 > -p5 ? pe > cut : pe < cut)).map(([p]) => p);
+      } else {
+        // … oder zwei Pfeile nebeneinander, der zweite steckt weiter hinten: vorn ein Barrel, dahinter ein durchgehend
+        // doppelt so breiter Streifen, der zu einer Seite über das vordere Barrel hinausragt
+        const keys = [...bins.keys()].sort((a, b) => a - b), nf = Math.max(3, Math.round(keys.length * 0.15));
+        const fr = keys.slice(0, nf).map((k) => bins.get(k)), lo = Math.min(...fr.map((b) => b[0])), hi = Math.max(...fr.map((b) => b[1])), one = hi - lo;
+        const rear = keys.slice(Math.round(keys.length * 0.4)).map((k) => bins.get(k));
+        const wr = rear.map((b) => b[1] - b[0]).sort((x, y) => x - y)[Math.floor(rear.length * 0.75)];
+        const out = rear.filter((b) => Math.max(b[1] - hi, lo - b[0]) > 0.6 * one);
+        if (one > 10 * s || !(wr >= Math.max(1.6 * one, 13 * s)) || out.length < 0.35 * rear.length) return null;
+        const right = out.reduce((n, b) => n + (b[1] - hi > lo - b[0] ? 1 : -1), 0) > 0, k0 = keys[nf];
+        best = front.filter(([, al, pe]) => Math.round(al / 2) >= k0 && (right ? pe > hi + 1 : pe < lo - 1)).map(([p]) => p);
+      }
     }
     if (best.length < 60 || elongation(best, w) < 2.5) return null;
     let x0 = w, y0 = this.h, x1 = 0, y1 = 0;
