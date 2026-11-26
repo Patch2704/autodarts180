@@ -42,9 +42,9 @@
   Object.defineProperty(w.navigator, 'canShare', { value: () => false, configurable: true });
   const st = await imp('js/state.js'), repo = await imp('js/data/repo.js'), x01 = await imp('js/core/x01.js'), det = await imp('js/vision/detector.js');
   const times = [], evTimes = [];
-  const stamps = [], blocks = [], markLog = [], botLog = [], shownLog = [];
-  const op = det.DartDetector.prototype.process; const evLog = [];
-  det.DartDetector.prototype.process = function (img) { const t = performance.now(); const r = op.call(this, img); times.push(performance.now() - t); window.__size = `${img.width}×${img.height}`; for (const e of r) { evLog.push(e.type); stamps.push([e.type, performance.now()]); } return r; };
+  const stamps = [], blocks = [], markLog = [], botLog = [], shownLog = [], partLog = [];
+  const op = det.DartDetector.prototype.process; const evLog = [], hitLog = [];
+  det.DartDetector.prototype.process = function (img) { const t = performance.now(); const r = op.call(this, img); times.push(performance.now() - t); window.__size = `${img.width}×${img.height}`; for (const e of r) { evLog.push(e.type); stamps.push([e.type, performance.now()]); if (e.hit) hitLog.push(`${e.type} ${e.id} ${e.hit.label} ${Math.round(e.conf * 100)} % (${e.board.x.toFixed(1)}, ${e.board.y.toFixed(1)}) [${e.reasons}]`); } return r; };
   const osc = det.DartDetector.prototype.setCalibration; det.DartDetector.prototype.setCalibration = function (...a) { window.__cal = (window.__cal || 0) + 1; return osc.apply(this, a); };
   const oe = det.DartDetector.prototype.evaluate;
   det.DartDetector.prototype.evaluate = function (d) { const t = performance.now(); const r = oe.call(this, d); evTimes.push(performance.now() - t); return r; };
@@ -67,7 +67,7 @@
   const doc = fr.contentDocument;
   log(`Kamera ${W}×${H}, Blick ${deg}°/${tilt}°, Status: ${doc.querySelector('.cam-status')?.textContent}`);
   const rng = mulberry32(Number(q.get('seed') ?? 7));
-  const truth = [], asked = [];
+  const truth = [], asked = [], truthPos = [];
   const btn = (t) => [...doc.querySelectorAll('button')].find((b) => b.textContent.trim().startsWith(t));
   const mode = q.get('mode') || '';
   const padClick = () => { const b = [...doc.querySelectorAll('button')].find((x) => x.textContent.trim() === '1'); if (b) b.click(); else log('Tastenfeld nicht gefunden'); };
@@ -79,7 +79,7 @@
     for (let k = 0; k < 3; k++) {
       const a = rng() * 2 * Math.PI, r = 12 + rng() * 150, x = r * Math.cos(a), y = r * Math.sin(a);
       darts.push(D.randomDart(rng, x, y, q.get('preset') ? { preset: q.get('preset'), maxTilt: 25 } : { preset: 'user', up: 20 }));
-      truth.push(scoreAt(x, y).label);
+      truth.push(scoreAt(x, y).label); truthPos.push(`${x.toFixed(1)},${y.toFixed(1)}`);
       doSlip(); setScene(darts);
       await sleep(2500);
       // mode=late: Rückfragen erst nach dem Herausziehen bestätigen; mode=manual: alles verwerfen und von Hand eintragen
@@ -94,6 +94,9 @@
     const shown = () => `${doc.querySelector('.pcard.active .name')?.textContent || '–'}: ${[...doc.querySelectorAll('.visit .dslot')].map((e) => [...e.childNodes].find((n) => n.nodeType === 3)?.textContent.trim() || "?").join(' ')}`;
     const s0 = shown();
     const botBefore = q.get('bot') ? (await repo.matches.get(m.id)).legs.flatMap((l) => l.visits).filter((x) => x.p === 1).length : 0;
+    // pull=partial: erst die sicheren Pfeile ziehen, die offenen (mit „?“) stecken noch (Nachwertung)
+    const openIdx = [...doc.querySelectorAll('.visit .dslot')].map((e, i) => (/\?$/.test([...e.childNodes].find((n) => n.nodeType === 3)?.textContent || '') ? i : -1)).filter((i) => i >= 0);
+    if (q.get('pull') === 'partial' && openIdx.length) { hand = true; await sleep(1200); doSlip(); setScene(darts.filter((_, i) => openIdx.includes(i))); await sleep(300); hand = false; await sleep(2500); partLog.push(shown()); }
     hand = true; await sleep(1500); doSlip(); setScene([]); await sleep(300); for (let k = 0; k < Number(q.get('slow') || 0); k++) { handX += 0.06; await sleep(100); } hand = false; handX = 0; if (q.get("sway")) { sway = Number(q.get("sway")); swayAt = performance.now(); } const tFree = performance.now(); let worst = 0, last = tFree; const iv = setInterval(() => { const n = performance.now(); worst = Math.max(worst, n - last); last = n; }, 20); await sleep(Number(q.get('pause') || 2500)); clearInterval(iv); const tk = stamps.find(([t, at]) => t === 'takeout' && at > tFree); if (q.get('bot')) { const vv = (await repo.matches.get(m.id)).legs.flatMap((l) => l.visits); botLog.push(`${botBefore}/${vv.filter((x) => x.p === 1).length}`); }
     markLog.push(`${m0}→${marks()}`); shownLog.push(`[${s0}] → [${shown()}]`); blocks.push(`${tk ? Math.round(tk[1] - tFree) : '–'}/${Math.round(worst)}`);
     if (mode) {
@@ -106,11 +109,14 @@
   const mm = await repo.matches.get(m.id);
   const got = mm.legs.flatMap((l) => l.visits.flatMap((x) => x.darts.map((d) => d.label)));
   log(`Wahrheit: ${truth.join(' ')}`); log(`Erkannt:  ${got.join(' ')}`); log(`Rückfragen bei Pfeil: ${asked.join(', ') || 'keine'}`);
+  log(`Wahre Lagen: ${truthPos.join(" · ")}`);
+  log(`Treffer: ${hitLog.join(" · ")}`);
   log(`Aufnahmen: ${mm.legs.flatMap((l) => l.visits).map((x) => x.darts.length).join(', ')} | Ereignisse: ${evLog.join(',')}`);
   const s = (a) => a.length ? `Ø ${(a.reduce((x, y) => x + y, 0) / a.length).toFixed(1)} ms, max ${Math.max(...a).toFixed(0)} ms` : '-';
   log(`Bildgröße Auswertung ${window.__size}; pro Bild ${s(times)}; Auswertung ${s(evTimes)}; Bilder ${times.length}`);
   log(`Hand weg → Entnahme erkannt / längste Blockade (ms): ${blocks.join(', ')}; Neukalibrierungen ${window.__cal || 0}`);
   log(`Markierte Bildpunkte vor/nach dem Herausziehen: ${markLog.join(', ')}`);
+  if (partLog.length) log(`Anzeige nach dem teilweisen Ziehen: ${partLog.join(' · ')}`);
   log(`Anzeige vor dem Ziehen → danach: ${shownLog.join(' · ')}`);
   if (q.get('bot')) log(`Bot-Aufnahmen vor dem Ziehen / danach: ${botLog.join(', ')} (Folge der Spieler: ${(await repo.matches.get(m.id)).legs.flatMap((l) => l.visits).map((x) => (x.p ? 'B' : 'T') + x.darts.length).join(' ')})`);
   log('Hinweise: ' + [...doc.querySelectorAll('.notice')].map((n) => n.textContent).join(' | '));

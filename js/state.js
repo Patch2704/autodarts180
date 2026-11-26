@@ -13,6 +13,7 @@ const DEFAULTS = {
   keepAwake: true,
   cameraHigh: true,
   confThreshold: 0.6,
+  revealLater: true,
   collectSamples: false,
   mainPlayer: null,
   botDelay: 750,

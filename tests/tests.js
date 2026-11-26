@@ -617,6 +617,47 @@ const stressLog = [];
     run([a]); det.awaitTakeout(); det.cancelWait(); eq(det.awaitingTakeout, false);
     ok(run([a, dart(-60, -30)]).includes('dart'), 'Pfeil nach Rückgängig nicht erkannt');
   });
+  test('Nachwertung: offener Pfeil wird nach dem Ziehen des vorderen frei ausgewertet, die Entnahme kommt erst danach', () => {
+    const w = 540, h = 960, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), base = d3.realScene(cam, w, h);
+    const bad = [];
+    for (const [bx, by, ax, ay] of [[-10, 110, -14, 92], [40, 60, 30, 48], [-60, -40, -70, -52]]) {
+      const { det, dart } = flow(), b = dart(bx, by), a = dart(ax, ay);
+      let seed = 300;
+      const frame = (darts, hand) => { const img = d3.addNoiseFast(darts.length ? d3.drawDarts(base, cam, darts) : base, 4, seed++); if (hand) for (let y = 400; y < 760; y++) for (let x = 120; x < 330; x++) { const i = (y * w + x) * 4; img.data[i] = 200; img.data[i + 1] = 150; img.data[i + 2] = 120; } return img; };
+      const go = (darts, n = 10, hand = false) => { const ev = []; for (let k = 0; k < n; k++) ev.push(...det.process(frame(darts, hand && k % 2 === 0))); return ev; };
+      const e1 = go([b]).filter((e) => e.type === 'dart'), e2 = go([b, a]).filter((e) => e.type === 'dart');
+      if (e1.length !== 1 || e2.length !== 1) { bad.push(`(${bx}, ${by}): Pfeile nicht einzeln erkannt`); continue; }
+      det.setOpen(e1[0].id, true); det.awaitTakeout();
+      // vorderer (zuletzt geworfener) Pfeil wird gezogen, der hintere steckt noch
+      const ev = [...go([b], 3, true), ...go([b], 14)];
+      const rv = ev.filter((e) => e.type === 'reveal'), want = scoreAt(b.x, b.y).label;
+      if (ev.some((e) => e.type === 'takeout')) bad.push(`(${bx}, ${by}): Entnahme gemeldet, obwohl der offene Pfeil steckt`);
+      else if (rv.length !== 1 || rv[0].id !== e1[0].id) bad.push(`(${bx}, ${by}): keine Nachwertung (${ev.map((e) => e.type).join(',')})`);
+      else if (rv[0].hit.label !== want) bad.push(`(${bx}, ${by}): nachgewertet ${rv[0].hit.label} statt ${want}`);
+      // danach alles gezogen: Entnahme
+      if (!go([], 3, true).concat(go([], 12)).some((e) => e.type === 'takeout')) bad.push(`(${bx}, ${by}): Entnahme danach nicht erkannt`);
+    }
+    ok(!bad.length, bad.join(' · '));
+  });
+  test('Start mit schon steckenden Pfeilen: Mit einem Bild der leeren Scheibe werden sie gleich gewertet, ohne Pfeile kein Phantom', () => {
+    const w = 540, h = 960, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), base = d3.realScene(cam, w, h);
+    const rng = (() => { let s = 11; return () => (s = (s * 16807) % 2147483647) / 2147483647; })();
+    // (nicht in einer Linie: Liegen mehrere neue Pfeile im Bild hintereinander, werden sie bisher oft zu einem zusammengefasst)
+    const a = d3.randomDart(rng, 80, 20, { preset: 'user', up: 20 }), b = d3.randomDart(rng, -60, 90, { preset: 'user', up: 20 });
+    let seed = 500;
+    const empty = d3.addNoiseFast(base, 4, seed++), snap = { data: empty.data.slice(), w, h };
+    const start = (darts) => { const det = new DartDetector(); det.setCalibration(cam.H, w, h); const img = d3.addNoiseFast(darts.length ? d3.drawDarts(base, cam, darts) : base, 4, seed++); det.rebase(img); return det; };
+    // zwei Pfeile stecken schon
+    let det = start([a, b]);
+    ok(det.adoptEmpty(snap), 'Leerbild nicht übernommen');
+    const evs = []; for (let k = 0; k < 10; k++) evs.push(...det.process(d3.addNoiseFast(d3.drawDarts(base, cam, [a, b]), 4, seed++)).filter((e) => e.type === 'dart'));
+    eq(evs.map((e) => e.hit.label).sort().join('+'), [scoreAt(a.x, a.y).label, scoreAt(b.x, b.y).label].sort().join('+'));
+    // leere Scheibe: nichts übernehmen, kein Phantom
+    det = start([]);
+    ok(!det.adoptEmpty(snap), 'Leerbild bei leerer Scheibe übernommen');
+    const e2 = []; for (let k = 0; k < 10; k++) e2.push(...det.process(d3.addNoiseFast(base, 4, seed++)).filter((e) => e.type === 'dart'));
+    eq(e2.length, 0, 'Phantom');
+  });
   // Nur seitlich versetzte Paare: Liegt der zweite Pfeil im Bild genau auf der Achse des ersten, wird er bisher oft
   // nicht erkannt (bekannte Lücke, siehe STATUS.md)
   test('Zwei Pfeile auf einmal, seitlich versetzt und gleich gerichtet: beide gemeldet, mit Rückfrage', () => {

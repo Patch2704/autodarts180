@@ -46,6 +46,7 @@ export async function render(root) {
   conf.onchange = () => settings.set('confThreshold', Number(conf.value) / 100);
   root.append(h('div', { class: 'card' }, h('h3', {}, 'Spiel und Erkennung'),
     toggle('cameraHigh', 'Hohe Kameraauflösung', 'Die Spitze der Pfeile wird im vollen Kamerabild nachgemessen. Ausschalten, wenn das Handy zu warm wird oder ruckelt (gilt ab dem nächsten Start der Kamera).'),
+    toggle('revealLater', 'Unsichere Pfeile beim Ziehen nachwerten', 'Statt nachzufragen bleibt ein unsicherer (z. B. verdeckter) Pfeil offen. Zieh nach der Aufnahme zuerst die Pfeile, die ihn verdecken – dann wird er neu ausgewertet. Gefragt wird nur, wenn das nicht klappt.'),
     toggle('keepAwake', 'Display eingeschaltet lassen', 'Während eines Matches geht der Bildschirm nicht aus (wenn vom Browser unterstützt)'),
     h('div', { class: 'switch-row' }, h('div', {}, h('div', { class: 't' }, 'Sicherheitsschwelle der Erkennung ', confLbl), h('div', { class: 'd' }, 'Darunter muss ein erkannter Pfeil bestätigt werden, bevor er zählt.')), h('div', { style: { width: '40%' } }, conf)),
     h('div', { class: 'switch-row' }, h('div', {}, h('div', { class: 't' }, 'Kamerakalibrierung'), h('div', { class: 'd' }, calibration.current ? `Gespeichert am ${fmt.dateTime(calibration.current.createdAt)}` : 'Nicht kalibriert')),

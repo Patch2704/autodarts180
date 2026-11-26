@@ -26,6 +26,10 @@ const spoken = (label) => {
   return (m[1] === 'T' ? 'Triple ' : m[1] === 'D' ? 'Doppel ' : '') + m[2];
 };
 
+// Bild der leeren Scheibe aus dem letzten Spiel (nur im Speicher, nur in dieser Sitzung): Wird beim Start schon
+// geworfen, bevor die Erkennung bereit ist, lassen sich die steckenden Pfeile damit trotzdem werten
+let emptyCache = null;
+
 export async function render(root, params) {
   const match = await M.get(params[0]);
   if (!match) {
@@ -36,6 +40,7 @@ export async function render(root, params) {
   let paused = false;
   let botTimer = null;
   let pending = []; // unsichere Kamera-Erkennungen
+  const clearPending = () => { pending = []; for (const m of detector.dartMem || []) m.open = false; };
   let camWarnings = [];
   let wakeLock = null;
   let lastHealth = 0;
@@ -230,7 +235,7 @@ export async function render(root, params) {
   function undo() {
     clearTimeout(botTimer);
     held = null; clearTimeout(heldTimer);
-    pending = [];
+    clearPending();
     detector.cancelWait();
     if (!hasHuman) undoDart(match);
     else {
@@ -304,7 +309,7 @@ export async function render(root, params) {
 
   // ---------- Kamera ----------
   async function startCamera() {
-    focusReady = false; focusLog.length = 0;
+    focusReady = false; focusLog.length = 0; firstSnap = null;
     const cal = calibration.current;
     if (!cal) { inputMode = 'manual'; draw(); return; }
     try {
@@ -370,6 +375,8 @@ export async function render(root, params) {
   let pendingWarn = '';
   let settingsLocked = null;
   let focusReady = false; // Autofokus beim Start abwarten
+  let firstSnap = null; // erstes Bild nach der Aufwärmphase: leere Scheibe, falls während des Scharfstellens schon geworfen wird
+  const emptyKey = (img) => `${calibration.current?.createdAt}|${crop.x.toFixed(4)}|${crop.y.toFixed(4)}|${crop.w.toFixed(4)}|${img.width}x${img.height}`;
   const focusLog = [];
   let needReadjust = false;
   function onFrame() {
@@ -388,21 +395,28 @@ export async function render(root, params) {
     // später überall Kantenreste ergeben
     if (!focusReady) {
       const s = frameMetrics(img).sharpness;
+      if (!firstSnap) firstSnap = { data: img.data.slice(), w: img.width, h: img.height, sharp: s };
       focusLog.push(s); if (focusLog.length > 12) focusLog.shift();
       // Trend statt Schwankung: Wackeln ändert die Schärfe von Bild zu Bild, der Autofokus in eine Richtung
       const avg = (l) => l.reduce((p, q) => p + q, 0) / l.length, m1 = avg(focusLog.slice(0, 6)), m2 = avg(focusLog.slice(6).length ? focusLog.slice(6) : [0]);
       if ((focusLog.length < 12 || Math.abs(m2 - m1) > 0.06 * m1) && now - (camera.startedAt || 0) < 7000) { detStatus = 'Kamera stellt scharf …'; drawOverlay(); return; }
       focusReady = true;
       detector.rebase(img);
+      // schon vor „bereit“ geworfen? Gegen ein Bild der leeren Scheibe prüfen (erstes Bild, falls gleich scharf, sonst
+      // das aus dem letzten Spiel); die steckenden Pfeile werden dann gleich erkannt
+      const sNow = frameMetrics(img).sharpness, key = emptyKey(img);
+      const cands = [firstSnap && Math.abs(firstSnap.sharp - sNow) < 0.1 * sNow ? firstSnap : null, emptyCache && emptyCache.key === key && Date.now() - emptyCache.at < 30 * 60e3 ? emptyCache.snap : null];
+      if (cands.some((c) => c && detector.adoptEmpty(c))) toast('Es stecken schon Pfeile – sie werden gewertet.');
+      firstSnap = null;
     }
     const events = paused ? [] : detector.process(img);
     for (const ev of events) {
       // für „Erkennung speichern“: Bild vorher/nachher der letzten Pfeile (bleibt nur im Speicher)
-      if (ev.type === 'dart' && detector.lastRefBefore) {
-        detLog.push({ fine: cutFine(ev, img), before: detector.lastRawBefore || detector.lastRefBefore, after: img, mask: detector.mask.slice(), state: `Pfeile davor ${Math.max(0, detector.dartsOnBoard - 1)}, ${ev.axis.fine ? `fein Stärke ${ev.axis.fine.strength.toFixed(1)} Spitze ${ev.axis.fine.m.toFixed(1)} mm verschoben ${ev.axis.fine.move.toFixed(1)} mm${ev.axis.fineUsed ? '' : ' (nicht übernommen)'}, ` : ''}Ausrichtung ${detector.lastShift ? detector.lastShift.tx.toFixed(2) + '/' + detector.lastShift.ty.toFixed(2) + ' Maßstab ' + (detector.lastShift.a || 0).toFixed(5) : '–'}, Schärfe ${(detector.sharpRatio || 1).toFixed(2)}, Rauschen ${detector.noise}`, tip: { ...ev.tip }, far: ev.far ? { ...ev.far } : null, round: detector.round, label: ev.hit.label, conf: ev.conf, reasons: ev.reasons, board: ev.board, at: Date.now() });
+      if ((ev.type === 'dart' || ev.type === 'reveal') && detector.lastRefBefore) {
+        detLog.push({ fine: cutFine(ev, img), before: detector.lastRawBefore || detector.lastRefBefore, after: img, mask: detector.mask.slice(), state: `${ev.type === 'reveal' ? 'nachgewertet (gegen leere Scheibe), ' : ''}Pfeile davor ${Math.max(0, detector.dartsOnBoard - 1)}, ${ev.axis.fine ? `fein Stärke ${ev.axis.fine.strength.toFixed(1)} Spitze ${ev.axis.fine.m.toFixed(1)} mm verschoben ${ev.axis.fine.move.toFixed(1)} mm${ev.axis.fineUsed ? '' : ' (nicht übernommen)'}, ` : ''}Ausrichtung ${detector.lastShift ? detector.lastShift.tx.toFixed(2) + '/' + detector.lastShift.ty.toFixed(2) + ' Maßstab ' + (detector.lastShift.a || 0).toFixed(5) : '–'}, Schärfe ${(detector.sharpRatio || 1).toFixed(2)}, Rauschen ${detector.noise}`, tip: { ...ev.tip }, far: ev.far ? { ...ev.far } : null, round: detector.round, label: ev.hit.label, conf: ev.conf, reasons: ev.reasons, board: ev.board, at: Date.now() });
         if (detLog.length > 3) detLog.shift();
       }
-      if (ev.type === 'takeout') saveDartModel();
+      if (ev.type === 'takeout') { saveDartModel(); const snap = detector.emptySnapshot(); if (snap) emptyCache = { key: emptyKey(img), snap, at: Date.now() }; }
       if (ev.tip) ev.tip = uncropPoint(ev.tip, crop);
       handleDetection(ev);
     }
@@ -537,22 +551,55 @@ export async function render(root, params) {
       if (st.openVisit && p != null && !isBot(p) && st.openVisit.dartCount < 3) {
         toast(`Pfeile entfernt, aber nur ${st.openVisit.dartCount} Dart(s) erkannt – fehlenden Dart eintragen oder „Aufnahme beenden“.`, 'err');
       } else toast(pending.length ? `Pfeile entfernt – noch ${pending.length} Treffer bestätigen` : 'Pfeile entfernt – bereit');
+      // offene Pfeile, die nicht freigelegt wurden: jetzt doch nachfragen
+      if (pending.some((pd) => pd.open)) { for (const pd of pending) pd.open = false; sfx('miss'); }
       draw();
       scheduleBot();
       return;
     }
     if (ev.type === 'lighting') { toast('Lichtveränderung erkannt – Referenzbild aktualisiert'); return; }
+    if (ev.type === 'reveal') { onReveal(ev); return; }
     if (ev.type !== 'dart') return;
     if (match.status !== 'running' || p == null) return;
     const d = makeDart(ev.hit.seg, ev.hit.mult);
     const dart = { ...d, x: ev.board.x, y: ev.board.y, conf: ev.conf, source: 'camera' };
     const thr = settings.get('confThreshold') ?? 0.6;
-    if (ev.conf >= thr && !pending.length) {
+    const sure = ev.conf >= thr;
+    if (sure && !pending.length) {
       commitCamera(dart, detector.round);
     } else {
-      pending.push({ dart, ev, round: detector.round });
-      sfx('miss');
-      drawPending();
+      // Unsicher: nicht nachfragen, solange die Pfeile stecken. Der Pfeil bleibt offen und wird nachgewertet, sobald
+      // die Pfeile, die ihn verdecken, gezogen sind (sichere Pfeile danach warten nur wegen der Reihenfolge)
+      const later = !sure && settings.get('revealLater') !== false;
+      pending.push({ dart, ev, round: detector.round, sure, open: later });
+      if (later) detector.setOpen(ev.id, true);
+      else if (!sure) sfx('miss');
+      // drei Pfeile geworfen (gezählt + offen): Die Aufnahme ist vorbei, es geht ans Ziehen
+      if (!isBot(p) && (st.openVisit ? st.openVisit.dartCount : 0) + pending.length >= 3) detector.awaitTakeout();
+      draw();
+    }
+  }
+
+  /** Pfeile in der Warteschlange, die feststehen, der Reihe nach verbuchen */
+  function flushPending() {
+    while (pending.length && pending[0].sure) { const pd = pending.shift(); commitCamera(pd.dart, pd.round); }
+    draw();
+  }
+
+  /** Ein offener Pfeil ist freigelegt und neu ausgewertet */
+  function onReveal(ev) {
+    const pd = pending.find((q) => q.ev.id === ev.id);
+    if (!pd) return;
+    const d = makeDart(ev.hit.seg, ev.hit.mult);
+    pd.dart = { ...d, x: ev.board.x, y: ev.board.y, conf: ev.conf, source: 'camera', revealed: true };
+    pd.ev = { ...ev, reasons: ['nachgewertet', ...(ev.reasons || [])] };
+    if (ev.conf >= (settings.get('confThreshold') ?? 0.6)) {
+      pd.sure = true; pd.open = false; detector.setOpen(ev.id, false);
+      toast(`Nachgewertet: ${d.label}`, 'ok');
+      flushPending();
+    } else {
+      toast(`Nachgewertet, aber noch unsicher: ${d.label}`);
+      draw();
     }
   }
 
@@ -634,9 +681,13 @@ export async function render(root, params) {
     // geworfene Darts; in den freien Feldern steht der Weg zum Finish (nach jedem Wurf neu berechnet)
     const plan = hv ? [] : targetPlan(st);
     const thrown = sv?.darts.length || 0;
+    // noch nicht verbuchte Kamera-Pfeile dieser Aufnahme (offen oder in der Reihe wartend)
+    const pend = !hv && p != null && !isBot(p) && !pending.some((q) => q.replaces) ? pending : [];
     for (let k = 0; k < 3; k++) {
-      const d = sv?.darts[k], t = plan[k - thrown];
-      if (d) {
+      const d = sv?.darts[k], q = !d && pend[k - thrown], t = plan[k - thrown - pend.length];
+      if (q) {
+        visitEl.append(h('div', { class: 'dslot empty target', title: q.open ? 'Wird nachgewertet, sobald die verdeckenden Pfeile gezogen sind' : 'Wartet auf die Pfeile davor' }, `${q.dart.label}${q.sure ? '' : '?'}`, h('small', {}, q.open ? 'offen' : q.sure ? 'wartet' : 'bestätigen')));
+      } else if (d) {
         visitEl.append(h('div', { class: `dslot pop ${d.bust ? 'bust' : ''}`, title: 'Antippen zum Korrigieren', onclick: () => editDart(li, vi, k) },
           d.source === 'camera' ? icon('camera', 'cam') : null, d.label, h('small', {}, d.points)));
       } else if (t) {
@@ -667,8 +718,8 @@ export async function render(root, params) {
     actionsEl.append(...[
       h('button', { class: 'btn', onclick: undo, disabled: paused }, icon('undo'), 'Rückgängig'),
       h('button', { class: 'btn', disabled: !ov || !ov.dartCount || botTurn || paused, onclick: () => { endVisit(match); if (inputMode === 'camera') { detector.awaitTakeout(); holdVisit(0); } save(); draw(); scheduleBot(); } }, icon('check'), 'Aufnahme beenden'),
-      h('button', { class: 'btn', disabled: !ov || botTurn || paused, onclick: () => { clearOpenVisit(match); pending = []; detector.cancelWait(); save(); draw(); } }, icon('refresh'), 'Aufnahme wiederholen'),
-      h('button', { class: 'btn', disabled: botTurn || paused, onclick: async () => { if (!(await confirmDialog('Die komplette letzte Aufnahme entfernen?'))) return; clearTimeout(botTimer); undoVisit(match); pending = []; detector.cancelWait(); save(); draw(); scheduleBot(); } }, icon('undo'), 'Aufnahme löschen'),
+      h('button', { class: 'btn', disabled: !ov || botTurn || paused, onclick: () => { clearOpenVisit(match); clearPending(); detector.cancelWait(); save(); draw(); } }, icon('refresh'), 'Aufnahme wiederholen'),
+      h('button', { class: 'btn', disabled: botTurn || paused, onclick: async () => { if (!(await confirmDialog('Die komplette letzte Aufnahme entfernen?'))) return; clearTimeout(botTimer); undoVisit(match); clearPending(); detector.cancelWait(); save(); draw(); scheduleBot(); } }, icon('undo'), 'Aufnahme löschen'),
       calibration.current ? h('button', { class: 'btn', onclick: () => { held = null; inputMode = inputMode === 'camera' ? 'manual' : 'camera'; match.inputMode = inputMode; save(); if (inputMode === 'camera') startCamera(); else stopCamera(); draw(); } }, icon(inputMode === 'camera' ? 'hand' : 'camera'), inputMode === 'camera' ? 'Nur Tastenfeld' : 'Kamera an') : null,
       inputMode === 'camera' ? h('button', { class: `btn ${waitingTakeout ? 'primary' : ''}`, onclick: resetReference }, icon('hand'), waitingTakeout ? 'Pfeile entfernt' : 'Referenz neu') : null,
       inputMode === 'camera' ? h('button', { class: 'btn', disabled: !lastImg || botTurn, onclick: redetect }, icon('refresh'), 'Erneut erkennen') : null,
@@ -797,7 +848,16 @@ export async function render(root, params) {
   function drawPending() {
     clear(pendingEl);
     if (!pending.length) return;
-    const pd = pending[0];
+    const pd = pending.find((q) => !q.sure) || pending[0];
+    if (pd.open) {
+      // kein Rückfrage-Fenster: nur ein Hinweis; bestätigen kann man trotzdem schon
+      pendingEl.append(h('div', { class: 'notice' },
+        h('div', {}, `Pfeil offen (Vorschlag ${pd.dart.label}, ${Math.round(pd.ev.conf * 100)} %): Zieh zuerst die Pfeile, die ihn verdecken – dann wird er nachgewertet.`),
+        h('div', { class: 'row', style: { marginTop: '6px' } },
+          h('button', { class: 'btn sm', onclick: () => resolvePending('confirm', pd) }, icon('check'), `${pd.dart.label} stimmt`),
+          h('button', { class: 'btn sm', onclick: () => resolvePending('correct', pd) }, icon('edit'), 'Korrigieren'))));
+      return;
+    }
     const reasons = pd.ev.reasons?.length ? pd.ev.reasons.join(', ') : 'geringe Sicherheit';
     pendingEl.append(h('div', { class: 'pending-box' },
       h('div', { style: { fontWeight: 750 } }, `Unsichere Erkennung: ${pd.dart.label} (${pd.dart.score} Punkte)`),
@@ -808,21 +868,28 @@ export async function render(root, params) {
         h('button', { class: 'btn sm ghost', onclick: () => resolvePending('discard') }, icon('x'), 'Kein Pfeil'))));
   }
 
-  function resolvePending(action) {
-    const pd = pending.shift();
-    if (!pd) return;
+  function resolvePending(action, which = null) {
+    const pd = which || pending.find((q) => !q.sure) || pending[0];
+    if (!pd || !pending.includes(pd)) return;
+    if (pd.ev.id != null) detector.setOpen(pd.ev.id, false);
     const finish = (dart) => {
       if (pd.replaces) {
+        pending.splice(pending.indexOf(pd), 1);
         const { li, vi, di } = pd.replaces;
         replaceDart(match, li, vi, di, dart);
         save(); draw(); scheduleBot();
-      } else commitCamera(dart, pd.round);
+      } else {
+        // steht fest; verbucht wird in der Reihenfolge der Würfe
+        pd.dart = dart; pd.sure = true; pd.open = false;
+        flushPending();
+      }
     };
+    if (action === 'discard') pending.splice(pending.indexOf(pd), 1);
     // bestätigte Pfeile zeigen der Erkennung, in welche Richtung die Pfeile im Bild stecken
     if (action === 'confirm') detector.learnDirection({ ...pd.ev, conf: 1 });
     if (action === 'discard') detector.forget(pd.ev);
     if (action === 'confirm') finish({ ...pd.dart, confirmed: true });
-    else if (action === 'discard') { draw(); }
+    else if (action === 'discard') { flushPending(); }
     else {
       const close = modal({
         title: `Erkannt: ${pd.dart.label} – richtiges Feld wählen`,

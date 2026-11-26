@@ -540,8 +540,8 @@ export class DartDetector {
     if (this.bigMotion && this.emptyRef && (this.awaitingTakeout || this.dartsOnBoard > 0)) {
       this.calm = motion < 0.012 ? this.calm + 1 : 0;
       if (this.calm >= 2 && (this.calm - 2) % 4 === 0) {
-        const raw = data.slice(), soft = softImage(raw, this.w, this.h);
-        const took = this.checkTakeout(soft, raw, this.alignTo(soft, this.emptyRef), true);
+        const raw = data.slice(), soft = softImage(raw, this.w, this.h), E = this.alignTo(soft, this.emptyRef);
+        const took = this.checkTakeout(soft, raw, E, true);
         if (took) { this.calm = 0; this.stable = 0; this.hadMotion = true; this.lastEval = null; return [took.event]; }
       }
       // … oder schon, während die Hand noch zurückgeht: an allen Pfeilstellen ist wieder die leere Scheibe zu sehen
@@ -728,6 +728,111 @@ export class DartDetector {
     return { event: { type: 'takeout', round: this.round }, done };
   }
 
+  /** Pfeil als „offen“ markieren: unsicher, wird nachgewertet, sobald ihn verdeckende Pfeile gezogen sind */
+  setOpen(id, open = true) {
+    const m = this.dartMem.find((q) => q.id === id);
+    if (m) m.open = open;
+  }
+
+  /** Je bekanntem Pfeil: Anteil seiner Stellen, an denen wieder das Bild von vor ihm zu sehen ist (null = nicht messbar) */
+  goneShares(data, E) {
+    return this.dartMem.map((m) => {
+      const mid = m.px[m.px.length >> 1], cx = mid % this.w, cy = (mid / this.w) | 0, p0 = applyT(m.T, cx, cy), p1 = applyT(E.T, cx, cy);
+      const off = (Math.round(p0.y - p1.y) * this.w + Math.round(p0.x - p1.x)) * 4;
+      let back = 0, all = 0;
+      for (let k = 0; k < m.px.length; k += 2) {
+        const i = m.px[k] * 4 + off;
+        if (i < 0 || i + 2 >= data.length) continue;
+        let db = 0, da = 0, d = 0, de = 0;
+        for (let c = 0; c < 3; c++) { const v = data[i + c], b = m.before[k * 3 + c], a = m.after[k * 3 + c]; db += Math.abs(v - b); da += Math.abs(v - a); d += Math.abs(a - b); de += Math.abs(v - E.img[i + c]); }
+        if (d < 45) continue;
+        all += d; if (Math.min(db, de) < 0.6 * da) back += d;
+      }
+      return all < 400 ? null : back / all;
+    });
+  }
+
+  /**
+   * Nachwertung: Ein Teil der Pfeile ist gezogen, ein offener (unsicherer) Pfeil steckt noch. Die verbliebenen Pfeile
+   * werden gegen das Bild der leeren Scheibe neu ausgewertet – nichts verdeckt sie mehr. Liefert „reveal“-Ereignisse
+   * für die offenen Pfeile (gleiche Kennung) oder null.
+   */
+  checkReveal(data, raw, E) {
+    if (!E.ok || !this.dartMem.length) return null;
+    const sh = this.goneShares(data, E);
+    const isGone = (i) => sh[i] != null && sh[i] > 0.75;
+    const gone = sh.filter((s, i) => isGone(i)).length;
+    const open = this.dartMem.filter((m, i) => m.open && !(sh[i] != null && sh[i] > 0.5));
+    if (!gone || !open.length) return null;
+    const keep = this.dartMem.filter((m, i) => !isGone(i));
+    // ruhiges, freies Bild (keine Hand mehr davor): nur die verbliebenen Pfeile weichen von der leeren Scheibe ab
+    const M = this.matchSharpness(data, E.img);
+    const count = this.buildMask(M.a, M.b, null);
+    if (count / this.roi.length > this.opts.maxDartFraction) return null;
+    const saved = { occ: this.occ && this.occ.slice(), segs: this.segs, dartPx: this.dartPx, dartMem: this.dartMem, regions: this.regions, n: this.dartsOnBoard, lastPixels: this.lastPixels };
+    this.occ = this.occ && new Uint8Array(this.occ.length); this.segs = []; this.dartPx = []; this.dartMem = []; this.dartsOnBoard = 0;
+    this.setFrameTransform(data, E);
+    this.pair = { cur: data, ref: this.emptyRef, T: E.T, raw: M.changed ? { cur: M.a, ref: M.b } : null };
+    const dets = this.analyse(Math.max(1, keep.length));
+    const restore = () => { this.occ = saved.occ; this.segs = saved.segs; this.dartPx = saved.dartPx; this.dartMem = saved.dartMem; this.regions = saved.regions; this.dartsOnBoard = saved.n; this.lastPixels = saved.lastPixels; };
+    // Zuordnung: welcher neu gefundene Pfeil liegt auf den Stellen welches bekannten Pfeils?
+    const overlap = (det, m) => { const s = new Set(det.pixelList); let n = 0; for (const p of m.px) if (s.has(p)) n++; return n / m.px.length; };
+    const pairs = [];
+    for (const det of dets) for (const m of keep) { const o = overlap(det, m); if (o > 0.15) pairs.push({ det, m, o }); }
+    pairs.sort((a, b) => b.o - a.o);
+    const used = new Set(), owner = new Map();
+    for (const p of pairs) if (!used.has(p.det) && ![...owner.values()].includes(p.m)) { used.add(p.det); owner.set(p.det, p.m); }
+    if (!open.some((m) => [...owner.values()].includes(m))) { restore(); return null; }
+    // feines Bild: gegen das feine Bild der leeren Scheibe nachmessen
+    this.takeFine();
+    const rf = this.refFine; this.refFine = this.emptyFine;
+    for (const det of dets) if (owner.has(det) && owner.get(det).open) this.refineFine(det);
+    this.refFine = rf;
+    // neuer Stand: nur noch die verbliebenen Pfeile, so wie sie jetzt (frei) zu sehen sind
+    const events = [];
+    this.regions = [];
+    for (const det of dets) {
+      const m = owner.get(det);
+      if (!m) continue; // nicht zuzuordnen: nicht als neuen Pfeil melden
+      this.regions.push(det.bbox); this.segs.push({ tip: det.tipPx, far: det.far }); this.dartPx.push(det.pixelList);
+      this.dartMem.push(Object.assign(this.remember(det.pixelList, Math.max(det.conf, m.conf), E.T), { id: m.id, open: m.open }));
+      this.markOcc(det.pixelList);
+      if (m.open) { const { pixelList, ...rest } = det; events.push({ type: 'reveal', ...rest, id: m.id }); }
+    }
+    // nicht wiedergefundene, aber noch steckende Pfeile behalten ihre alte Erinnerung (für die Entnahme)
+    for (const m of keep) if (![...owner.values()].includes(m)) { this.dartMem.push(m); const k = saved.dartMem.indexOf(m); if (k >= 0) { this.dartPx.push(saved.dartPx[k]); this.segs.push(saved.segs[k]); this.markOcc(saved.dartPx[k]); } }
+    this.dartsOnBoard = this.dartMem.length;
+    this.lastRefBefore = this.emptyRef; this.lastRawBefore = rawOf.get(this.emptyRef) || this.emptyRef; this.lastFineBefore = this.emptyFine;
+    this.ref = data; this.refRaw = raw; this.refFine = this.curFine;
+    return events.length ? events : null;
+  }
+
+  /** Bild der leeren Scheibe (Original) zum Merken über einen Neustart der Kamera hinweg */
+  emptySnapshot() {
+    if (!this.emptyRef || this.dartsOnBoard > 0) return null;
+    const r = rawOf.get(this.emptyRef) || this.emptyRef;
+    return { data: r.slice(), w: this.w, h: this.h };
+  }
+
+  /**
+   * Start, während schon Pfeile stecken (vor „bereit“ geworfen): Passt ein gemerktes Bild der leeren Scheibe und weicht
+   * das jetzige nur in Pfeilgröße davon ab, wird es Referenz – die steckenden Pfeile werden dann gleich erkannt.
+   */
+  adoptEmpty(snap) {
+    if (!snap || snap.w !== this.w || snap.h !== this.h || !this.ref) return false;
+    const old = softImage(snap.data.slice(), this.w, this.h), cur = this.ref;
+    const E = this.alignTo(cur, old);
+    if (!E.ok) return false;
+    const M = this.matchSharpness(cur, E.img);
+    const frac = this.buildMask(M.a, M.b, null) / this.roi.length;
+    if (frac < this.opts.minDartFraction || frac > 0.6 * this.opts.maxDartFraction || this.looksEmpty()) return false;
+    // ein wenig Licht- oder Schärfeunterschied darf es geben, aber keine großflächige Veränderung
+    if (this.matchShare(cur, E.img) < 0.9) return false;
+    this.setEmpty(old); this.ref = old; this.refRaw = rawOf.get(old) || old; this.refFine = null; this.emptyFine = null;
+    this.checkNow = true; this.hadMotion = true; this.lastEval = null;
+    return true;
+  }
+
   evaluate(frame) {
     const raw = frame.slice(), data = softImage(raw, this.w, this.h);
     const roiN = this.roi.length;
@@ -741,6 +846,7 @@ export class DartDetector {
       if (!took.done) { this.lastEval = null; this.stable = 0; this.checkNow = true; }
       return [took.event];
     }
+    if (this.dartMem.some((m) => m.open)) { const rv = this.checkReveal(data, raw, E); if (rv) return rv; }
     if (this.awaitingTakeout) { this.status = 'warte auf Entfernen'; return [{ type: 'waiting-takeout' }]; }
 
     // Ein nicht erkannter Pfeil (von Hand eingetragen) ist wieder weg: Das ist kein neuer Pfeil
@@ -808,7 +914,8 @@ export class DartDetector {
       this.regions.push(det.bbox);
       this.segs.push({ tip: det.tipPx, far: det.far });
       this.dartPx.push(det.pixelList);
-      this.dartMem.push(this.remember(det.pixelList, det.conf, E.T));
+      det.id = this.dartId = (this.dartId || 0) + 1;
+      this.dartMem.push(Object.assign(this.remember(det.pixelList, det.conf, E.T), { id: det.id }));
       this.markOcc(det.pixelList);
       this.learnDirection(det);
       delete det.pixelList;
@@ -958,7 +1065,7 @@ export class DartDetector {
       const isGone = back > need * all;
       m.gone = all ? back / all : 0;
       // jeder sichere Pfeil muss weg sein; unsichere Meldungen (evtl. gar kein Pfeil) blockieren nicht allein
-      if (!isGone && m.conf >= 0.5) return false;
+      if (!isGone && (m.conf >= 0.5 || m.open)) return false;
       total += all; if (isGone) { gone += all; any = true; }
     }
     return any && gone >= 0.8 * total;
@@ -978,7 +1085,7 @@ export class DartDetector {
   /** Grobe Vorprüfung ohne Ausrichten: Sehen die meisten Pfeilpixel jedes sicheren Pfeils aus wie ohne Pfeil (±3 px)? */
   vanishedNow(data) {
     for (const m of this.dartMem) {
-      if (m.conf < 0.5 && this.dartMem.length > 1) continue;
+      if (m.conf < 0.5 && !m.open && this.dartMem.length > 1) continue;
       let back = 0, all = 0;
       const step = Math.max(1, Math.floor(m.px.length / 250));
       for (let k = 0; k < m.px.length; k += step) {
