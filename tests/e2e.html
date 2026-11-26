@@ -42,7 +42,7 @@
   Object.defineProperty(w.navigator, 'canShare', { value: () => false, configurable: true });
   const st = await imp('js/state.js'), repo = await imp('js/data/repo.js'), x01 = await imp('js/core/x01.js'), det = await imp('js/vision/detector.js');
   const times = [], evTimes = [];
-  const stamps = [], blocks = [], markLog = [];
+  const stamps = [], blocks = [], markLog = [], botLog = [];
   const op = det.DartDetector.prototype.process; const evLog = [];
   det.DartDetector.prototype.process = function (img) { const t = performance.now(); const r = op.call(this, img); times.push(performance.now() - t); window.__size = `${img.width}×${img.height}`; for (const e of r) { evLog.push(e.type); stamps.push([e.type, performance.now()]); } return r; };
   const osc = det.DartDetector.prototype.setCalibration; det.DartDetector.prototype.setCalibration = function (...a) { window.__cal = (window.__cal || 0) + 1; return osc.apply(this, a); };
@@ -59,7 +59,7 @@
   if (!auto?.H) { log('Auto-Kalibrierung fehlgeschlagen'); window.__e2e.done = true; throw new Error('kal'); }
   const bc = cal.boardCrop(auto.H), cimg = D.grabCrop(frames[0], bc, 640);
   await st.calibration.save({ H: auto.H, points: auto.points, quality: auto.quality ?? 1, cropQuality: cal.calibrationQuality(cimg, cal.cropH(auto.H, bc)).score, brightness: cal.frameMetrics(cimg).brightness, aspect: W / H, createdAt: Date.now(), version: 3 });
-  const m = x01.createMatch({ settings: { startScore: 1001, legsToWin: 1 }, players: [{ id: 'e2e', name: 'Test' }] });
+  const m = x01.createMatch({ settings: { startScore: 1001, legsToWin: 1 }, players: [{ id: 'e2e', name: 'Test' }, ...(q.get('bot') ? [{ id: 'e2ebot', name: 'Bot', isBot: true, bot: { avg: 40, personality: 'constant' } }] : [])] });
   m.inputMode = 'camera';
   await repo.matches.save(m);
   w.location.hash = `#/game/${m.id}`;
@@ -91,7 +91,9 @@
     }
     const marks = () => { const c = doc.querySelector('.game-cam canvas'); if (!c || !c.width) return '?'; const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 0; i < d.length; i += 4) if (d[i + 3] > 250 && ((Math.abs(d[i] - 61) < 12 && Math.abs(d[i + 1] - 220) < 12) || (Math.abs(d[i] - 245) < 12 && Math.abs(d[i + 1] - 184) < 12))) n++; return n; };
     const m0 = marks();
-    hand = true; await sleep(1500); doSlip(); setScene([]); await sleep(300); for (let k = 0; k < Number(q.get('slow') || 0); k++) { handX += 0.06; await sleep(100); } hand = false; handX = 0; if (q.get("sway")) { sway = Number(q.get("sway")); swayAt = performance.now(); } const tFree = performance.now(); let worst = 0, last = tFree; const iv = setInterval(() => { const n = performance.now(); worst = Math.max(worst, n - last); last = n; }, 20); await sleep(Number(q.get('pause') || 2500)); clearInterval(iv); const tk = stamps.find(([t, at]) => t === 'takeout' && at > tFree); markLog.push(`${m0}→${marks()}`); blocks.push(`${tk ? Math.round(tk[1] - tFree) : '–'}/${Math.round(worst)}`);
+    const botBefore = q.get('bot') ? (await repo.matches.get(m.id)).legs.flatMap((l) => l.visits).filter((x) => x.p === 1).length : 0;
+    hand = true; await sleep(1500); doSlip(); setScene([]); await sleep(300); for (let k = 0; k < Number(q.get('slow') || 0); k++) { handX += 0.06; await sleep(100); } hand = false; handX = 0; if (q.get("sway")) { sway = Number(q.get("sway")); swayAt = performance.now(); } const tFree = performance.now(); let worst = 0, last = tFree; const iv = setInterval(() => { const n = performance.now(); worst = Math.max(worst, n - last); last = n; }, 20); await sleep(Number(q.get('pause') || 2500)); clearInterval(iv); const tk = stamps.find(([t, at]) => t === 'takeout' && at > tFree); if (q.get('bot')) { const vv = (await repo.matches.get(m.id)).legs.flatMap((l) => l.visits); botLog.push(`${botBefore}/${vv.filter((x) => x.p === 1).length}`); }
+    markLog.push(`${m0}→${marks()}`); blocks.push(`${tk ? Math.round(tk[1] - tFree) : '–'}/${Math.round(worst)}`);
     if (mode) {
       for (let c; (c = btn('Bestätigen'));) { asked.push('spät'); c.click(); await sleep(300); }
       // fehlende Pfeile der Aufnahme von Hand eintragen (Scheibe ist schon leer)
@@ -107,6 +109,7 @@
   log(`Bildgröße Auswertung ${window.__size}; pro Bild ${s(times)}; Auswertung ${s(evTimes)}; Bilder ${times.length}`);
   log(`Hand weg → Entnahme erkannt / längste Blockade (ms): ${blocks.join(', ')}; Neukalibrierungen ${window.__cal || 0}`);
   log(`Markierte Bildpunkte vor/nach dem Herausziehen: ${markLog.join(', ')}`);
+  if (q.get('bot')) log(`Bot-Aufnahmen vor dem Ziehen / danach: ${botLog.join(', ')} (Folge der Spieler: ${(await repo.matches.get(m.id)).legs.flatMap((l) => l.visits).map((x) => (x.p ? 'B' : 'T') + x.darts.length).join(' ')})`);
   log('Hinweise: ' + [...doc.querySelectorAll('.notice')].map((n) => n.textContent).join(' | '));
   w.location.hash = '#/dashboard'; await sleep(300);
   if (q.get('thr')) st.settings.set('confThreshold', oldThr);

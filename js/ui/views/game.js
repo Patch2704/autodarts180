@@ -97,6 +97,30 @@ export async function render(root, params) {
     const st = replay(match), v = shownVisit(st);
     hidden = v ? { key: visitKey(st, v), n: v.darts.length } : { key: '', n: 0 };
   }
+  // Kamera-Treffer, die erst gezählt werden, wenn wieder ein Mensch dran ist (der Bot wirft gerade)
+  let deferred = [];
+  function flushDeferred() {
+    if (!deferred.length) return;
+    const st = replay(match);
+    if (st.currentPlayer == null || isBot(st.currentPlayer)) return;
+    const d = deferred.shift();
+    commitCamera(d.dart, d.round);
+  }
+  /**
+   * Kamera-Treffer verbuchen. Stammt die offene Aufnahme aus einer früheren Runde (ihre Pfeile wurden schon gezogen),
+   * ist sie vorbei: Sie wird beendet, bevor der neue Pfeil zählt. Ist dann der Bot dran, wartet der Pfeil.
+   */
+  function commitCamera(dart, round) {
+    let st = replay(match);
+    if (st.openVisit && !isBot(st.currentPlayer) && st.openVisit.dartCount > 0 && visitRound < round) {
+      endVisit(match); save();
+      toast(`Aufnahme mit ${st.openVisit.dartCount} Dart${st.openVisit.dartCount > 1 ? 's' : ''} beendet – die Pfeile waren schon gezogen.`, 'err');
+      st = replay(match);
+    }
+    if (st.currentPlayer != null && isBot(st.currentPlayer)) { deferred.push({ dart, round }); draw(); scheduleBot(); return; }
+    commit(dart, round);
+  }
+
   function commit(dart, round = detector.round) {
     if (paused || match.status !== 'running') return;
     const before = replay(match);
@@ -158,12 +182,15 @@ export async function render(root, params) {
   }
 
   // ---------- Bot ----------
+  // Der Bot wirft erst, wenn die Pfeile der eigenen Aufnahme aus der Scheibe gezogen sind
+  const botWaits = () => inputMode === 'camera' && detector.awaitingTakeout;
   function scheduleBot() {
     clearTimeout(botTimer);
     if (paused || match.status !== 'running' || destroyed) return;
     const st = replay(match);
     const p = st.currentPlayer;
-    if (p == null || !isBot(p)) return;
+    if (p == null || !isBot(p)) { flushDeferred(); return; }
+    if (botWaits()) { draw(); return; }
     const delay = settings.get('botDelay') || 750;
     botTimer = setTimeout(() => {
       if (paused || destroyed) return;
@@ -347,7 +374,7 @@ export async function render(root, params) {
     for (const ev of events) {
       // für „Erkennung speichern“: Bild vorher/nachher der letzten Pfeile (bleibt nur im Speicher)
       if (ev.type === 'dart' && detector.lastRefBefore) {
-        detLog.push({ fine: cutFine(ev, img), before: detector.lastRawBefore || detector.lastRefBefore, after: img, mask: detector.mask.slice(), state: `Pfeile davor ${Math.max(0, detector.dartsOnBoard - 1)}, ${ev.axis.fine ? `fein Stärke ${ev.axis.fine.strength.toFixed(1)} Spitze ${ev.axis.fine.m.toFixed(1)} mm verschoben ${ev.axis.fine.move.toFixed(1)} mm${ev.axis.fineUsed ? '' : ' (nicht übernommen)'}, ` : ''}Ausrichtung ${detector.lastShift ? detector.lastShift.tx.toFixed(2) + '/' + detector.lastShift.ty.toFixed(2) + ' Maßstab ' + (detector.lastShift.a || 0).toFixed(5) : '–'}, Schärfe ${(detector.sharpRatio || 1).toFixed(2)}, Rauschen ${detector.noise}`, tip: { ...ev.tip }, far: ev.far ? { ...ev.far } : null, label: ev.hit.label, conf: ev.conf, reasons: ev.reasons, board: ev.board, at: Date.now() });
+        detLog.push({ fine: cutFine(ev, img), before: detector.lastRawBefore || detector.lastRefBefore, after: img, mask: detector.mask.slice(), state: `Pfeile davor ${Math.max(0, detector.dartsOnBoard - 1)}, ${ev.axis.fine ? `fein Stärke ${ev.axis.fine.strength.toFixed(1)} Spitze ${ev.axis.fine.m.toFixed(1)} mm verschoben ${ev.axis.fine.move.toFixed(1)} mm${ev.axis.fineUsed ? '' : ' (nicht übernommen)'}, ` : ''}Ausrichtung ${detector.lastShift ? detector.lastShift.tx.toFixed(2) + '/' + detector.lastShift.ty.toFixed(2) + ' Maßstab ' + (detector.lastShift.a || 0).toFixed(5) : '–'}, Schärfe ${(detector.sharpRatio || 1).toFixed(2)}, Rauschen ${detector.noise}`, tip: { ...ev.tip }, far: ev.far ? { ...ev.far } : null, round: detector.round, label: ev.hit.label, conf: ev.conf, reasons: ev.reasons, board: ev.board, at: Date.now() });
         if (detLog.length > 3) detLog.shift();
       }
       if (ev.type === 'takeout') saveDartModel();
@@ -478,16 +505,17 @@ export async function render(root, params) {
         toast(`Pfeile entfernt, aber nur ${st.openVisit.dartCount} Dart(s) erkannt – fehlenden Dart eintragen oder „Aufnahme beenden“.`, 'err');
       } else toast(pending.length ? `Pfeile entfernt – noch ${pending.length} Treffer bestätigen` : 'Pfeile entfernt – bereit');
       draw();
+      scheduleBot();
       return;
     }
     if (ev.type === 'lighting') { toast('Lichtveränderung erkannt – Referenzbild aktualisiert'); return; }
     if (ev.type !== 'dart') return;
-    if (match.status !== 'running' || p == null || isBot(p)) return;
+    if (match.status !== 'running' || p == null) return;
     const d = makeDart(ev.hit.seg, ev.hit.mult);
     const dart = { ...d, x: ev.board.x, y: ev.board.y, conf: ev.conf, source: 'camera' };
     const thr = settings.get('confThreshold') ?? 0.6;
     if (ev.conf >= thr && !pending.length) {
-      commit(dart);
+      commitCamera(dart, detector.round);
     } else {
       pending.push({ dart, ev, round: detector.round });
       sfx('miss');
@@ -504,7 +532,8 @@ export async function render(root, params) {
     drawBoard(ctx, cal.H, rect, { color: 'rgba(61,220,132,0.35)', numbers: false });
     const st = replay(match);
     const v = shownVisit(st);
-    const skip = v && visitKey(st, v) === hidden.key ? hidden.n : 0;
+    // Würfe des Bots stecken nicht in der Scheibe
+    const skip = v && isBot(v.p) ? Infinity : v && visitKey(st, v) === hidden.key ? hidden.n : 0;
     for (const [i, d] of (v?.darts || []).entries()) {
       if (i < skip || !Number.isFinite(d.x)) continue;
       const q = applyH(cal.H, d.x, d.y);
@@ -610,7 +639,9 @@ export async function render(root, params) {
       inputMode === 'camera' ? h('button', { class: 'btn', disabled: !lastImg || botTurn, onclick: redetect }, icon('refresh'), 'Erneut erkennen') : null,
       inputMode === 'camera' ? h('button', { class: 'btn', onclick: exportDetections, title: 'Bilder der letzten erkannten Pfeile (vorher/nachher mit erkannter Spitze) speichern, z. B. zur Fehleranalyse' }, icon('download'), 'Erkennung speichern') : null,
     ].filter(Boolean));
-    if (waitingTakeout && !botTurn && match.status === 'running') {
+    if (waitingTakeout && botTurn && match.status === 'running') {
+      actionsEl.append(h('div', { class: 'notice', style: { gridColumn: '1 / -1' } }, 'Der Bot wirft, sobald deine Pfeile aus der Scheibe gezogen sind.'));
+    } else if (waitingTakeout && !botTurn && match.status === 'running') {
       actionsEl.append(h('div', { class: 'notice', style: { gridColumn: '1 / -1' } }, 'Bitte Pfeile aus der Scheibe ziehen – die Kamera erkennt das automatisch.'));
     }
     if (paused) actionsEl.append(h('div', { class: 'notice warn', style: { gridColumn: '1 / -1' } }, 'Match pausiert.'));
@@ -629,7 +660,10 @@ export async function render(root, params) {
     const version = (await globalThis.caches?.keys?.().catch(() => []) || []).filter((k) => k.startsWith('autodarts180')).join(' ');
     const toCanvas = (data, w, hh) => { const c = document.createElement('canvas'); c.width = w; c.height = hh; c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(data), w, hh), 0, 0); return c; };
     const files = [], stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    for (const [i, e] of rows.entries()) {
+    let nr = 0;
+    for (const e of rows) {
+      const old = !e.now && e.round !== detector.round && !(detector.awaitingTakeout && e.round === detector.round);
+      const title = e.now ? '' : old ? 'aus voriger Aufnahme' : `${++nr}. erkannt`;
       const w = e.after.width, hh = e.after.height;
       const before = toCanvas(e.before, w, hh), after = toCanvas(e.after.data, w, hh);
       const m = new Uint8ClampedArray(e.after.data);
@@ -661,12 +695,26 @@ export async function render(root, params) {
       g.drawImage(mask, 0, 0, w, hh, ov + 16, head + S + 16, ov, oh);
       if (e.tip) { const tx = e.tip.x * ov, ty = head + S + 16 + e.tip.y * oh; g.strokeStyle = '#00e5ff'; g.lineWidth = 2; g.beginPath(); g.arc(tx, ty, 16, 0, 2 * Math.PI); g.stroke(); }
       g.fillStyle = '#fff'; g.font = 'bold 20px system-ui, sans-serif';
-      g.fillText(e.now ? `Jetzt (links: leere Scheibe) · ${version}` : `${i + 1}. erkannt: ${e.label} (${Math.round(e.conf * 100)} %)  x ${e.board.x.toFixed(1)} / y ${e.board.y.toFixed(1)} mm · Spitze im Ausschnitt ${Math.round(((e.tip.x * w - x0) * S) / s)}, ${Math.round(((e.tip.y * hh - y0) * S) / s)} · ${version}`, 8, 20, 2032);
+      g.fillText(e.now ? `Jetzt (links: leere Scheibe) · ${version}` : `${title}: ${e.label} (${Math.round(e.conf * 100)} %)  x ${e.board.x.toFixed(1)} / y ${e.board.y.toFixed(1)} mm · Spitze im Ausschnitt ${Math.round(((e.tip.x * w - x0) * S) / s)}, ${Math.round(((e.tip.y * hh - y0) * S) / s)} · ${version}`, 8, 20, 2032);
       g.font = '15px system-ui, sans-serif';
       if (!e.now) g.fillText(e.reasons.join(', ') || 'keine Auffälligkeiten', 8, 40, 2032);
       g.fillText(`${w}×${hh} · Kamera ${camera.resolution.w}×${camera.resolution.h}, Bild holen ${Math.round(grabMs)} ms · Ausschnitt ab ${x0.toFixed(1)}, ${y0.toFixed(1)}, ${(S / s).toFixed(2)}× · ${e.state || ''}`, 8, 59, 2032);
       const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.95));
-      if (blob) files.push(new File([blob], `autodarts180-${stamp}-${e.now ? 'jetzt' : i + 1}.jpg`, { type: 'image/jpeg' }));
+      const name = e.now ? 'jetzt' : old ? `vorher-${files.length + 1}` : nr;
+      if (blob) files.push(new File([blob], `autodarts180-${stamp}-${name}.jpg`, { type: 'image/jpeg' }));
+      // dazu die Spitze in Kameraauflösung, so groß, dass beim Teilen nichts verkleinert wird (800 px breit)
+      if (e.fine && e.tip) {
+        const T = 384, d = document.createElement('canvas'); d.width = 800; d.height = 32 + T;
+        const q = d.getContext('2d'); q.fillStyle = '#111'; q.fillRect(0, 0, d.width, d.height);
+        const tx = e.tip.x * w * e.fine.k - e.fine.x, ty = e.tip.y * hh * e.fine.k - e.fine.y, sx = Math.max(0, Math.min(e.fine.s - T, Math.round(tx - T / 2))), sy = Math.max(0, Math.min(e.fine.s - T, Math.round(ty - T / 2)));
+        const b = toCanvas(e.fine.before.data, e.fine.s, e.fine.s), f = toCanvas(e.fine.after.data, e.fine.s, e.fine.s);
+        q.drawImage(b, sx, sy, T, T, 0, 32, T, T); q.drawImage(f, sx, sy, T, T, T + 32, 32, T, T);
+        q.strokeStyle = '#00e5ff'; q.lineWidth = 1.5; q.beginPath(); q.arc(T + 32 + tx - sx, 32 + ty - sy, 10, 0, 2 * Math.PI); q.stroke();
+        q.fillStyle = '#fff'; q.font = '14px system-ui, sans-serif';
+        q.fillText(`${e.now ? 'Jetzt' : title}: ${e.label || ''} · Spitze vorher | nachher, 1:1 Kamerabild ab ${(e.fine.x + sx)}, ${(e.fine.y + sy)} (Faktor ${e.fine.k.toFixed(2)})`, 6, 21, 788);
+        const bl = await new Promise((res) => d.toBlob(res, 'image/jpeg', 0.95));
+        if (bl) files.push(new File([bl], `autodarts180-${stamp}-${name}-spitze.jpg`, { type: 'image/jpeg' }));
+      }
     }
     try {
       if (navigator.canShare?.({ files })) { await navigator.share({ files, title: 'Autodarts180 Erkennung' }); return; }
@@ -690,7 +738,7 @@ export async function render(root, params) {
       return;
     }
     detector.rebase(lastImg); pending = []; hideMarkers();
-    toast('Referenzbild neu gesetzt'); draw();
+    toast('Referenzbild neu gesetzt'); draw(); scheduleBot();
   }
 
   function redetect() {
@@ -733,7 +781,7 @@ export async function render(root, params) {
         const { li, vi, di } = pd.replaces;
         replaceDart(match, li, vi, di, dart);
         save(); draw(); scheduleBot();
-      } else commit(dart, pd.round);
+      } else commitCamera(dart, pd.round);
     };
     // bestätigte Pfeile zeigen der Erkennung, in welche Richtung die Pfeile im Bild stecken
     if (action === 'confirm') detector.learnDirection({ ...pd.ev, conf: 1 });

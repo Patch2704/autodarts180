@@ -830,16 +830,19 @@ export class DartDetector {
     r.board = this.boardAt(r.tip); r.move = mm;
     a.fine = r;
     // Nur eine klar sichtbare Spitze vor einem klar sichtbaren Barrel zählt; große Sprünge nur bei sehr klarem Signal
+    const expMm = a.tm ? a.tm.mu / this.pxPerMm : ((this.tipRho && this.tipRho.v) || 0.08) * Math.hypot(det.tipPx.x - det.far.x, det.tipPx.y - det.far.y) / this.pxPerMm;
+    r.expMm = expMm;
+    if (r.m > 1.5 * expMm + 2) return;
     if (r.strength < 8 || r.m < 2.5 || r.Wb < 4 || r.Wb > 10.5 || mm > (r.strength > 15 ? 9 : 5)) return;
     const b = r.board;
     if (!Number.isFinite(b.x)) return;
     const hit = scoreAt(b.x, b.y);
     const p = this.fieldProbability(r.tip, b, hit, a.dir.x, a.dir.y, 1, { sure: true, sigma: (r.strength > 15 ? 0.6 : 1) * this.pxPerMm, tail: 0, tailWeight: 0, toBoard: (q) => this.boardAt(q) });
-    const f0 = Math.max(1e-3, a.pField) ** 1.6, ringF = (h) => (h.r > 170 ? 0.55 : 1);
-    det.conf = Math.max(0, Math.min(1, (det.conf / f0 / (a.lift || 1) ** (r.strength > 15 && r.m > 3.5 ? 1 : 0.5) / ringF(det.hit)) * p.p ** 1.6 * ringF(hit)));
+    const f0 = Math.max(1e-3, a.pField) ** 1.6, ringF = (h, s) => (h.r > 170 && !(s && h.r > 173.5) ? 0.55 : 1);
+    det.conf = Math.max(0, Math.min(1, (det.conf / f0 / (a.lift || 1) ** (r.strength > 15 && r.m > 3.5 ? 1 : 0.5) / ringF(det.hit, a.tm && a.tm.clear)) * p.p ** 1.6 * ringF(hit, r.strength > 15)));
     det.reasons = det.reasons.filter((t) => !/Draht|Spitze kaum|kontrastarmes|knapp außerhalb|außerhalb der Wertung|Form wenig|nicht unterscheidbar|nur teilweise|nur ein kurzes/.test(t));
     if (p.p < 0.93) det.reasons.push(p.p < 0.75 ? 'direkt am Draht' : 'nahe am Draht');
-    if (hit.r > 170) det.reasons.push(hit.r < 190 ? 'knapp außerhalb des Doppels' : 'außerhalb der Wertungsfläche');
+    if (hit.r > 170 && !(r.strength > 15 && hit.r > 173.5)) det.reasons.push(hit.r < 190 ? 'knapp außerhalb des Doppels' : 'außerhalb der Wertungsfläche');
     if (det.reasons.some((t) => /mehrere neue|zwei Pfeile/.test(t))) det.conf = Math.min(det.conf, 0.55);
     det.tipPx = { x: r.tip.x, y: r.tip.y };
     det.tip = { x: (r.tip.x + 0.5) / this.w, y: (r.tip.y + 0.5) / this.h };
@@ -1800,9 +1803,11 @@ export class DartDetector {
     if (L > 1.15 * this.maxDartLen(mx, my)) { conf *= 0.5; reasons.push('Veränderung länger als ein Pfeil'); }
     // nur ein kurzes Stück sichtbar (weniger als gut die Hälfte eines Pfeils) → Richtung und Spitze unsicher
     if (exp && exp.len > 12 && L < 0.95 * exp.len) { conf *= 0.6; lift *= 0.7; reasons.push('nur ein kurzes Stück des Pfeils sichtbar'); }
-    if (hit.r > 170 && hit.r < 190) { conf *= 0.55; reasons.push('knapp außerhalb des Doppels'); }
+    // (nicht in einer Gruppe: Dort kann das klare Stück auch zu einem angestoßenen Pfeil gehören)
+    const outSure = tm && tm.clear && hit.r > 173.5 && !(this.occ && this.dartsOnBoard > 0 && pixels.some((p) => this.occ[p]));
+    if (hit.r > 170 && hit.r < 190 && !outSure) { conf *= 0.55; reasons.push('knapp außerhalb des Doppels'); }
     // ein „Fehlwurf“ weit draußen ist selten; oft fehlt nur der vordere Pfeilteil → nachfragen
-    else if (hit.r >= 190) { conf *= 0.55; reasons.push('außerhalb der Wertungsfläche'); }
+    else if (hit.r >= 190 && !outSure) { conf *= 0.55; reasons.push('außerhalb der Wertungsfläche'); }
     // Liegt die Spitze direkt auf/an einem schon steckenden Pfeil? (Nur Überschneidung der
     // Umrisse reicht nicht – in einer engen Gruppe überschneiden sich die Umrisse fast immer.)
     // Verdeckte oder schlecht sichtbare Spitze: Es zählt nur, ob das Feld auch dann stimmt, wenn sie deutlich weiter
@@ -1867,17 +1872,19 @@ export class DartDetector {
       const atMinEnd = usedAlt ? !tipAtMin : tipAtMin;
       const tdx = atMinEnd ? -ux : ux, tdy = atMinEnd ? -uy : uy;
       let touches = false;
-      for (let s = 0; s <= 6 && !touches; s += 1) {
-        const x = Math.round(tip.x + tdx * s), y = Math.round(tip.y + tdy * s);
-        for (let o = -2; o <= 2 && !touches; o++) {
+      // ohne gefundenes Barrelende kann die Spitze ein ganzes Stück weiter vorne hinter anderen Pfeilen stecken
+      const look = tm ? 6 : Math.min(30, 0.25 * L);
+      for (let s = 0; s <= look && !touches; s += 1) {
+        const x = Math.round(tip.x + tdx * s), y = Math.round(tip.y + tdy * s), ow = s <= 6 ? 2 : Math.round(2 + 0.2 * s);
+        for (let o = -ow; o <= ow && !touches; o++) {
           const xx = x - Math.round(tdy * o), yy = y + Math.round(tdx * o);
           if (xx >= 0 && yy >= 0 && xx < this.w && yy < this.h && this.occ[yy * this.w + xx]) touches = true;
         }
       }
       occTouch = touches;
       // ein ganzer Pfeil ist im Bild ca. 1,5–1,8 × so lang wie 100 mm senkrecht zur Scheibe
-      if (touches && L < 1.3 * exp.len) { conf *= soft(0.4); reasons.push('Spitze evtl. von anderem Pfeil verdeckt'); }
-      else if (touches) { conf *= soft(0.65); reasons.push('Spitze grenzt an anderen Pfeil (evtl. verdeckt)'); }
+      if (touches && L < 1.3 * exp.len) { conf *= tm ? soft(0.4) : 0.4; reasons.push('Spitze evtl. von anderem Pfeil verdeckt'); }
+      else if (touches) { conf *= tm ? soft(0.65) : 0.65; reasons.push('Spitze grenzt an anderen Pfeil (evtl. verdeckt)'); }
     }
 
     return {
