@@ -204,14 +204,15 @@ function dominantLine(pixels, w, minExtent = 0) {
 
 /**
  * Stelle nur abgedunkelt (Schatten), nicht umgefärbt? a = aktuell, b = Referenz; über ein Kreuz aus
- * 9 Pixeln gemittelt, damit Bildrauschen die Farbanteile nicht verfälscht.
+ * 9 Pixeln gemittelt, damit Bildrauschen die Farbanteile nicht verfälscht. Liefert 0 (kein Schatten), 1 (Farbe gleich)
+ * oder 2 (Raumlicht-Schatten, siehe warmShadowAt).
  */
 function isShadowAt(a, b, i, s) {
   // zuerst der Pixel selbst (schützt die dünne Spitze, deren Umgebung nur Schatten ist) …
   const pa = a[i] + a[i + 1] + a[i + 2], pb = b[i] + b[i + 1] + b[i + 2];
   if (pb < 180 || pa < 0.5 * pb || pa > 0.98 * pb) return false;
   const pt = 0.018 + 1 / pb * 3;
-  if (Math.abs(a[i] / pa - b[i] / pb) > pt || Math.abs(a[i + 1] / pa - b[i + 1] / pb) > pt) return false;
+  if (Math.abs(a[i] / pa - b[i] / pb) > pt || Math.abs(a[i + 1] / pa - b[i + 1] / pb) > pt) return warmShadowAt(a, b, i, s, pa, pb) ? 2 : 0;
   // … dann die Umgebung, mit enger Grenze
   let ar = 0, ag = 0, ab = 0, br = 0, bg = 0, bb = 0;
   for (let k = 0; k < 9; k++) {
@@ -225,7 +226,38 @@ function isShadowAt(a, b, i, s) {
   // Farbanteile bleiben im Schatten fast gleich. Gemessen: graues Barrel vor weißem Feld weicht um
   // 0,026–0,035 ab (echte Aufnahme)
   const tol = 0.008 + 0.6 / (lb / 9);
-  return Math.abs(ar / la - br / lb) < tol && Math.abs(ag / la - bg / lb) < tol;
+  if (Math.abs(ar / la - br / lb) < tol && Math.abs(ag / la - bg / lb) < tol) return 1;
+  return warmShadowAt(a, b, i, s, pa, pb) ? 2 : 0;
+}
+
+/** Farbanteil-Vektor (Abweichung vom Grau) */
+const chroma = (r, g, bl) => { const t = r + g + bl || 1; return [r / t - 1 / 3, g / t - 1 / 3, bl / t - 1 / 3]; };
+/**
+ * Schatten bei Raumlicht (ohne LED-Ring, echte Aufnahmen v28): nur 3–25 % dunkler, und der Farbton bleibt oder wird
+ * kräftiger (wärmer). Ein graues, silbernes oder schwarzes Barrel macht die Farbe dagegen neutral. Nur auf
+ * deutlich farbigem Grund (Creme bei warmem Licht, Rot, Grün) – auf fast neutralem Weiß gilt die strenge Prüfung oben.
+ */
+function warmShadowAt(a, b, i, s, pa, pb) {
+  if (pa < 0.72 * pb) return false;
+  const test = (ar, ag, ab, br, bg, bb) => {
+    const ca = chroma(ar, ag, ab), cb = chroma(br, bg, bb), nb2 = cb[0] * cb[0] + cb[1] * cb[1] + cb[2] * cb[2];
+    if (nb2 < 0.03 * 0.03) return false;
+    const lam = (ca[0] * cb[0] + ca[1] * cb[1] + ca[2] * cb[2]) / nb2;
+    // echte Schatten machen die Farbe kräftiger (λ meist 1,0–1,4); der dünne Rand eines dunklen Pfeils über
+    // einem farbigen Feld dunkelt ebenfalls ab, macht die Farbe aber eher blasser (λ < 1)
+    if (lam < 1.02 || lam > 1.8) return false;
+    // Farbton bleibt: Anteil quer zur bisherigen Farbe klein
+    const qx = ca[0] - lam * cb[0], qy = ca[1] - lam * cb[1], qz = ca[2] - lam * cb[2];
+    return qx * qx + qy * qy + qz * qz < 0.3 * 0.3 * nb2;
+  };
+  if (!test(a[i], a[i + 1], a[i + 2], b[i], b[i + 1], b[i + 2])) return false;
+  let ar = 0, ag = 0, ab = 0, br = 0, bg = 0, bb = 0;
+  for (let k = 0; k < 9; k++) {
+    const j = i + SH_X[k] * 4 + SH_Y[k] * s;
+    ar += a[j]; ag += a[j + 1]; ab += a[j + 2]; br += b[j]; bg += b[j + 1]; bb += b[j + 2];
+  }
+  const k = (ar + ag + ab) / (br + bg + bb);
+  return k >= 0.72 && k <= 0.98 && test(ar, ag, ab, br, bg, bb);
 }
 /**
  * Leichte Glättung (3×3-Binomial) vor dem Vergleich: Rauschen, Faserstruktur und Schärfeschwankungen
@@ -1163,6 +1195,8 @@ export class DartDetector {
     const { diff, mask, roi, w } = this;
     const s = w * 4;
     diff.fill(0); mask.fill(0);
+    if (!this.shade || this.shade.length !== diff.length) this.shade = new Uint8Array(diff.length); else this.shade.fill(0);
+    const shade = this.shade;
     const tol = this.opts.edgeTolerance;
     const hist = new Uint32Array(256);
     let hn = 0;
@@ -1182,7 +1216,9 @@ export class DartDetector {
       if (d < 4) { diff[p] = d; if (inNoise) { hist[diff[p]]++; hn++; } continue; }
       if (inNoise) { hist[d > 255 ? 255 : d | 0]++; hn++; }
       // Schatten: leicht abgedunkelt bei unveränderter Farbe → gehört nicht zum Pfeil
-      if (d > 6 && isShadowAt(a, b, i, s)) { diff[p] = 0; continue; }
+      // (Raumlicht-Schatten werden gemerkt: Dort wird die Spitze nicht im Original weiterverfolgt)
+      const sh = d > 6 ? isShadowAt(a, b, i, s) : 0;
+      if (sh) { diff[p] = 0; if (sh === 2) shade[p] = 1; continue; }
       // Freigewordene Stelle (ein angestoßener Pfeil hat sich bewegt): Hier sieht das Bild wieder
       // aus wie die leere Scheibe – das gehört nicht zum neuen Pfeil
       if (vac && d > 10) {
@@ -1420,6 +1456,9 @@ export class DartDetector {
           const dir = prior || this.expectedDir(gs.x, gs.y);
           if (dir && (prior || dir.len > 45)) ok = Math.abs(dx * dir.y - dy * dir.x) <= 5 + (prior ? 0.3 : 0.6) * dist;
         }
+        // Liegt zwischen beiden Teilen ein Schatten (Raumlicht: der Schatten des Pfeils läuft in Pfeilrichtung weiter)?
+        // Dann ist der entfernte Fleck das Ende des Schattens, nicht die abgesetzte Spitze
+        if (ok && gap > 3 && this.shadowBetween(cs, gs, c, merged)) ok = false;
         // kleine Splitter direkt daneben
         if (!ok && c.px.length < 0.15 * pixels.length && gap <= 4 + 2 * s) ok = true;
         if (!ok || c.px.length < Math.max(12, 0.01 * pixels.length)) continue;
@@ -1430,6 +1469,26 @@ export class DartDetector {
       }
     }
     return { pixels, bb, merged };
+  }
+
+  /** Besteht die Strecke zwischen einem Teil und der Gruppe (außerhalb beider) überwiegend aus erkanntem Schatten? */
+  shadowBetween(cs, gs, c, merged) {
+    if (!this.shade) return false;
+    const { w, mask } = this;
+    // nächstgelegener Punkt der Gruppe zum Schwerpunkt des Teils
+    let best = null, bd = Infinity;
+    for (const m of merged) { const st = Math.max(1, Math.floor(m.px.length / 400)); for (let k = 0; k < m.px.length; k += st) { const p = m.px[k], dx = (p % w) - cs.x, dy = ((p / w) | 0) - cs.y, d = dx * dx + dy * dy; if (d < bd) { bd = d; best = p; } } }
+    if (best == null) return false;
+    const x1 = best % w, y1 = (best / w) | 0, L = Math.hypot(cs.x - x1, cs.y - y1);
+    let out = 0, sh = 0;
+    for (let t = 0; t <= L; t += 0.7) {
+      const x = Math.round(x1 + ((cs.x - x1) * t) / L), y = Math.round(y1 + ((cs.y - y1) * t) / L), p = y * w + x;
+      if (mask[p]) continue;
+      out++;
+      let f = 0; for (let o = -1; o <= 1 && !f; o++) for (let q = -1; q <= 1 && !f; q++) if (this.shade[p + o * w + q]) f = 1;
+      sh += f;
+    }
+    return out >= 4 && sh >= 0.5 * out;
   }
 
   /** Gruppe von Bildpunkten → Pfeil (Spitze, Feld, Konfidenz) oder null */
@@ -1688,6 +1747,8 @@ export class DartDetector {
       if (xi < 2 || yi < 2 || xi >= w - 2 || yi >= h - 2) return 0;
       const p = yi * w + xi, v = diff[p];
       if (v >= low) return v;
+      // im geglätteten Bild als Schatten erkannt: nicht im (verrauschten) Original weiterverfolgen
+      if (this.shade && this.shade[p]) return v;
       // die dünne Spitze wird durch die Glättung blasser: im Original nachsehen
       const d = rawDev(p * 4);
       return d < rawThr || isShadowAt(R.cur, R.ref, p * 4, st) ? v : d;
@@ -1728,7 +1789,7 @@ export class DartDetector {
       const thr = Math.max(16, low * 1.5);
       const raw = (x, y) => {
         const xi = Math.round(x), yi = Math.round(y);
-        return xi < 2 || yi < 2 || xi >= w - 2 || yi >= h - 2 ? 0 : rawDev((yi * w + xi) * 4);
+        return xi < 2 || yi < 2 || xi >= w - 2 || yi >= h - 2 || (this.shade && this.shade[yi * w + xi]) ? 0 : rawDev((yi * w + xi) * 4);
       };
       const maxLen = 6 * this.pxPerMm;
       let end = last, miss = 0;

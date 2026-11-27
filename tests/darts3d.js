@@ -82,7 +82,9 @@ export function randomDart(rng, x, y, style = {}) {
  * Zeichnet Pfeile in ein (rauschfreies) Grundbild. Liefert neues ImageData.
  * opts.shadow: Lichtrichtung (zur Lampe), z. B. [0.2, 0.6, 1] für Deckenlicht von vorne oben
  */
-export function drawDarts(base, cam, darts, { shadow = null, shadowStrength = 0.35 } = {}) {
+export function drawDarts(base, cam, darts, { shadow = null, shadowStrength = 0.35, shadowTint = null } = {}) {
+  // shadowTint: wie stark jeder Farbkanal im Schatten abnimmt (Raumlicht: Schatten wärmer, Blau nimmt am stärksten ab)
+  const tint = shadowTint || [1, 1, 1], sf = (c, cv) => 1 - shadowStrength * cv * tint[c];
   const { w, h } = cam;
   const img = new ImageData(new Uint8ClampedArray(base.data), w, h);
   const d = img.data;
@@ -99,11 +101,10 @@ export function drawDarts(base, cam, darts, { shadow = null, shadowStrength = 0.
       const p = y * w + x;
       if (isShadow) {
         if (zbuf[p] !== Infinity) continue;
-        const i = p * 4, k = 1 - shadowStrength * cov;
+        const i = p * 4;
         if (shadowMask[p] >= cov) continue;
         const prev = shadowMask[p]; shadowMask[p] = cov;
-        const kk = (1 - shadowStrength * cov) / (1 - shadowStrength * prev);
-        d[i] *= kk; d[i + 1] *= kk; d[i + 2] *= kk;
+        for (let c = 0; c < 3; c++) d[i + c] *= sf(c, cov) / sf(c, prev);
         continue;
       }
       if (z > zbuf[p]) continue;
@@ -260,7 +261,7 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
   const rng = mulberry32(seed * 7919 + Math.round(deg * 13 + tilt * 3));
   const cam = sideCamera(deg, w, h, { fill, tilt, roll });
   // echte Optik bildet Kanten weich ab (ohne Glättung wären verschobene Bilder unrealistisch verschieden)
-  const base = style.real ? soften(renderScene({ w, h, pts: cal.pointsFromH(cam.H), light, noise: 0, seed, ...(style.real ? { colors: REAL_COLORS, texture: style.texture || 9, warm: false, light: 1 } : {}) }).img) : renderScene({ w, h, pts: cal.pointsFromH(cam.H), light, noise: 0, seed, ...(style.real ? { colors: REAL_COLORS, texture: style.texture || 9, warm: false, light: 1 } : {}) }).img;
+  const base = style.real ? soften(renderScene({ w, h, pts: cal.pointsFromH(cam.H), light, noise: 0, seed, ...(style.real ? { colors: REAL_COLORS, texture: style.texture || 9, warm: !!style.warmLight, light: style.warmLight ? style.light || 0.85 : 1 } : {}) }).img) : renderScene({ w, h, pts: cal.pointsFromH(cam.H), light, noise: 0, seed, ...(style.real ? { colors: REAL_COLORS, texture: style.texture || 9, warm: false, light: 1 } : {}) }).img;
   const bc = cal.boardCrop(cam.H);
   const crop = detectorOpts.boardCropOnly ? bc : dartCrop(cam.H, w, h);
   const detMaxW = Math.min(960, Math.round((640 * crop.w) / bc.w)); // wie im Spiel
@@ -268,7 +269,7 @@ export function simulate({ deg = 0, tilt = 0, w = 720, h = 1280, fill = 0.7, vis
   const det = new DartDetector(detectorOpts);
   let frameSeed = seed * 1000;
   let cacheKey = null, cacheImg = null; // gezeichnete Pfeile wiederverwenden, nur Rauschen neu
-  const drawn = (darts) => { const key = darts.map((d) => d.x.toFixed(3) + d.y.toFixed(3) + d.dir.map((v) => v.toFixed(4)).join(',')).join('|'); if (key !== cacheKey) { cacheKey = key; cacheImg = darts.length ? drawDarts(base, cam, darts, { shadow }) : base; } return cacheImg; };
+  const drawn = (darts) => { const key = darts.map((d) => d.x.toFixed(3) + d.y.toFixed(3) + d.dir.map((v) => v.toFixed(4)).join(',')).join('|'); if (key !== cacheKey) { cacheKey = key; cacheImg = darts.length ? drawDarts(base, cam, darts, { shadow: style.shadow || shadow, shadowStrength: style.shadowStrength ?? 0.35, shadowTint: style.shadowTint }) : base; } return cacheImg; };
   // Wackeln pro Bild (style.jitter) und bleibendes Verrutschen nach Treffern/Ziehen (style.slip), in Vollbild-px
   let sx0 = 0, sy0 = 0;
   const slip = () => { if (style.disturb) field = disturbField(rng, style.disturb); if (style.slip) { sx0 = (rng() - 0.5) * 2 * style.slip; sy0 = (rng() - 0.5) * 2 * style.slip; } };
@@ -398,7 +399,10 @@ export const SCENARIOS = [
 ];
 // Bedingungen wie auf den echten Bildern des Nutzers (fast frontal, neutral weiße Felder, Wackeln)
 export const REAL = { real: true, preset: 'user', up: 20, jitter: 0.15, slip: 1.2, sameSet: true };
-export const REAL_SCENARIOS = [['echt: verteilt', REAL], ['echt: ohne Wackeln', { ...REAL, jitter: 0, slip: 0 }], ['echt: enge Gruppe', { ...REAL, cluster: 8, bump: true }], ['echt: starkes Wackeln', { ...REAL, jitter: 0.4, slip: 2 }], ['echt: unruhiges Bild', { ...REAL, texture: 18, noise: 7, disturb: { warp: 0.35, sharp: 0.5 } }], ['echt: Autofokus beim Start', { ...REAL, texture: 18, noise: 5, softStart: 5 }]];
+export const REAL_SCENARIOS = [['echt: verteilt', REAL], ['echt: ohne Wackeln', { ...REAL, jitter: 0, slip: 0 }], ['echt: enge Gruppe', { ...REAL, cluster: 8, bump: true }], ['echt: starkes Wackeln', { ...REAL, jitter: 0.4, slip: 2 }], ['echt: unruhiges Bild', { ...REAL, texture: 18, noise: 7, disturb: { warp: 0.35, sharp: 0.5 } }], ['echt: Autofokus beim Start', { ...REAL, texture: 18, noise: 5, softStart: 5 }],
+  // ohne LED-Ring: warmes Raumlicht, schwache lange Schatten, die wärmer gefärbt sind (gemessen an echten Bildern v28)
+  ['echt: Raumlicht mit Schatten', { ...REAL, warmLight: true, light: 0.85, shadow: [0.5, 0.8, 1], shadowStrength: 0.16, shadowTint: [0.85, 1, 1.4] }],
+  ['echt: dunkel mit Schatten', { ...REAL, warmLight: true, light: 0.55, noise: 6, shadow: [-0.4, 0.9, 1], shadowStrength: 0.2, shadowTint: [0.85, 1, 1.4] }]];
 export const REAL_CAMERAS = [[-23, -8], [-20, 0], [25, -5], [-30, 5], [23, 8]];
 export const CAMERAS = [[30, 0], [-30, 0], [45, 0], [-45, 0], [55, 0], [-55, 0], [45, 15], [-45, -15]];
 

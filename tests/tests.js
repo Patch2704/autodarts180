@@ -617,6 +617,15 @@ const stressLog = [];
     run([a]); det.awaitTakeout(); det.cancelWait(); eq(det.awaitingTakeout, false);
     ok(run([a, dart(-60, -30)]).includes('dart'), 'Pfeil nach Rückgängig nicht erkannt');
   });
+  {
+    // Raumlicht ohne LED-Ring: schwache, lange, wärmer gefärbte Schatten (wie auf den echten Bildern v28)
+    const sc = d3.REAL_SCENARIOS.find(([l]) => l === 'echt: Raumlicht mit Schatten')[1];
+    const r = d3.simulate({ deg: -23, tilt: -8, w: 540, h: 960, visits: 4, seed: 31, style: sc });
+    stressLog.push('— Raumlicht mit Schatten —', `${r.auto}/${r.n} ohne Rückfrage richtig, falsch ohne Rückfrage ${r.wrongConfident}, Phantome ${r.phantom}, verpasst ${r.missed}`);
+    test('Raumlicht mit Schatten: Schatten werden nicht als Pfeil oder Spitze gewertet (kein Phantom, höchstens ein Fehler ohne Rückfrage)', () => {
+      eq(r.phantom, 0, 'Phantome'); ok(r.wrongConfident <= 1, `${r.wrongConfident} falsch ohne Rückfrage`); ok(r.auto >= 0.6 * r.n, `nur ${r.auto}/${r.n} ohne Rückfrage richtig`);
+    });
+  }
   test('Nachwertung: offener Pfeil wird nach dem Ziehen des vorderen frei ausgewertet, die Entnahme kommt erst danach', () => {
     const w = 540, h = 960, cam = d3.sideCamera(-23, w, h, { fill: 0.8, tilt: -8 }), base = d3.realScene(cam, w, h);
     const bad = [];
